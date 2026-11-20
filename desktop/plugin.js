@@ -16,6 +16,7 @@ import {
   atom,
   Badge,
   Button,
+  Checkbox,
   Codicon,
   ConfirmDialog,
   ContextMenu,
@@ -27,10 +28,19 @@ import {
   haptic,
   host,
   PALETTE_AREA,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   queryClient,
   relativeTime,
   ROUTES_AREA,
   SegmentedControl,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Skeleton,
   STATUSBAR_AREAS,
   Tip,
   useMutation,
@@ -186,6 +196,18 @@ export function parseSection(section) {
   return rows
 }
 
+/** `text` as a sentence that ends exactly once: Hermes's error text often ends with its own period,
+ *  so one is added only when no terminal punctuation is there already. */
+export function endSentence(text) {
+  const trimmed = String(text ?? '').trim().replace(/[\s,;:]+$/, '')
+
+  if (!trimmed) {
+    return ''
+  }
+
+  return /[.!?…]["')\]]*$/.test(trimmed) ? trimmed : `${trimmed}.`
+}
+
 /** One toast per backend status. Returns { kind, message }. */
 export function resultToast(verb, result, t) {
   const name = result?.item?.subject || ''
@@ -227,6 +249,23 @@ export const STYLES = {
     padding: `0.5rem ${PAD}`
   },
   barRow: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.35rem', minWidth: 0 },
+  // A button never shrinks below its label and never grows past its row: a label longer than the
+  // pane is cut with an ellipsis inside the button instead of by the pane edge.
+  button: { flexShrink: 0, maxWidth: '100%', minWidth: 0 },
+  ellipsis: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  // Row actions stay together at the row's right end; when the row is too narrow they wrap onto a
+  // line of their own, still right-aligned, before any button is squeezed.
+  actions: {
+    alignItems: 'center',
+    display: 'flex',
+    flex: '0 0 auto',
+    flexWrap: 'wrap',
+    gap: '0.3rem',
+    justifyContent: 'flex-end',
+    marginLeft: 'auto',
+    maxWidth: '100%',
+    minWidth: 0
+  },
   listScroll: { flex: '1 1 auto', minHeight: 0, minWidth: 0, overflowX: 'hidden', overflowY: 'auto' },
   detailScroll: { flex: '1 1 auto', minHeight: 0, minWidth: 0, overflowX: 'hidden', overflowY: 'auto', padding: PAD },
   listRow: {
@@ -454,14 +493,16 @@ function useVisible() {
   }
 }
 
-function FilterButton({ active, label, onClick }) {
+export function FilterButton({ active, label, onClick }) {
   return jsx(Button, {
     'aria-pressed': active,
     onClick,
     size: 'xs',
+    style: STYLES.button,
+    title: label,
     type: 'button',
     variant: active ? 'chip' : 'ghost',
-    children: label
+    children: jsx('span', { style: STYLES.ellipsis, children: label })
   })
 }
 
@@ -679,7 +720,8 @@ function FallbackPage() {
 // File view: the list shows each (profile, file) once; the detail shows one composite diff of that
 // file, its current text as grey context with every pending change drawn where it applies, and an
 // Accept and Reject per change. Backend contract v1:
-//   GET  /files?kind=all                                         list of files
+//   GET  /files?kind=all                                         list of files; each has a `version`
+//                                                                that changes whenever its diff can
 //   GET  /files/{profile}/{subsystem}/{key}/diff                 segments, or { status: 'gone' }
 //   POST /files/{profile}/{subsystem}/{key}/blocks/{id}/{accept|reject}
 //   POST /files/{profile}/{subsystem}/{key}/{accept-all|reject-all}
@@ -925,10 +967,15 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
       stale ? jsx(Badge, { size: 'xs', variant: 'muted', children: t('stale') }) : null,
       block.state === 'conflict' ? jsx(Badge, { size: 'xs', variant: 'warn', children: t('conflict') }) : null,
       jsx('span', { style: FILE_STYLES.blockSummary, children: block.summary || '' }),
-      canAcceptBlock(block)
-        ? jsx(Button, { disabled: busy, onClick: onAccept, size: 'xs', type: 'button', children: t('accept') })
-        : null,
-      jsx(Button, { disabled: busy, onClick: onReject, size: 'xs', type: 'button', variant: 'outline', children: t('reject') })
+      jsxs('span', {
+        style: STYLES.actions,
+        children: [
+          canAcceptBlock(block)
+            ? jsx(Button, { disabled: busy, onClick: onAccept, size: 'xs', style: STYLES.button, type: 'button', children: t('accept') })
+            : null,
+          jsx(Button, { disabled: busy, onClick: onReject, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('reject') })
+        ]
+      })
     ]
   })
 
@@ -980,8 +1027,13 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
     style: STYLES.header,
     children: [
       jsx('span', { style: FILE_STYLES.fileTitle, children: file.file }),
-      jsx(Button, { disabled: busy || !acceptable, onClick: onAcceptAll, size: 'sm', type: 'button', children: t('acceptAll') }),
-      jsx(Button, { disabled: busy, onClick: onRejectAll, size: 'sm', type: 'button', variant: 'outline', children: t('rejectAll') }),
+      jsxs('div', {
+        style: STYLES.actions,
+        children: [
+          jsx(Button, { disabled: busy || !acceptable, onClick: onAcceptAll, size: 'sm', style: STYLES.button, type: 'button', children: t('acceptAll') }),
+          jsx(Button, { disabled: busy, onClick: onRejectAll, size: 'sm', style: STYLES.button, type: 'button', variant: 'outline', children: t('rejectAll') })
+        ]
+      }),
       jsxs('div', {
         style: { ...STYLES.listMeta, flexBasis: '100%' },
         children: [
@@ -1000,15 +1052,17 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
 
 /** The whole detail pane for one file, as a pure view: data and callbacks in, tree out. */
 export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, t }) {
-  const shownFile = data?.status === 'ok' && data.file ? data.file : file
-  const segments = data?.status === 'ok' ? data.segments ?? [] : []
+  // A response for another file (a late answer after the user moved on) counts as not loaded yet.
+  const own = data && diffMatches(data, file) ? data : undefined
+  const shownFile = own?.status === 'ok' ? own.file : file
+  const segments = own?.status === 'ok' ? own.segments ?? [] : []
   const blockList = segments.filter(s => s.type === 'block').map(s => s.block)
 
   const body = error
     ? jsx(ErrorState, { description: String(error?.message || ''), title: t('diffError') })
-    : loading
-      ? jsx('div', { style: STYLES.muted, children: t('loading') })
-      : data?.status === 'gone'
+    : loading || !own
+      ? jsx(DiffSkeleton, { t })
+      : own.status === 'gone'
         ? jsx('div', { style: STYLES.muted, children: t('fileGone') })
         : jsx(FileDiffView, { busy, onBlock: onAction, prior, segments, t })
 
@@ -1038,6 +1092,263 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
   })
 }
 
+// ---------------------------------------------------------------------------------------------
+// List controls: which profiles the list shows, and its order. Both persist in ctx.storage.
+// Profiles are stored as the HIDDEN set, so a profile that first stages a change later shows up.
+// They filter and order the list only; the status-bar chip still counts every profile.
+// ---------------------------------------------------------------------------------------------
+
+export const SORTS = ['newest', 'oldest', 'name', 'changes']
+export const $sort = atom('newest')
+export const $hidden = atom([])
+
+const byName = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' })
+
+const SORT_ORDER = {
+  newest: (a, b) => (b.latest_staged_at ?? 0) - (a.latest_staged_at ?? 0),
+  oldest: (a, b) => (a.latest_staged_at ?? 0) - (b.latest_staged_at ?? 0),
+  name: (a, b) => byName(a.file, b.file),
+  changes: (a, b) => (b.counts?.total ?? 0) - (a.counts?.total ?? 0)
+}
+
+/** A sorted copy. Array.prototype.sort is stable, so files that tie keep the backend's order. */
+export function sortFiles(files, sort) {
+  return [...files].sort(SORT_ORDER[sort] ?? SORT_ORDER.newest)
+}
+
+/** Files outside the hidden profiles, then of the chosen kind ('all' | 'skills' | 'memory'). */
+export function filterFiles(files, hidden, kind = 'all') {
+  const off = new Set(hidden)
+
+  return files.filter(file => !off.has(file.profile) && (kind === 'all' || file.subsystem === kind))
+}
+
+/** What the list shows, in order: profile selection, then kind, then the sort. */
+export const shownFiles = (files, hidden, kind, sort) => sortFiles(filterFiles(files, hidden, kind), sort)
+
+/** One row per profile that has pending files: { profile, count } with 'default' first. */
+export function profileSummary(files) {
+  const counts = new Map()
+
+  for (const file of files) {
+    counts.set(file.profile, (counts.get(file.profile) ?? 0) + 1)
+  }
+
+  return [...counts]
+    .map(([profile, count]) => ({ count, profile }))
+    .sort((a, b) => (a.profile === 'default' ? -1 : b.profile === 'default' ? 1 : byName(a.profile, b.profile)))
+}
+
+/** The hidden list after checking (shown = true) or unchecking one profile. */
+export function toggleHidden(hidden, profile, shown) {
+  const rest = hidden.filter(p => p !== profile)
+
+  return shown ? rest : [...rest, profile]
+}
+
+/** Hide every listed profile except the focused chat's. */
+export const onlyProfile = (profiles, focused) => profiles.map(p => p.profile).filter(p => p !== focused)
+
+function writeStored(key, value) {
+  try {
+    CTX?.storage.set(key, value)
+  } catch {
+    // storage full or unavailable: the choice holds for this session
+  }
+}
+
+export function setSort(sort) {
+  if (SORTS.includes(sort)) {
+    $sort.set(sort)
+    writeStored('sortOrder', sort)
+  }
+}
+
+export function setHiddenProfiles(hidden) {
+  const clean = [...new Set((Array.isArray(hidden) ? hidden : []).filter(p => typeof p === 'string'))]
+
+  $hidden.set(clean)
+  writeStored('hiddenProfiles', clean)
+}
+
+export function loadListSettings(ctx) {
+  const sort = readStored(ctx, 'sortOrder', 'newest')
+  const hidden = readStored(ctx, 'hiddenProfiles', [])
+
+  $sort.set(SORTS.includes(sort) ? sort : 'newest')
+  $hidden.set(Array.isArray(hidden) ? hidden.filter(p => typeof p === 'string') : [])
+}
+
+export const LIST_STYLES = {
+  controls: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.35rem', minWidth: 0 },
+  trigger: { flexShrink: 0, maxWidth: '100%', minWidth: 0, width: 'auto' },
+  popover: { display: 'flex', flexDirection: 'column', gap: '0.35rem', maxWidth: 'calc(100vw - 2rem)', minWidth: 0, width: '16rem' },
+  shortcuts: { display: 'flex', flexWrap: 'wrap', gap: '0.25rem', minWidth: 0 },
+  checklist: { display: 'flex', flexDirection: 'column', maxHeight: 'min(20rem, 60vh)', minWidth: 0, overflowY: 'auto' },
+  check: { alignItems: 'center', borderRadius: '4px', cursor: 'pointer', display: 'flex', fontSize: '0.75rem', gap: '0.5rem', minWidth: 0, padding: '0.3rem 0.35rem' },
+  checkName: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  checkCount: { color: 'var(--ui-text-tertiary)', flex: 'none', fontVariantNumeric: 'tabular-nums' }
+}
+
+/** The sort menu as a pure view. The trigger shows the active choice. */
+export function SortMenu({ value, onChange, t }) {
+  const active = SORTS.includes(value) ? value : 'newest'
+
+  return jsxs(Select, {
+    onValueChange: onChange,
+    value: active,
+    children: [
+      jsx(SelectTrigger, {
+        'aria-label': t('sortLabel'),
+        size: 'xs',
+        style: LIST_STYLES.trigger,
+        title: t('sortLabel'),
+        children: jsx(SelectValue, { children: jsx('span', { style: STYLES.ellipsis, children: t(`sort_${active}`) }) })
+      }),
+      jsx(SelectContent, { children: SORTS.map(id => jsx(SelectItem, { value: id, children: t(`sort_${id}`) }, id)) })
+    ]
+  })
+}
+
+/** Sort control for the list pane header. Its own component, so the list re-renders only the rows. */
+export function SortControl() {
+  const t = usePluginI18n(ID)
+  const sort = useValue($sort)
+
+  return jsx(SortMenu, { onChange: setSort, t, value: sort })
+}
+
+/** The profile picker as a pure view: a trigger that says how many profiles show, and a popover
+ *  with All, Only the focused chat's profile, and one checkbox per profile with its file count. */
+export function ProfilePicker({ profiles, hidden, focused, onChange, t }) {
+  const off = new Set(hidden)
+  const shown = profiles.filter(p => !off.has(p.profile)).length
+  const label = shown === profiles.length ? t('profilesAll', profiles.length) : t('profilesShown', shown, profiles.length)
+  const hasFocused = profiles.some(p => p.profile === focused)
+
+  return jsxs(Popover, {
+    children: [
+      jsx(PopoverTrigger, {
+        asChild: true,
+        children: jsxs(Button, {
+          'aria-label': `${t('scopeGroup')}: ${label}`,
+          size: 'xs',
+          style: STYLES.button,
+          title: label,
+          type: 'button',
+          variant: shown < profiles.length ? 'chip' : 'ghost',
+          children: [jsx('span', { style: STYLES.ellipsis, children: label }), jsx(Codicon, { name: 'chevron-down' })]
+        })
+      }),
+      jsxs(PopoverContent, {
+        align: 'start',
+        style: LIST_STYLES.popover,
+        children: [
+          jsxs('div', {
+            style: LIST_STYLES.shortcuts,
+            children: [
+              jsx(FilterButton, { active: hidden.length === 0, label: t('showAll'), onClick: () => onChange([]) }),
+              jsx(Button, {
+                disabled: !hasFocused,
+                onClick: () => onChange(onlyProfile(profiles, focused)),
+                size: 'xs',
+                style: STYLES.button,
+                title: hasFocused ? t('onlyFocused', focused) : t('onlyFocusedNone', focused),
+                type: 'button',
+                variant: 'ghost',
+                children: jsx('span', { style: STYLES.ellipsis, children: t('onlyFocused', focused) })
+              })
+            ]
+          }),
+          jsx('div', {
+            'aria-label': t('scopeGroup'),
+            role: 'group',
+            style: LIST_STYLES.checklist,
+            children: profiles.map(({ profile, count }) =>
+              jsxs(
+                'label',
+                {
+                  style: LIST_STYLES.check,
+                  title: t('profileRow', profile, count),
+                  children: [
+                    jsx(Checkbox, { checked: !off.has(profile), onCheckedChange: on => onChange(toggleHidden(hidden, profile, on === true)) }),
+                    jsx('span', { style: LIST_STYLES.checkName, children: profile }),
+                    profile === focused ? jsx('span', { style: STYLES.muted, children: t('focusedMark') }) : null,
+                    jsx('span', { style: LIST_STYLES.checkCount, children: count })
+                  ]
+                },
+                profile
+              )
+            )
+          })
+        ]
+      })
+    ]
+  })
+}
+
+function ProfileControl({ profiles, focused }) {
+  const t = usePluginI18n(ID)
+  const hidden = useValue($hidden)
+
+  return jsx(ProfilePicker, { focused, hidden, onChange: setHiddenProfiles, profiles, t })
+}
+
+/** Placeholder lines in the diff box's shape while a file's diff loads. */
+const SKELETON_WIDTHS = ['62%', '88%', '74%', '40%', '81%', '93%', '55%', '70%']
+
+export function DiffSkeleton({ t }) {
+  return jsx('div', {
+    'aria-busy': true,
+    'aria-label': t('loadingDiff'),
+    role: 'status',
+    style: { ...STYLES.diffBox, display: 'flex', flexDirection: 'column', gap: '0.45rem', padding: '0.6rem 0.75rem' },
+    children: SKELETON_WIDTHS.map((width, i) => jsx(Skeleton, { style: { height: '0.7rem', maxWidth: '100%', width } }, i))
+  })
+}
+
+/** A token that changes whenever the file's diff can have changed: the backend's version, or (from
+ *  a backend without it) the counts and the latest staged time. */
+export function diffVersion(file) {
+  if (file.version) {
+    return String(file.version)
+  }
+
+  const c = file.counts ?? {}
+
+  return `${file.latest_staged_at ?? 0}:${c.total ?? 0}:${c.pending ?? 0}:${c.stale ?? 0}:${c.conflict ?? 0}`
+}
+
+export const diffQueryKey = file => [...diffKey(file), diffVersion(file)]
+
+/** True when a diff response belongs to `file`; a late answer for another file is never shown. */
+export function diffMatches(data, file) {
+  if (data?.status === 'gone') {
+    return true
+  }
+
+  const got = data?.file
+
+  return data?.status === 'ok' && !!got && got.key === file.key && got.profile === file.profile && got.subsystem === file.subsystem
+}
+
+const LIST_EN = {
+  emptyHidden: n => `${n} file${n === 1 ? '' : 's'} waiting in hidden profiles.`,
+  emptyKind: kind => `Nothing under ${kind} in the shown profiles.`,
+  focusedMark: 'this chat',
+  loadingDiff: 'Loading the changes in this file',
+  onlyFocused: profile => `Only ${profile}`,
+  onlyFocusedNone: profile => `${profile} has no pending files`,
+  profileRow: (profile, n) => `${profile}: ${n} file${n === 1 ? '' : 's'} with changes`,
+  profilesAll: n => `All ${n} profile${n === 1 ? '' : 's'}`,
+  profilesShown: (n, total) => `${n} of ${total} profile${total === 1 ? '' : 's'}`,
+  sortLabel: 'Sort files',
+  sort_changes: 'Most changes',
+  sort_name: 'File name A to Z',
+  sort_newest: 'Newest first',
+  sort_oldest: 'Oldest first'
+}
+
 function useFiles() {
   const profile = useValue(host.state.profile)
 
@@ -1049,28 +1360,27 @@ function useFiles() {
   })
 }
 
-/** Files the list shows, with the same profile scope and kind filter as before. */
+/** Files the list shows: the profile selection, then the kind filter, then the sort order. Both
+ *  panes use it (the detail needs the shown order to pick the next file). */
 function useVisibleFiles() {
   const query = useFiles()
   const focused = useValue(host.state.focusedSessionProfile) || 'default'
-  const scope = useValue($scope)
+  const hidden = useValue($hidden)
   const kind = useValue($kind)
+  const sort = useValue($sort)
   const files = query.data?.files ?? []
-  const focusedCount = visibleItems(files, 'focused', focused).length
-  const effective = scope ?? (focusedCount > 0 ? 'focused' : 'all')
-  const inScope = visibleItems(files, effective, focused)
+  const inScope = filterFiles(files, hidden)
 
   return {
     ...query,
-    effective,
     files,
     focused,
-    focusedCount,
     inScope,
     kind,
     kindCounts: countBySubsystem(inScope),
     profileErrors: query.data?.profile_errors ?? [],
-    shown: visibleItems(files, effective, focused, kind)
+    profiles: profileSummary(files),
+    shown: shownFiles(files, hidden, kind, sort)
   }
 }
 
@@ -1095,13 +1405,8 @@ function FilesListPane() {
         ]
       }),
       jsxs('div', {
-        'aria-label': t('scopeGroup'),
-        role: 'group',
-        style: STYLES.barRow,
-        children: [
-          jsx(FilterButton, { active: v.effective === 'focused', label: t('scopeFocused', v.focused, v.focusedCount), onClick: () => $scope.set('focused') }),
-          jsx(FilterButton, { active: v.effective === 'all', label: t('scopeAll', v.files.length), onClick: () => $scope.set('all') })
-        ]
+        style: LIST_STYLES.controls,
+        children: [jsx(ProfileControl, { focused: v.focused, profiles: v.profiles }), jsx(SortControl, {})]
       }),
       jsx('div', {
         'aria-label': t('kindGroup'),
@@ -1111,6 +1416,7 @@ function FilesListPane() {
           jsx(FilterButton, { active: v.kind === k, label: t('kindFilter', t(`kind_${k}`), v.kindCounts[k]), onClick: () => $kind.set(k) }, k)
         )
       }),
+      jsx(NotifyModeControl, {}),
       v.profileErrors.length
         ? jsx('div', { style: { ...STYLES.muted, overflowWrap: 'anywhere' }, children: t('profileErrors', v.profileErrors.map(e => e.profile).join(', ')) })
         : null
@@ -1130,15 +1436,7 @@ function FilesListPane() {
   } else if (v.isLoading) {
     body = jsx('div', { style: { ...STYLES.muted, padding: PAD }, children: t('loading') })
   } else if (!v.shown.length) {
-    const description = v.inScope.length
-      ? t('emptyKind', t(`kind_${v.kind}`))
-      : v.files.length
-        ? t('emptyElsewhere', v.files.length)
-        : gateOn
-          ? t('emptyBody')
-          : t('gateOff')
-
-    body = jsx(EmptyState, { description, title: t('emptyTitle') })
+    body = jsx(FilesEmpty, { files: v.files.length, gateOn, inScope: v.inScope.length, kind: v.kind, onShowAll: () => setHiddenProfiles([]), t })
   } else {
     body = jsx(FileList, { files: v.shown, lastOpened: CTX ? readOpened(CTX.storage) : {}, onSelect: key => $selection.set(key), selection, t })
   }
@@ -1147,6 +1445,25 @@ function FilesListPane() {
     style: STYLES.paneRoot,
     children: [bar, jsx('div', { style: STYLES.listScroll, children: body })]
   })
+}
+
+/** Empty list: why, and when hidden profiles hold files, a way to show them. */
+export function FilesEmpty({ files, gateOn, inScope, kind, onShowAll, t }) {
+  if (inScope) {
+    return jsx(EmptyState, { description: t('emptyKind', t(`kind_${kind}`)), title: t('emptyTitle') })
+  }
+
+  if (files) {
+    return jsxs('div', {
+      style: { alignItems: 'center', display: 'flex', flexDirection: 'column', gap: '0.5rem', minWidth: 0, paddingBottom: PAD },
+      children: [
+        jsx(EmptyState, { description: t('emptyHidden', files), title: t('emptyTitle') }),
+        jsx(Button, { onClick: onShowAll, size: 'sm', style: STYLES.button, type: 'button', variant: 'outline', children: t('showAll') })
+      ]
+    })
+  }
+
+  return jsx(EmptyState, { description: gateOn ? t('emptyBody') : t('gateOff'), title: t('emptyTitle') })
 }
 
 function FileDetail({ file }) {
@@ -1160,11 +1477,15 @@ function FileDetail({ file }) {
     $opened.set($opened.get() + 1)
   }, [key])
 
+  // No polling of its own: the 3-second list poll carries each file's version, and the key holds
+  // it, so the diff is fetched again only when it can have changed. Until that answer arrives the
+  // previous diff of this same file stays up (the component is keyed by file).
   const diff = useQuery({
+    placeholderData: previous => previous,
     queryFn: () => CTX.rest(fileDiffPath(file)),
-    queryKey: diffKey(file),
-    refetchInterval: POLL_MS,
-    refetchOnWindowFocus: false
+    queryKey: diffQueryKey(file),
+    refetchOnWindowFocus: false,
+    staleTime: Infinity
   })
 
   useEffect(() => {
@@ -1576,7 +1897,7 @@ const en = {
   emptyElsewhere: n => `Nothing for this profile. ${n} waiting in other profiles.`,
   emptyKind: kind => `Nothing under ${kind} for this profile.`,
   emptyTitle: 'No changes waiting',
-  failed: reason => `Change not applied${reason ? `: ${reason}` : ''}. It stays pending.`,
+  failed: reason => (endSentence(reason) ? `Change not applied: ${endSentence(reason)} It stays pending.` : 'Change not applied. It stays pending.'),
   gateOff: 'Writes are saved right away. Set skills.write_approval or memory.write_approval to true to review them first.',
   kindFilter: (label, n) => `${label} (${n})`,
   kindGroup: 'Kind of change',
@@ -1611,7 +1932,7 @@ const en = {
 }
 
 messages.en = en
-Object.assign(en, NOTIFY_EN)
+Object.assign(en, NOTIFY_EN, LIST_EN)
 
 export default {
   id: ID,
@@ -1625,6 +1946,7 @@ export default {
     })
 
     loadNotifySettings(ctx)
+    loadListSettings(ctx)
     startWatcher(ctx)
 
     const contributions = [

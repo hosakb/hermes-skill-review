@@ -6,13 +6,15 @@ root this process serves. Both go through the shared ``tools.write_approval`` st
 Skill diffs come from ``skill_pending_diff``; Hermes has no memory diff, so memory diffs are
 built from the record and the profile's current entries with the memory store's own per-op logic.
 Acceptance runs the same applier as ``/skills approve`` and ``/memory approve``.
-Authentication is the gateway's own plugin API auth; this module adds none and opens no files
-other than pending records, MEMORY.md and USER.md (read-only, for diffs).
+Authentication is the gateway's own plugin API auth; this module adds none. Outside Hermes's own
+functions it opens pending records, and reads MEMORY.md, USER.md, every SKILL.md and a staged write's
+target file only to fingerprint them for the evaluation cache (read-only).
 """
 
 from __future__ import annotations
 
 import base64
+import copy
 import difflib
 import hashlib
 import json
@@ -20,6 +22,7 @@ import os
 import posixpath
 import re
 import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -552,7 +555,7 @@ def _skill_blocks(entry: dict[str, Any]) -> tuple[Optional[list[str]], list[dict
     from tools import write_approval as wa
     from tools import skill_manager_tool as smt
     name, rel = entry["name"], entry["rel"]
-    found, path_error, current = None, None, None
+    found, path_error, current, target = None, None, None, None
     name_error = smt._validate_name(Path(name).name) if name else "missing skill name"
     if not name_error:
         found = smt._find_skill(name)
@@ -564,6 +567,7 @@ def _skill_blocks(entry: dict[str, Any]) -> tuple[Optional[list[str]], list[dict
             path_error = (err or {}).get("error") if err else None
         if target is not None and not path_error and target.is_file():
             current = target.read_text(encoding="utf-8-sig")
+    entry["_target"] = target if found and not path_error else None  # read by the evaluation cache
     cur = current.splitlines() if current is not None else []
     blocks = []
     for record, index, op in entry["ops"]:
@@ -687,17 +691,143 @@ def _file_entries(subsystem: str, profile: str) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _evaluate(subsystem: str, entry: dict[str, Any]) -> tuple[Optional[list[str]], list[dict[str, Any]]]:
+def _evaluate_uncached(subsystem: str, entry: dict[str, Any]) -> tuple[Optional[list[str]], list[dict[str, Any]]]:
     cur, blocks = (_memory_blocks if subsystem == MEMORY else _skill_blocks)(entry)
     return cur, _finish(blocks)
 
 
-def _file_info(profile: str, subsystem: str, entry: dict[str, Any], blocks: list[dict[str, Any]]) -> dict[str, Any]:
+# --- evaluation cache ----------------------------------------------------------------------------
+#
+# Evaluating a file reruns Hermes's own checks: one memory dry run per op, and for skills a lookup
+# that parses the frontmatter of every SKILL.md the profile has. The list polls every few seconds,
+# so a result is kept per (profile home, subsystem, file key) and reused while every input of the
+# evaluation is unchanged:
+#   - the staged records the file's ops come from (whole records, so any rewrite counts);
+#   - memory: the raw bytes of MEMORY.md and USER.md (the dry run reads both), the store's limits
+#     and flags as Hermes loads them from the effective config, and whether memory is hosted;
+#   - skills: the skill roots Hermes searches, every SKILL.md under them (path, real path, bytes),
+#     which is all the skill lookup reads, and the target file's real path and bytes.
+# A result is stored only if those inputs read the same before and after the evaluation, so a write
+# that lands during it is never cached. `version` is a digest of the inputs; the desktop refetches a
+# diff only when its file's version changes.
+
+_CACHE_MAX = 512
+_cache: "OrderedDict[tuple[str, str, str], dict[str, Any]]" = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _digest(*parts: Any) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        data = part if isinstance(part, bytes) else json.dumps(part, sort_keys=True, ensure_ascii=False,
+                                                               default=str).encode("utf-8", "surrogatepass")
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
+def _file_bytes(path: Any) -> Any:
+    """The file's bytes, or a marker for a missing or unreadable one (both are inputs too)."""
+    try:
+        return Path(path).read_bytes()
+    except FileNotFoundError:
+        return ["missing"]
+    except OSError as exc:
+        return ["unreadable", exc.errno, type(exc).__name__]
+
+
+def _memory_state() -> str:
+    from tools.hosted_tool_policy import host_feature_enabled
+    from tools.memory_tool import load_on_disk_store
+    from tools.memory_tool_store import MemoryStore
+    store = load_on_disk_store()
+    limits = [store.memory_char_limit, store.user_char_limit, store.memory_enabled, store.user_profile_enabled,
+              host_feature_enabled("builtin_memory")]
+    return _digest(limits, _file_bytes(MemoryStore._path_for("memory")), _file_bytes(MemoryStore._path_for("user")))
+
+
+def _skills_state() -> str:
+    """Every SKILL.md Hermes's skill lookup can see. The walk skips Hermes's excluded folders (as the
+    lookup does) and, like ``Path.rglob`` on Python 3.13+, does not descend into symlinked folders, so
+    below a root only a SKILL.md that is itself a symlink can point elsewhere; its target is recorded."""
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS, get_all_skills_dirs
+    parts: list[Any] = []
+    for root in get_all_skills_dirs():
+        parts.append(["root", str(root), os.path.realpath(root), root.is_dir()])
+        if not root.is_dir():
+            continue
+        for folder, dirs, names in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_SKILL_DIRS)
+            if "SKILL.md" in names:
+                path = os.path.join(folder, "SKILL.md")
+                parts.append([path, os.readlink(path) if os.path.islink(path) else None])
+                parts.append(_file_bytes(path))
+    return _digest(*parts)
+
+
+def _target_state(target: Optional[Path]) -> Any:
+    return None if target is None else [str(target), os.path.realpath(target), _file_bytes(target)]
+
+
+def _state(subsystem: str) -> str:
+    return _memory_state() if subsystem == MEMORY else _skills_state()
+
+
+def _home_key() -> str:
+    from hermes_constants import get_hermes_home, hermes_home_key
+    return str(hermes_home_key(get_hermes_home()))
+
+
+def _evaluate(subsystem: str, entry: dict[str, Any], memo: dict) -> tuple[Optional[list[str]], list[dict[str, Any]], str]:
+    """``(current lines, finished blocks, version)``, from the cache when every input is unchanged.
+    ``memo`` holds one profile's state for one subsystem, shared by the files of one request; fresh
+    results wait in it until ``_store`` checks that state again."""
+    home = _home_key()
+    if "state" not in memo:
+        memo.update(state=_state(subsystem), home=home, subsystem=subsystem, fresh=[])
+    assert (memo["home"], memo["subsystem"]) == (home, subsystem), "one memo per profile and subsystem"
+    state = memo["state"]
+    records = _digest([[record, index] for record, index, _op in entry["ops"]])
+    cache_key = (home, subsystem, entry["key"])
+    with _cache_lock:
+        hit = _cache.get(cache_key)
+        if hit is not None:
+            _cache.move_to_end(cache_key)
+    if (hit is not None and hit["records"] == records and hit["state"] == state
+            and _target_state(hit["target"]) == hit["target_state"]):
+        return copy.deepcopy(hit["cur"]), copy.deepcopy(hit["blocks"]), hit["version"]
+    cur, blocks = _evaluate_uncached(subsystem, entry)
+    target = entry.get("_target")
+    target_state = _target_state(target)
+    version = _digest(records, state, target_state)[:16]
+    memo["fresh"].append((cache_key, {"records": records, "state": state, "target": target,
+                                      "target_state": target_state, "version": version,
+                                      "cur": copy.deepcopy(cur), "blocks": copy.deepcopy(blocks)}))
+    return cur, blocks, version
+
+
+def _store(memo: dict) -> None:
+    """Cache the memo's fresh results if the state still reads as it did before they were computed:
+    a write that landed in between leaves them uncached. Same profile scope as the evaluation."""
+    if not memo.get("fresh"):
+        return
+    if _state(memo["subsystem"]) == memo["state"]:
+        with _cache_lock:
+            for cache_key, value in memo["fresh"]:
+                _cache[cache_key] = value
+                _cache.move_to_end(cache_key)
+            while len(_cache) > _CACHE_MAX:
+                _cache.popitem(last=False)
+    memo["fresh"] = []
+
+
+def _file_info(profile: str, subsystem: str, entry: dict[str, Any], blocks: list[dict[str, Any]],
+               version: str) -> dict[str, Any]:
     states = [b["state"] for b in blocks]
     return {"key": entry["key"], "profile": profile, "subsystem": subsystem, "file": entry["file"],
             "counts": {"total": len(blocks), "pending": states.count("pending"), "stale": states.count("stale"),
                        "conflict": states.count("conflict")},
-            "latest_staged_at": max((b["staged_at"] for b in blocks), default=0)}
+            "latest_staged_at": max((b["staged_at"] for b in blocks), default=0), "version": version}
 
 
 def _segments(cur: Optional[list[str]], blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -736,8 +866,11 @@ def list_files(kind: str = "all") -> dict[str, Any]:
                         continue
                     with _queue_lock(subsystem):
                         entries = _file_entries(subsystem, name)
+                    memo: dict = {}
                     for entry in entries.values():
-                        files.append(_file_info(name, subsystem, entry, _evaluate(subsystem, entry)[1]))
+                        _cur, blocks, version = _evaluate(subsystem, entry, memo)
+                        files.append(_file_info(name, subsystem, entry, blocks, version))
+                    _store(memo)
         except Exception as exc:  # one broken profile must not hide the others
             errors.append({"profile": name, "error": str(exc)})
     files.sort(key=lambda f: (-f["latest_staged_at"], f["profile"], f["file"]))
@@ -753,8 +886,11 @@ def file_diff(profile: str, subsystem: str, key: str) -> dict[str, Any]:
         entry = _find_entry(subsystem, profile, key)
         if entry is None:
             return {"status": "gone"}
-        cur, blocks = _evaluate(subsystem, entry)
-    return {"status": "ok", "file": _file_info(profile, subsystem, entry, blocks), "segments": _segments(cur, blocks)}
+        memo: dict = {}
+        cur, blocks, version = _evaluate(subsystem, entry, memo)
+        _store(memo)
+    return {"status": "ok", "file": _file_info(profile, subsystem, entry, blocks, version),
+            "segments": _segments(cur, blocks)}
 
 
 def _resolve_block(profile: str, subsystem: str, key: str, block_id: str, apply: bool) -> dict[str, Any]:
@@ -793,7 +929,7 @@ def _resolve_all(profile: str, subsystem: str, key: str, apply: bool) -> dict[st
                 entry = _file_entries(subsystem, profile).get(key)
                 if entry is None:
                     break
-                blocks = _evaluate(subsystem, entry)[1]
+                blocks = _evaluate_uncached(subsystem, entry)[1]  # a resolve always re-checks from disk
                 nxt = next((b for b in blocks if b["id"] not in attempted), None)
                 if nxt is None:
                     break
