@@ -18,6 +18,10 @@ import {
   Button,
   Codicon,
   ConfirmDialog,
+  ContextMenu,
+  ContextMenuCheckboxItem,
+  ContextMenuContent,
+  ContextMenuTrigger,
   EmptyState,
   ErrorState,
   haptic,
@@ -26,6 +30,7 @@ import {
   queryClient,
   relativeTime,
   ROUTES_AREA,
+  SegmentedControl,
   STATUSBAR_AREAS,
   Tip,
   useMutation,
@@ -500,7 +505,8 @@ function ListPane() {
         children: KINDS.map(k =>
           jsx(FilterButton, { active: v.kind === k, label: t('kindFilter', t(`kind_${k}`), v.kindCounts[k]), onClick: () => $kind.set(k) }, k)
         )
-      })
+      }),
+      jsx(NotifyModeControl, {})
     ]
   })
 
@@ -680,6 +686,8 @@ export function openReview(key) {
     $selection.set(key)
   }
 
+  markSeen()
+
   if (useRouteFallback || typeof host.openWorkspace !== 'function') {
     host.navigate(ROUTE)
 
@@ -720,7 +728,7 @@ export function announce(ctx, items) {
 
   ctx.storage.set('announced', keep)
 
-  if (fresh.length) {
+  if (fresh.length && $notifyMode.get() === 'popup') {
     const first = fresh[0]
 
     host.notify({
@@ -743,46 +751,221 @@ function startWatcher(ctx) {
 
     return queryClient
       .fetchQuery({ queryFn: fetchPending, queryKey: pendingKey(profile), staleTime: POLL_MS - 500 })
-      .then(data => announce(ctx, data?.items))
+      .then(data => {
+        if (listPaneVisible()) {
+          markSeen() // the user is looking at the list: nothing in it is unseen
+        }
+
+        const fresh = announce(ctx, data?.items)
+
+        $lit.set($notifyMode.get() === 'light' && hasUnseen(data?.items, $lastSeenAt.get()))
+
+        return fresh
+      })
       .catch(() => 0) // backend off or unreachable: the list pane shows the error
   }
 
   ctx.setTimeout(tick, 1500)
   ctx.setInterval(tick, POLL_MS)
+
+  // The pane coming on screen by any route (its tab, a drag, the layout restoring) counts as opening it.
+  if (typeof host.paneVisibility === 'function') {
+    const visible = host.paneVisibility(LIST_PANE)
+    const stop = visible?.listen?.(on => {
+      if (on) {
+        markSeen()
+      }
+    })
+
+    if (typeof stop === 'function') {
+      ctx.onDispose(stop)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Notification mode: 'popup' toasts each new change, 'light' lights the status-bar chip instead
+// until the user opens the review pane. A change is unseen when it was staged after lastSeenAt.
+// ---------------------------------------------------------------------------------------------
+
+export const NOTIFY_MODES = ['popup', 'light']
+export const $notifyMode = atom('popup')
+export const $lit = atom(false)
+const $lastSeenAt = atom(0) // ms; 0 means the pane was never opened
+
+const listPaneVisible = () =>
+  typeof host.paneVisibility === 'function' && host.paneVisibility(LIST_PANE)?.get?.() === true
+
+/** True when any item was staged (created_at, seconds) after lastSeenAt (milliseconds). */
+export const hasUnseen = (items, lastSeenAt) =>
+  Array.isArray(items) && items.some(item => Number(item?.created_at) * 1000 > lastSeenAt)
+
+function readStored(ctx, key, fallback) {
+  try {
+    return ctx.storage.get(key, fallback)
+  } catch {
+    return fallback
+  }
+}
+
+function loadNotifySettings(ctx) {
+  const mode = readStored(ctx, 'notifyMode', 'popup')
+  const seen = Number(readStored(ctx, 'lastSeenAt', 0))
+
+  $notifyMode.set(NOTIFY_MODES.includes(mode) ? mode : 'popup')
+  $lastSeenAt.set(Number.isFinite(seen) ? seen : 0)
+  $lit.set(false)
+}
+
+export function setNotifyMode(mode) {
+  if (!NOTIFY_MODES.includes(mode)) {
+    return
+  }
+
+  $notifyMode.set(mode)
+  CTX?.storage.set('notifyMode', mode)
+
+  if (mode !== 'light') {
+    $lit.set(false)
+  }
+}
+
+/** The user has looked at the review pane: everything staged until now is seen. */
+export function markSeen() {
+  const now = Date.now()
+
+  $lastSeenAt.set(now)
+  $lit.set(false)
+
+  try {
+    CTX?.storage.set('lastSeenAt', now)
+  } catch {
+    // storage full or unavailable: the light still clears for this session
+  }
+}
+
+export function NotifyModeSwitch({ mode, onChange, t }) {
+  return jsxs('div', {
+    'aria-label': t('notifyLabel'),
+    role: 'group',
+    style: STYLES.barRow,
+    children: [
+      jsx('span', { style: STYLES.muted, children: t('notifyLabel') }),
+      jsx(SegmentedControl, {
+        onChange,
+        options: NOTIFY_MODES.map(id => ({ id, label: t(id === 'popup' ? 'notifyPopup' : 'notifyLight') })),
+        sizing: 'content',
+        value: mode
+      })
+    ]
+  })
+}
+
+/** The list pane header's control. Its own component, so list-pane changes stay apart from it. */
+function NotifyModeControl() {
+  const t = usePluginI18n(ID)
+  const mode = useValue($notifyMode)
+
+  // Desktops without paneVisibility: the list mounting is the best sign the user opened it.
+  useEffect(() => {
+    if (typeof host.paneVisibility !== 'function') {
+      markSeen()
+    }
+  }, [])
+
+  return jsx(NotifyModeSwitch, { mode, onChange: setNotifyMode, t })
+}
+
+export const CHIP_STYLES = {
+  button: {
+    alignItems: 'center',
+    background: 'none',
+    border: 0,
+    color: 'var(--ui-text-secondary)',
+    cursor: 'pointer',
+    display: 'inline-flex',
+    fontSize: '0.6875rem',
+    gap: '0.3rem',
+    height: '100%',
+    padding: '0 0.4rem'
+  },
+  lit: { color: 'var(--ui-accent)', fontWeight: 600 },
+  dot: { background: 'var(--ui-accent)', borderRadius: '50%', display: 'inline-block', flex: 'none', height: '6px', width: '6px' },
+  menuLabel: { color: 'var(--ui-text-tertiary)', fontSize: '0.6875rem', padding: '0.3rem 0.5rem' }
+}
+
+/** Status-bar chip: click opens the review panes, right-click picks the notification mode. */
+export function ReviewChip({ count, counts, lit, mode, onOpen, onMode, t }) {
+  const button = jsxs('button', {
+    'aria-label': lit ? `${t('chipTip', count, counts)}. ${t('chipUnseen')}` : t('chipTip', count, counts),
+    'data-lit': lit,
+    onClick: onOpen,
+    style: lit ? { ...CHIP_STYLES.button, ...CHIP_STYLES.lit } : CHIP_STYLES.button,
+    type: 'button',
+    children: [
+      jsx(Codicon, { name: 'git-pull-request' }),
+      t('chipLabel'),
+      lit ? jsx('span', { 'aria-hidden': true, style: CHIP_STYLES.dot }) : null,
+      jsx(Badge, { size: 'xs', variant: 'warn', children: count })
+    ]
+  })
+
+  return jsxs(ContextMenu, {
+    children: [
+      jsx(Tip, {
+        label: lit ? `${t('chipTip', count, counts)}. ${t('chipUnseen')}` : t('chipTip', count, counts),
+        children: jsx(ContextMenuTrigger, { asChild: true, children: button })
+      }),
+      jsxs(ContextMenuContent, {
+        children: [
+          jsx('div', { style: CHIP_STYLES.menuLabel, children: t('notifyLabel') }),
+          ...NOTIFY_MODES.map(id =>
+            jsx(
+              ContextMenuCheckboxItem,
+              {
+                checked: mode === id,
+                onCheckedChange: () => onMode(id),
+                children: t(id === 'popup' ? 'notifyPopup' : 'notifyLight')
+              },
+              id
+            )
+          )
+        ]
+      })
+    ]
+  })
 }
 
 function StatusChip() {
   const t = usePluginI18n(ID)
   const { data, isError } = usePending()
+  const lit = useValue($lit)
+  const mode = useValue($notifyMode)
   const items = data?.items
 
   if (isError || !items || !items.length) {
     return null
   }
 
-  return jsx(Tip, {
-    label: t('chipTip', items.length, countBySubsystem(items)),
-    children: jsxs('button', {
-      onClick: () => {
-        haptic('tap')
-        openReview()
-      },
-      style: {
-        alignItems: 'center',
-        background: 'none',
-        border: 0,
-        color: 'var(--ui-text-secondary)',
-        cursor: 'pointer',
-        display: 'inline-flex',
-        fontSize: '0.6875rem',
-        gap: '0.3rem',
-        height: '100%',
-        padding: '0 0.4rem'
-      },
-      type: 'button',
-      children: [jsx(Codicon, { name: 'git-pull-request' }), t('chipLabel'), jsx(Badge, { size: 'xs', variant: 'warn', children: items.length })]
-    })
+  return jsx(ReviewChip, {
+    count: items.length,
+    counts: countBySubsystem(items),
+    lit,
+    mode,
+    onMode: setNotifyMode,
+    onOpen: () => {
+      haptic('tap')
+      openReview()
+    },
+    t
   })
+}
+
+const NOTIFY_EN = {
+  chipUnseen: 'New changes since you last opened Review',
+  notifyLabel: 'When a new change arrives',
+  notifyLight: 'Light up icon',
+  notifyPopup: 'Popup'
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -851,6 +1034,7 @@ const en = {
 }
 
 messages.en = en
+Object.assign(en, NOTIFY_EN)
 
 export default {
   id: ID,
@@ -863,6 +1047,7 @@ export default {
       CTX = null
     })
 
+    loadNotifySettings(ctx)
     startWatcher(ctx)
 
     const contributions = [

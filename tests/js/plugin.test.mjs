@@ -358,3 +358,232 @@ test('source: no hardcoded colours, only allowed imports, no workspace takeover,
   assert.doesNotMatch(code, /\bScrollArea\b/, "Radix ScrollArea's display:table wrapper lets wide lines escape")
   assert.doesNotMatch(code, /max-content/)
 })
+
+// --- notification mode: popup or light up the status bar chip ---------------------------------
+
+const {
+  $notifyMode, $lit, setNotifyMode, markSeen, hasUnseen, ReviewChip, NotifyModeSwitch, CHIP_STYLES, NOTIFY_MODES
+} = mod
+const nowSec = () => Date.now() / 1000
+const tick = async ctx => { ctx.timers.find(x => x.every).fn(); await flush() }
+
+test('notifyMode defaults to popup and only accepts popup or light', () => {
+  host.reset()
+  const ctx = fakeCtx()
+  plugin.register(ctx)
+  assert.deepEqual(NOTIFY_MODES, ['popup', 'light'])
+  assert.equal($notifyMode.get(), 'popup')
+  setNotifyMode('bogus')
+  assert.equal($notifyMode.get(), 'popup', 'an unknown value is ignored')
+  assert.equal(ctx.store.notifyMode, undefined)
+  dispose(ctx)
+  const bad = fakeCtx()
+  bad.store.notifyMode = 'banner'
+  plugin.register(bad)
+  assert.equal($notifyMode.get(), 'popup', 'a corrupt stored value falls back to popup')
+  dispose(bad)
+})
+
+test('popup mode: a new change toasts exactly once, with a Review action that only reveals the panes', async () => {
+  host.reset()
+  const qc = globalThis.__queryClient
+  const ctx = fakeCtx()
+  qc.data = { items: [] }
+  plugin.register(ctx)
+  const item = { subsystem: 'skills', profile: 'default', id: 'p1', created_at: nowSec() + 5 }
+  qc.data = { items: [item] }
+  await tick(ctx)
+  await tick(ctx)
+  assert.equal(host.toasts.length, 1, 'announced once, never repeated')
+  assert.equal(host.toasts[0].action.label, 'review')
+  assert.equal($lit.get(), false, 'popup mode never lights the chip')
+  host.toasts[0].action.onClick()
+  assert.deepEqual(host.revealed, [LIST_PANE, DETAIL_PANE])
+  assert.equal(host.workspaceOpens, 0, 'never opens a main workspace tab')
+  assert.equal(host.navigated, null)
+  dispose(ctx)
+})
+
+test('light mode: a new change does not toast and lights the chip', async () => {
+  host.reset()
+  const qc = globalThis.__queryClient
+  const ctx = fakeCtx()
+  ctx.store.notifyMode = 'light'
+  ctx.store.lastSeenAt = Date.now() - 60_000
+  qc.data = { items: [] }
+  plugin.register(ctx)
+  assert.equal($notifyMode.get(), 'light')
+  await tick(ctx)
+  assert.equal($lit.get(), false, 'nothing pending, nothing lit')
+  qc.data = { items: [{ subsystem: 'memory', profile: 'default', id: 'l1', created_at: nowSec() }] }
+  await tick(ctx)
+  assert.equal(host.toasts.length, 0)
+  assert.equal($lit.get(), true)
+  assert.deepEqual(ctx.store.announced, ['memory/default/l1'], 'still recorded, so popup mode will not replay it')
+  dispose(ctx)
+})
+
+test('opening the review pane clears the lit chip and stores lastSeenAt', async () => {
+  host.reset()
+  const qc = globalThis.__queryClient
+  const ctx = fakeCtx()
+  ctx.store.notifyMode = 'light'
+  plugin.register(ctx)
+  qc.data = { items: [{ subsystem: 'skills', profile: 'default', id: 's1', created_at: nowSec() - 1 }] }
+  await tick(ctx)
+  assert.equal($lit.get(), true, 'never seen (lastSeenAt 0) counts as unseen')
+  const before = Date.now()
+  openReview()
+  assert.equal($lit.get(), false)
+  assert.ok(ctx.store.lastSeenAt >= before && ctx.store.lastSeenAt <= Date.now(), 'lastSeenAt is now')
+  await tick(ctx)
+  assert.equal($lit.get(), false, 'the same change stays seen on the next poll')
+  qc.data = { items: [...qc.data.items, { subsystem: 'skills', profile: 'default', id: 's2', created_at: nowSec() + 2 }] }
+  await tick(ctx)
+  assert.equal($lit.get(), true, 'a change staged after the last look lights it again')
+  dispose(ctx)
+})
+
+test('a visible list pane counts as seen, so the chip does not light while the user is looking', async () => {
+  host.reset()
+  const qc = globalThis.__queryClient
+  const visible = { value: false, listeners: new Set() }
+  const vis = {
+    get: () => visible.value,
+    subscribe(fn) { visible.listeners.add(fn); fn(visible.value); return () => visible.listeners.delete(fn) },
+    listen(fn) { visible.listeners.add(fn); return () => visible.listeners.delete(fn) }
+  }
+  const show = v => { visible.value = v; visible.listeners.forEach(fn => fn(v)) }
+  host.paneVisibility = id => { host.visibilityAsked = id; return vis }
+  const ctx = fakeCtx()
+  ctx.store.notifyMode = 'light'
+  plugin.register(ctx)
+  assert.equal(host.visibilityAsked, LIST_PANE)
+  qc.data = { items: [{ subsystem: 'skills', profile: 'default', id: 'v1', created_at: nowSec() - 1 }] }
+  await tick(ctx)
+  assert.equal($lit.get(), true)
+  const realNow = Date.now
+  const T = realNow()
+  Date.now = () => T
+  show(true)
+  assert.equal($lit.get(), false, 'the pane becoming visible marks everything seen')
+  assert.equal(ctx.store.lastSeenAt, T)
+  qc.data = { items: [...qc.data.items, { subsystem: 'skills', profile: 'default', id: 'v2', created_at: (T + 1000) / 1000 }] }
+  Date.now = () => T + 2000
+  await tick(ctx)
+  Date.now = realNow
+  assert.equal($lit.get(), false, 'still visible: a change staged after the last look is seen as it lands')
+  show(false)
+  qc.data = { items: [...qc.data.items, { subsystem: 'skills', profile: 'default', id: 'v3', created_at: nowSec() + 5 }] }
+  await tick(ctx)
+  assert.equal($lit.get(), true, 'hidden again: the next change lights the chip')
+  dispose(ctx)
+  assert.equal(visible.listeners.size, 0, 'the visibility subscription is disposed with the plugin')
+  delete host.paneVisibility
+  delete host.visibilityAsked
+})
+
+test('the mode persists in plugin storage and is read back after a restart', () => {
+  host.reset()
+  const ctx = fakeCtx()
+  plugin.register(ctx)
+  setNotifyMode('light')
+  assert.equal(ctx.store.notifyMode, 'light')
+  dispose(ctx)
+  $notifyMode.set('popup') // simulate a fresh module
+  const again = fakeCtx()
+  again.store.notifyMode = ctx.store.notifyMode
+  plugin.register(again)
+  assert.equal($notifyMode.get(), 'light')
+  dispose(again)
+})
+
+test('switching modes at runtime applies to the next change without a reload', async () => {
+  host.reset()
+  const qc = globalThis.__queryClient
+  const ctx = fakeCtx()
+  qc.data = { items: [] }
+  plugin.register(ctx)
+  const a = { subsystem: 'skills', profile: 'default', id: 'r1', created_at: nowSec() - 3 }
+  qc.data = { items: [a] }
+  await tick(ctx)
+  assert.equal(host.toasts.length, 1)
+  markSeen()
+
+  setNotifyMode('light')
+  qc.data = { items: [a, { subsystem: 'skills', profile: 'default', id: 'r2', created_at: nowSec() + 1 }] }
+  await tick(ctx)
+  assert.equal(host.toasts.length, 1, 'light mode: no toast')
+  assert.equal($lit.get(), true)
+
+  setNotifyMode('popup')
+  assert.equal($lit.get(), false, 'leaving light mode turns the light off at once')
+  qc.data = { items: [...qc.data.items, { subsystem: 'memory', profile: 'default', id: 'r3', created_at: nowSec() + 2 }] }
+  await tick(ctx)
+  assert.equal(host.toasts.length, 2, 'popup mode again: the next change toasts')
+  assert.equal(host.toasts[1].message, 'newPending:1', 'only the new one, r2 is not replayed')
+  dispose(ctx)
+})
+
+test('hasUnseen compares staged seconds with lastSeenAt milliseconds', () => {
+  assert.equal(hasUnseen([{ created_at: 10 }], 9_000), true)
+  assert.equal(hasUnseen([{ created_at: 10 }], 10_000), false)
+  assert.equal(hasUnseen([{}], 0), false, 'an item without a staged time never lights')
+  assert.equal(hasUnseen(undefined, 0), false)
+})
+
+test('chip styles: lit uses the accent variable and a dot, unlit is plain; theme variables only', () => {
+  const counts = { skills: 2, memory: 1 }
+  const lit = ReviewChip({ count: 3, counts, lit: true, mode: 'light', onOpen() {}, onMode() {}, t })
+  const unlit = ReviewChip({ count: 3, counts, lit: false, mode: 'light', onOpen() {}, onMode() {}, t })
+  const button = tree => find(tree, n => n.type === 'button')
+  const dot = tree => find(tree, n => n.props?.style === CHIP_STYLES.dot)
+  assert.equal(button(lit).props.style.color, 'var(--ui-accent)')
+  assert.equal(dot(lit).props.style.background, 'var(--ui-accent)')
+  assert.equal(dot(lit).props['aria-hidden'], true)
+  assert.equal(button(unlit).props.style.color, 'var(--ui-text-secondary)')
+  assert.equal(dot(unlit), undefined, 'no dot while nothing is unseen')
+  assert.equal(button(lit).props['data-lit'], true)
+  assert.equal(button(unlit).props['data-lit'], false)
+  assert.match(button(lit).props['aria-label'], /chipUnseen/, 'screen readers hear that it lit up')
+  for (const tree of [lit, unlit]) {
+    assert.ok(walk(tree).some(n => n.props?.children === 3), 'the count shows in both states')
+  }
+  const json = JSON.stringify(CHIP_STYLES)
+  assert.doesNotMatch(json, /#[0-9a-fA-F]{3,8}\b/)
+  assert.doesNotMatch(json, /\b(?:rgb|rgba|hsl|hsla|oklch)\(/)
+})
+
+test('chip: click opens the review panes, right-click menu switches the mode', () => {
+  let opened = 0
+  const picked = []
+  const tree = ReviewChip({ count: 1, counts: { skills: 1, memory: 0 }, lit: false, mode: 'popup', onOpen: () => { opened += 1 }, onMode: m => picked.push(m), t })
+  find(tree, n => n.type === 'button').props.onClick()
+  assert.equal(opened, 1)
+  const items = walk(tree).filter(n => typeof n.props?.onCheckedChange === 'function')
+  assert.equal(items.length, 2)
+  assert.deepEqual(items.map(i => i.props.checked), [true, false])
+  items[1].props.onCheckedChange(true)
+  assert.deepEqual(picked, ['light'])
+  assert.ok(walk(tree).some(n => n.props?.children === 'notifyLabel'), 'the menu says what the choice is about')
+})
+
+test('NotifyModeSwitch is a labelled two-option segmented control', () => {
+  const changes = []
+  const tree = NotifyModeSwitch({ mode: 'light', onChange: m => changes.push(m), t })
+  assert.equal(tree.props.role, 'group')
+  assert.equal(tree.props['aria-label'], 'notifyLabel')
+  const seg = find(tree, n => Array.isArray(n.props?.options))
+  assert.equal(seg.props.value, 'light')
+  assert.deepEqual(seg.props.options.map(o => [o.id, o.label]), [['popup', 'notifyPopup'], ['light', 'notifyLight']])
+  seg.props.onChange('popup')
+  assert.deepEqual(changes, ['popup'])
+  assert.deepEqual(messages.en.notifyLabel, 'When a new change arrives')
+  assert.deepEqual([messages.en.notifyPopup, messages.en.notifyLight], ['Popup', 'Light up icon'])
+})
+
+test('the list pane header carries the notify control', () => {
+  const src = readFileSync(pluginPath, 'utf8')
+  const list = src.slice(src.indexOf('function ListPane()'), src.indexOf('// Detail pane'))
+  assert.match(list, /jsx\(NotifyModeControl, \{\}\)/)
+})
