@@ -4,7 +4,7 @@ const SDK_NAMES = ['Badge', 'Button', 'Codicon', 'ConfirmDialog', 'EmptyState', 
   'usePluginI18n', 'useQuery', 'useQueryClient', 'useValue', 'queryClient', 'atom',
   'SegmentedControl', 'ContextMenu', 'ContextMenuCheckboxItem', 'ContextMenuContent', 'ContextMenuTrigger',
   'Checkbox', 'Popover', 'PopoverContent', 'PopoverTrigger', 'Select', 'SelectContent', 'SelectItem', 'SelectTrigger',
-  'SelectValue', 'Skeleton']
+  'SelectValue', 'Skeleton', 'Input', 'Textarea']
 
 const sdk = `
 ${SDK_NAMES.filter(n => !['PALETTE_AREA', 'ROUTES_AREA', 'STATUSBAR_AREAS', 'host', 'haptic', 'relativeTime', 'queryClient', 'atom'].includes(n))

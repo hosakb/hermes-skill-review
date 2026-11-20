@@ -1,7 +1,8 @@
 """Editing a proposed change before accepting it (new routes; contract v1 is unchanged).
 
 GET  /files/{profile}/{subsystem}/{key}/edits
-     {"status": "ok", "blocks": {block_id: {"field", "text", "limit"}}} for every editable block,
+     {"status": "ok", "blocks": {block_id: {"field", "scope", "text", "limit"}}} for every editable block,
+     scope "span" (a patch's replacement text), "entry" (a whole memory entry) or "file",
      or {"status": "gone"}. "limit" is {"label", "max", "base", "strip"} or None: the shown count
      is base + len(text) (text stripped first when "strip"), against max.
 POST /files/{profile}/{subsystem}/{key}/blocks/{block_id}/edit
@@ -84,6 +85,7 @@ def test_memory_ops_editable_and_prefilled_with_the_proposed_text(client, stage,
     assert got["blocks"][add["id"]]["text"] == "gamma fact" and got["blocks"][add["id"]]["field"] == "content"
     assert got["blocks"][patch["id"]]["text"] == "ALPHA", "a patch edits its new span, not the whole entry"
     assert remove["id"] not in got["blocks"], "a removal has nothing to edit"
+    assert got["blocks"][add["id"]]["scope"] == "entry" and got["blocks"][patch["id"]]["scope"] == "span"
 
 
 def test_memory_limit_is_the_store_budget_after_the_change(client, stage, root):
@@ -105,11 +107,12 @@ def test_skill_ops_editable_fields(client, stage, root):
         {"action": "create", "name": "council", "content": skill_content("council"), "category": ""}]})
     patch_f, write_f, create_f = (entry(client, n) for n in ("demo/SKILL.md", "demo/references/a.md", "council/SKILL.md"))
     (pb,), (wb,), (cb,) = (blocks(diff(client, f)) for f in (patch_f, write_f, create_f))
-    assert edits(client, patch_f)["blocks"][pb["id"]] | {"limit": None} == {"field": "new_string", "text": "line 1", "limit": None}
+    assert edits(client, patch_f)["blocks"][pb["id"]] | {"limit": None} == {
+        "field": "new_string", "scope": "span", "text": "line 1", "limit": None}
     assert edits(client, write_f)["blocks"][wb["id"]]["field"] == "file_content"
     assert edits(client, write_f)["blocks"][wb["id"]]["text"] == "hi\n"
     got = edits(client, create_f)["blocks"][cb["id"]]
-    assert got["field"] == "content" and got["text"] == skill_content("council")
+    assert got["field"] == "content" and got["scope"] == "file" and got["text"] == skill_content("council")
     assert got["limit"]["max"] == 100_000 and got["limit"]["base"] == 0
 
 

@@ -965,7 +965,7 @@ def reject_all(profile: str, subsystem: str, key: str) -> dict[str, Any]:
 # Editing a proposed change, and where a file lives. New routes; contract v1 above is unchanged.
 #
 #   GET  /files/{profile}/{subsystem}/{key}/edits
-#        {"status": "ok", "blocks": {block_id: {"field", "text", "limit"}}} for every block whose
+#        {"status": "ok", "blocks": {block_id: {"field", "scope", "text", "limit"}}} for every block whose
 #        proposed text can be edited, or {"status": "gone"}. ``limit`` is {"label", "max", "base",
 #        "strip"} or None: the count after an edit is base + len(text), text stripped when "strip".
 #   POST /files/{profile}/{subsystem}/{key}/blocks/{block_id}/edit   body {"text": str, "apply": bool}
@@ -1004,6 +1004,13 @@ def _edit_field(subsystem: str, op: dict[str, Any]) -> Optional[str]:
     if action in {"create", "edit"} or (action == "patch" and op.get("content")):
         return "content"
     return {"patch": "new_string", "write_file": "file_content"}.get(action)
+
+
+def _edit_scope(subsystem: str, op: dict[str, Any], field: str) -> str:
+    """What the text is: ``span`` (a patch's replacement), ``entry`` (a whole memory entry) or ``file``."""
+    if field == "new_string" or (subsystem == MEMORY and op.get("action") == "patch"):
+        return "span"
+    return "entry" if subsystem == MEMORY else "file"
 
 
 def _with_edit(record: dict[str, Any], index: int, field: str, text: str) -> dict[str, Any]:
@@ -1214,7 +1221,7 @@ def file_edits(profile: str, subsystem: str, key: str) -> dict[str, Any]:
                 continue
             field = _edit_field(subsystem, op)
             text = op.get(field) or ""
-            out[block_id] = {"field": field, "text": text,
+            out[block_id] = {"field": field, "scope": _edit_scope(subsystem, op, field), "text": text,
                              "limit": _edit_limit(subsystem, entry, op, field, text, store)}
     return {"status": "ok", "blocks": out}
 
