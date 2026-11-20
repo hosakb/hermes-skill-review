@@ -2,8 +2,8 @@
  * Skill Review: Hermes Desktop half.
  *
  * Shows every skill and memory write that Hermes staged under skills.write_approval and
- * memory.write_approval. Two panes split the workspace's right edge: a list of every pending write,
- * and beside it the diff of the selected one with Accept and Reject. A new pending write is announced
+ * memory.write_approval. One pane on the workspace's right edge holds a list of every pending write
+ * and, beside it, the diff of the selected one with Accept and Reject. A new pending write is announced
  * by a toast and the status-bar count; nothing takes over the main view.
  * The backend is dashboard/plugin_api.py (/api/plugins/skill-review).
  *
@@ -49,7 +49,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'skill-review'
@@ -57,7 +57,6 @@ const ROUTE = '/skill-review'
 const POLL_MS = 3000
 
 export const LIST_PANE = `${ID}:list`
-export const DETAIL_PANE = `${ID}:detail`
 
 let CTX = null
 let useRouteFallback = false
@@ -66,7 +65,7 @@ let useRouteFallback = false
  *  the layout) keeps the selection and filters. */
 export const $selection = atom(null)
 const $scope = atom(null) // null: follow the focused profile while it has items, else all
-const $kind = atom('all')
+export const $kind = atom('all')
 const $confirming = atom(null) // key of the item whose reject dialog is open
 
 // ---------------------------------------------------------------------------------------------
@@ -705,15 +704,9 @@ function DetailPane() {
   return jsx(Detail, { item, shown: v.shown }, itemKey(item))
 }
 
-/** Route page for desktops without the pane APIs: both panes side by side in one page. */
+/** Route page for desktops without the pane APIs: the same list and diff as the pane. */
 function FallbackPage() {
-  return jsxs('div', {
-    style: { display: 'flex', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden' },
-    children: [
-      jsx('div', { style: { borderRight: '1px solid var(--ui-stroke-secondary)', flex: '0 0 300px', minHeight: 0, minWidth: 0 }, children: jsx(FilesListPane, {}) }),
-      jsx('div', { style: { flex: '1 1 auto', minHeight: 0, minWidth: 0 }, children: jsx(FileDetailPane, {}) })
-    ]
-  })
+  return jsx(ReviewPane, {})
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1546,6 +1539,110 @@ function FileDetailPane() {
   return jsx(FileDetail, { file }, fileKey(file))
 }
 
+// ---------------------------------------------------------------------------------------------
+// The review tab: list and diff side by side in one pane, stacked when the pane is narrow
+// ---------------------------------------------------------------------------------------------
+
+/** Pane width (px) below which the list and the diff take turns in one column. */
+export const REVIEW_NARROW_PX = 560
+
+/** A 0 width means the pane is hidden or not laid out yet; keep the wide layout then. */
+export const isNarrowWidth = width => typeof width === 'number' && width > 0 && width < REVIEW_NARROW_PX
+
+/** Report the node's content width on every resize. Returns the cleanup, or undefined when there
+ *  is no node or no ResizeObserver (the pane then stays side by side). */
+export function observeWidth(node, onWidth, RO = globalThis.ResizeObserver) {
+  if (!node || typeof RO !== 'function') {
+    return undefined
+  }
+
+  const observer = new RO(entries => {
+    const width = entries[entries.length - 1]?.contentRect?.width
+
+    if (typeof width === 'number') {
+      onWidth(width)
+    }
+  })
+
+  observer.observe(node)
+
+  return () => observer.disconnect()
+}
+
+const COLUMN = { display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, overflow: 'hidden' }
+
+export const REVIEW_STYLES = {
+  root: { display: 'flex', flexDirection: 'row', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden', position: 'relative' },
+  list: { ...COLUMN, borderRight: '1px solid var(--ui-stroke-secondary)', flex: '0 0 300px' },
+  detail: { ...COLUMN, flex: '1 1 0' },
+  // Narrow: the one visible column fills the pane.
+  alone: { borderRight: 0, flex: '1 1 0' },
+  // Narrow with a file open: the list stays mounted, out of sight, so its scroll position survives.
+  parked: { inset: 0, pointerEvents: 'none', position: 'absolute', visibility: 'hidden' },
+  back: { ...STYLES.bar, alignItems: 'flex-start', flex: 'none', padding: `0.35rem ${PAD}` },
+  body: { ...COLUMN, flex: '1 1 auto' }
+}
+
+/** Pure layout, so tests can drive both widths. The selection atom decides what narrow shows. */
+export function ReviewLayout({ narrow, selection, onBack, rootRef, t }) {
+  const open = Boolean(selection)
+
+  if (!narrow) {
+    return jsxs('div', {
+      ref: rootRef,
+      style: REVIEW_STYLES.root,
+      children: [
+        jsx('div', { style: REVIEW_STYLES.list, children: jsx(FilesListPane, {}) }, 'list'),
+        jsx('div', { style: REVIEW_STYLES.detail, children: jsx(FileDetailPane, {}) }, 'detail')
+      ]
+    })
+  }
+
+  const list = open
+    ? jsx('div', { 'aria-hidden': true, style: { ...REVIEW_STYLES.list, ...REVIEW_STYLES.parked }, children: jsx(FilesListPane, {}) }, 'list')
+    : jsx('div', { style: { ...REVIEW_STYLES.list, ...REVIEW_STYLES.alone }, children: jsx(FilesListPane, {}) }, 'list')
+
+  return jsxs('div', {
+    ref: rootRef,
+    style: REVIEW_STYLES.root,
+    children: [
+      list,
+      open
+        ? jsxs('div', {
+            style: REVIEW_STYLES.detail,
+            children: [
+              jsx('div', {
+                'data-review-back': true,
+                style: REVIEW_STYLES.back,
+                children: jsxs(Button, {
+                  onClick: onBack,
+                  size: 'sm',
+                  style: STYLES.button,
+                  type: 'button',
+                  variant: 'ghost',
+                  children: [jsx(Codicon, { name: 'arrow-left' }), t('backToList')]
+                })
+              }),
+              jsx('div', { style: REVIEW_STYLES.body, children: jsx(FileDetailPane, {}) })
+            ]
+          }, 'detail')
+        : null
+    ]
+  })
+}
+
+/** The single review pane: measures its own width and picks side by side or stacked. */
+export function ReviewPane() {
+  const t = usePluginI18n(ID)
+  const selection = useValue($selection)
+  const [node, setNode] = useState(null)
+  const [narrow, setNarrow] = useState(false)
+
+  useEffect(() => observeWidth(node, width => setNarrow(isNarrowWidth(width))), [node])
+
+  return jsx(ReviewLayout, { narrow, onBack: () => $selection.set(null), rootRef: setNode, selection, t })
+}
+
 const FILE_EN = {
   acceptAll: 'Accept all',
   blockLabel: summary => `Change: ${summary}`,
@@ -1576,7 +1673,7 @@ const FILE_EN = {
 // Reveal, watcher, status chip
 // ---------------------------------------------------------------------------------------------
 
-/** Show both panes (bringing back a closed one) and optionally select an item. Never opens a
+/** Show the review pane (bringing it back if closed) and optionally select an item. Never opens a
  *  main-workspace tab. Desktops without the pane APIs get the route page instead. */
 export function openReview(key) {
   if (key) {
@@ -1591,14 +1688,12 @@ export function openReview(key) {
     return
   }
 
-  for (const pane of [LIST_PANE, DETAIL_PANE]) {
-    if (typeof host.undismissPane === 'function') {
-      host.undismissPane(pane)
-    }
+  if (typeof host.undismissPane === 'function') {
+    host.undismissPane(LIST_PANE)
+  }
 
-    if (typeof host.revealPane === 'function') {
-      host.revealPane(pane)
-    }
+  if (typeof host.revealPane === 'function') {
+    host.revealPane(LIST_PANE)
   }
 }
 
@@ -1909,7 +2004,7 @@ const en = {
   newEntry: 'New entry',
   newFile: 'New file',
   newPending: n => `${n} new change${n === 1 ? '' : 's'} to review`,
-  detailTitle: 'Change',
+  backToList: 'Back to list',
   listTitle: 'Pending writes',
   paneTitle: 'Pending writes',
   reject: 'Reject',
@@ -1951,21 +2046,15 @@ export default {
 
     const contributions = [
       {
+        // One tab holding the list and the diff. The id stays 'list' so saved layouts keep it; a
+        // saved entry for the old detail pane is unregistered now, and the desktop collapses its zone.
         id: 'list',
         area: 'panes',
         title: en.listTitle,
         // Its own tiling column on the workspace's right edge, like Bots' Routines pane. 'right'
         // placement is the collapsible right sidebar's role, so this docks explicitly instead.
-        data: { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, width: '300px', minWidth: '240px' },
-        render: () => jsx(FilesListPane, {})
-      },
-      {
-        id: 'detail',
-        area: 'panes',
-        title: en.detailTitle,
-        // A second column immediately right of the list, not a tab stacked on it.
-        data: { placement: 'main', dock: { pane: LIST_PANE, pos: 'right' }, width: '560px', minWidth: '320px' },
-        render: () => jsx(FileDetailPane, {})
+        data: { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, width: '720px', minWidth: '240px' },
+        render: () => jsx(ReviewPane, {})
       },
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 110, render: () => jsx(StatusChip, {}) },
       {
