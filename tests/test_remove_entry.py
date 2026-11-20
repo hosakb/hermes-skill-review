@@ -157,6 +157,28 @@ def test_entry_changed_since_staged_fails_with_hermes_text_and_record_bytes_unch
     assert no_claims(root)
 
 
+def test_a_write_landing_after_our_check_cannot_redirect_the_removal(api, client, stage, root, monkeypatch):
+    """The entry is rewritten right after our eligibility check, before the remove op is built. The
+    removal stays pinned to the reviewed entry, so Hermes refuses instead of deleting the newer one."""
+    write_memory(root, "dev", ["alpha fact", "beta fact"])
+    rec = stage("dev", mem_batch(mreplace("alpha fact", "alpha", "alpha reworded"), {"action": "add", "content": "x"}))
+    before = pending_file(root, "dev", rec["id"], "memory").read_bytes()
+    real = api._removal_refusal
+
+    def then_edited(*args):
+        refusal = real(*args)
+        write_memory(root, "dev", ["alpha fact v2", "beta fact"])
+        return refusal
+
+    monkeypatch.setattr(api, "_removal_refusal", then_edited)
+    f = entry(client, "MEMORY.md")
+    first = blocks(diff(client, f))[0]
+    r = remove(client, f, first["id"])
+    assert r["status"] == "failed" and "Entry changed since it was staged" in r["error"], r
+    assert read_memory(root, "dev") == ["alpha fact v2", "beta fact"]
+    assert pending_file(root, "dev", rec["id"], "memory").read_bytes() == before
+
+
 def test_stale_block_is_refused(client, stage, root):
     write_memory(root, "dev", ["alpha fact v2", "beta fact"])
     rec = stage("dev", mem_batch(mpatch("alpha fact", "alpha", "ALPHA")))
