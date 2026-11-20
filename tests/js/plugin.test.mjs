@@ -33,7 +33,7 @@ register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
   parseSection, planAutoOpen, visibleItems, itemKey, resultToast, openReview, countBySubsystem, pendingPath,
-  messages, STYLES, DiffRow, DiffView, DetailHeader, ListRow, $selection, nextKeyAfter, LIST_PANE, DETAIL_PANE
+  messages, STYLES, DiffRow, DiffView, DetailHeader, ListRow, $selection, nextKeyAfter, LIST_PANE, ReviewPane
 } = mod
 const plugin = mod.default
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
@@ -49,7 +49,8 @@ const styleHas = (style, expected) => Object.entries(expected).every(([k, v]) =>
 
 function fakeCtx() {
   const timers = []
-  const store = {}
+  // autoOpen off: these tests cover the notifyMode path (auto-open.test.mjs covers autoOpen on).
+  const store = { autoOpen: false }
   const ctx = {
     disposers: [],
     registered: [],
@@ -76,21 +77,20 @@ test('default export has the contract fields', () => {
   assert.equal(typeof plugin.register, 'function')
 })
 
-test('register adds a list pane and a detail pane docked to its right, no route by default', () => {
+test('register adds no pane at startup; Review registers one pane on the workspace right edge, no route', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
+  assert.deepEqual(ctx.registered.filter(c => c.area === 'panes'), [], 'nothing docks itself at launch')
+  openReview()
   const panes = ctx.registered.filter(c => c.area === 'panes')
-  assert.deepEqual(panes.map(p => p.id), ['list', 'detail'])
+  assert.deepEqual(panes.map(p => p.id), ['list'])
   assert.equal(LIST_PANE, 'skill-review:list')
-  assert.equal(DETAIL_PANE, 'skill-review:detail')
-  const [list, detail] = panes
-  assert.deepEqual(list.data.dock, { pane: 'workspace', pos: 'right' }, 'list splits the workspace right edge')
-  assert.equal(list.data.placement, 'main')
-  assert.match(list.data.width, /^(2[89]\d|3[0-2]\d)px$/, 'list is a ~280-320px fixed track')
-  assert.deepEqual(detail.data.dock, { pane: LIST_PANE, pos: 'right' }, 'detail sits in its own column beside the list')
-  assert.equal(typeof list.render, 'function')
-  assert.equal(typeof detail.render, 'function')
+  const [pane] = panes
+  assert.deepEqual(pane.data.dock, { pane: 'workspace', pos: 'right' }, 'the pane splits the workspace right edge')
+  assert.equal(pane.data.placement, 'main')
+  assert.equal(pane.data.width, '720px', 'wide enough for the list and the diff side by side')
+  assert.equal(pane.render().type, ReviewPane)
   assert.ok(!ctx.registered.some(c => c.area === 'routes'), 'no route when the desktop has the pane APIs')
   assert.ok(ctx.registered.some(c => c.area === 'statusBar.right'))
   assert.ok(ctx.registered.some(c => c.area === 'palette'))
@@ -111,13 +111,13 @@ test('old desktops without openWorkspace get the route page as the only fallback
   dispose(ctx)
 })
 
-test('openReview reveals both panes and never opens a workspace tab', () => {
+test('openReview reveals the review pane and never opens a workspace tab', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
   openReview()
-  assert.deepEqual(host.revealed, [LIST_PANE, DETAIL_PANE])
-  assert.deepEqual(host.undismissed, [LIST_PANE, DETAIL_PANE], 'a closed pane comes back')
+  assert.deepEqual(host.revealed, [LIST_PANE])
+  assert.deepEqual(host.undismissed, [LIST_PANE], 'a closed pane comes back')
   assert.equal(host.workspaceOpens, 0)
   assert.equal(host.navigated, null)
   dispose(ctx)
@@ -150,7 +150,7 @@ test('the watcher polls from register() and only toasts, with an action that rev
   assert.equal(toast.message, 'newPending:1')
   assert.equal(typeof toast.action?.onClick, 'function')
   toast.action.onClick()
-  assert.deepEqual(host.revealed, [LIST_PANE, DETAIL_PANE])
+  assert.deepEqual(host.revealed, [LIST_PANE])
   assert.equal($selection.get(), itemKey(council), 'the toast action selects the new item')
 
   interval.fn(); await flush()
@@ -390,6 +390,7 @@ test('popup mode: a new change toasts exactly once, with a Review action that on
   const ctx = fakeCtx()
   qc.data = { items: [] }
   plugin.register(ctx)
+  await tick(ctx) // the first poll only records
   const item = { subsystem: 'skills', profile: 'default', id: 'p1', created_at: nowSec() + 5 }
   qc.data = { items: [item] }
   await tick(ctx)
@@ -398,7 +399,7 @@ test('popup mode: a new change toasts exactly once, with a Review action that on
   assert.equal(host.toasts[0].action.label, 'review')
   assert.equal($lit.get(), false, 'popup mode never lights the chip')
   host.toasts[0].action.onClick()
-  assert.deepEqual(host.revealed, [LIST_PANE, DETAIL_PANE])
+  assert.deepEqual(host.revealed, [LIST_PANE])
   assert.equal(host.workspaceOpens, 0, 'never opens a main workspace tab')
   assert.equal(host.navigated, null)
   dispose(ctx)
@@ -504,6 +505,7 @@ test('switching modes at runtime applies to the next change without a reload', a
   const ctx = fakeCtx()
   qc.data = { items: [] }
   plugin.register(ctx)
+  await tick(ctx) // the first poll only records
   const a = { subsystem: 'skills', profile: 'default', id: 'r1', created_at: nowSec() - 3 }
   qc.data = { items: [a] }
   await tick(ctx)
