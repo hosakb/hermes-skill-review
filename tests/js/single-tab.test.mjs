@@ -62,13 +62,13 @@ const dispose = ctx => ctx.disposers.forEach(fn => fn())
 
 // --- registration -----------------------------------------------------------------------------
 
-test('Review registers exactly one pane, titled Pending writes, under the old list pane id', () => {
+test('Review registers one review tab, titled Pending writes, under the old list pane id, plus the settings pane', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
   openReview()
   const panes = ctx.registered.filter(c => c.area === 'panes')
-  assert.equal(panes.length, 1, 'one pane, so one tab')
+  assert.deepEqual(panes.map(p => p.id), ['list', 'settings'], 'one review tab; the second pane holds the settings')
   const [pane] = panes
   assert.equal(pane.id, 'list', 'stable id: a saved layout that holds skill-review:list still finds it')
   assert.equal(LIST_PANE, 'skill-review:list')

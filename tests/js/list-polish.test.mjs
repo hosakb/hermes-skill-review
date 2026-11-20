@@ -158,9 +158,9 @@ test('the sort choice persists in ctx.storage and loads back', () => {
   assert.deepEqual($hidden.get(), [])
 })
 
-test('SortControl is its own component, rendered in the list pane header', () => {
+test('SortControl is its own component, rendered in the settings pane', () => {
   assert.match(src, /export function SortControl\(\) \{/)
-  assert.match(slice('function FilesListPane()', '\nfunction '), /jsx\(SortControl, \{\}\)/)
+  assert.match(slice('export function SettingsView(', '\nexport function '), /jsx\(SortControl, \{\}\)/)
 })
 
 // --- 2. profile subset ------------------------------------------------------------------------
@@ -233,9 +233,9 @@ test('Only-focused is disabled when the focused chat profile has nothing pending
   assert.equal(only.props.disabled, true)
 })
 
-test('the list pane uses the picker; the status chip keeps counting every profile', () => {
+test('the settings pane uses the picker; the status chip keeps counting every profile', () => {
   const list = slice('function FilesListPane()', '\nfunction ')
-  assert.match(list, /jsx\(ProfileControl, /)
+  assert.match(slice('export function SettingsView(', '\nexport function '), /jsx\(ProfileControl, /)
   assert.doesNotMatch(list, /scopeFocused|\$scope/, 'the old two-way scope control is gone from the live list')
   const chip = slice('function StatusChip()', '\nconst NOTIFY_EN')
   assert.doesNotMatch(chip, /\$hidden|filterFiles|shownFiles/)
@@ -253,8 +253,8 @@ test('an empty list with hidden profiles explains and offers to show them all', 
   assert.ok(walk(expand(FilesEmpty({ files: 0, gateOn: false, inScope: 0, kind: 'all', onShowAll() {}, t }))).some(n => n.props?.description === 'gateOff'))
 })
 
-test('the list pane header carries the notify control again', () => {
-  assert.match(slice('function FilesListPane()', '\nfunction '), /jsx\(NotifyModeControl, \{\}\)/)
+test('the settings pane carries the notify control', () => {
+  assert.match(slice('export function SettingsView(', '\nexport function '), /jsx\(NotifyModeControl, \{\}\)/)
 })
 
 // --- 3a. nothing overflows the pane -----------------------------------------------------------
