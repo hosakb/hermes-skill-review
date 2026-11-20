@@ -1,0 +1,12 @@
+name: skill-review
+label: Skill Review
+kind: standalone
+version: 0.1.0
+description: >
+  Desktop review pane for staged skill writes. Shows a visual diff for every
+  pending skill_manage change (skills.write_approval) and lets you accept or
+  reject it. Reads and resolves only <HERMES_HOME>/pending/skills. No network,
+  no credentials, no tools or hooks.
+requires_hermes: ">=0.22.5"
+provides_tools: []
+provides_hooks: []

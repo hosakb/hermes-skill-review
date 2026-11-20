@@ -1,0 +1,9 @@
+{
+  "name": "skill-review",
+  "label": "Skill Review",
+  "description": "Review, accept or reject staged skill writes with a visual diff.",
+  "icon": "GitCompare",
+  "version": "0.1.0",
+  "tab": {"hidden": true},
+  "api": "plugin_api.py"
+}
