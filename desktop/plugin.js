@@ -2,8 +2,10 @@
  * Skill Review: Hermes Desktop half.
  *
  * Shows every skill and memory write that Hermes staged under skills.write_approval and
- * memory.write_approval as a visual diff, with Accept and Reject buttons. It opens a review tab by itself when a new pending write appears, and shows a
- * count in the status bar. The backend is dashboard/plugin_api.py (/api/plugins/skill-review).
+ * memory.write_approval. Two panes split the workspace's right edge: a list of every pending write,
+ * and beside it the diff of the selected one with Accept and Reject. A new pending write is announced
+ * by a toast and the status-bar count; nothing takes over the main view.
+ * The backend is dashboard/plugin_api.py (/api/plugins/skill-review).
  *
  * Plain ESM, loaded uncompiled: UI is jsx() calls. Only @hermes/plugin-sdk, react and
  * react/jsx-runtime resolve. Layout and colour use inline styles with theme variables only, because
@@ -11,6 +13,7 @@
  */
 
 import {
+  atom,
   Badge,
   Button,
   Codicon,
@@ -23,7 +26,6 @@ import {
   queryClient,
   relativeTime,
   ROUTES_AREA,
-  ScrollArea,
   STATUSBAR_AREAS,
   Tip,
   useMutation,
@@ -32,16 +34,25 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'skill-review'
 const ROUTE = '/skill-review'
 const POLL_MS = 3000
-const TITLE = 'Pending writes'
+
+export const LIST_PANE = `${ID}:list`
+export const DETAIL_PANE = `${ID}:detail`
 
 let CTX = null
-let closeTab = null
+let useRouteFallback = false
+
+/** UI state shared by both panes. Module-level atoms, so a pane remount (drag, tab switch, reload of
+ *  the layout) keeps the selection and filters. */
+export const $selection = atom(null)
+const $scope = atom(null) // null: follow the focused profile while it has items, else all
+const $kind = atom('all')
+const $confirming = atom(null) // key of the item whose reject dialog is open
 
 // ---------------------------------------------------------------------------------------------
 // Pure helpers (exported for the node tests)
@@ -72,6 +83,18 @@ export function planAutoOpen(items, announced) {
 }
 
 /** Items for the chosen profile scope ('focused' | 'all') and kind ('all' | 'skills' | 'memory'). */
+/** After resolving `key`, the item to select next: the following one, else the previous, else none. */
+export function nextKeyAfter(items, key) {
+  const keys = items.map(itemKey)
+  const index = keys.indexOf(key)
+
+  if (index < 0) {
+    return keys[0] ?? null
+  }
+
+  return keys[index + 1] ?? keys[index - 1] ?? null
+}
+
 export function visibleItems(items, scope, focused, kind = 'all') {
   const inScope = scope === 'all' ? items : items.filter(item => item.profile === focused)
 
@@ -180,10 +203,117 @@ export function resultToast(verb, result, t) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Styles (theme variables only)
+// Styles (theme variables only). Every flex or grid child on the path from a pane root to a diff
+// row's text has minWidth: 0, so a long unbroken line can never push a parent wider than the pane.
 // ---------------------------------------------------------------------------------------------
 
 const mono = 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)'
+const PAD = '0.75rem'
+
+export const STYLES = {
+  paneRoot: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden' },
+  bar: {
+    borderBottom: '1px solid var(--ui-stroke-secondary)',
+    display: 'flex',
+    flex: 'none',
+    flexDirection: 'column',
+    gap: '0.4rem',
+    minWidth: 0,
+    padding: `0.5rem ${PAD}`
+  },
+  barRow: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.35rem', minWidth: 0 },
+  listScroll: { flex: '1 1 auto', minHeight: 0, minWidth: 0, overflowX: 'hidden', overflowY: 'auto' },
+  detailScroll: { flex: '1 1 auto', minHeight: 0, minWidth: 0, overflowX: 'hidden', overflowY: 'auto', padding: PAD },
+  listRow: {
+    background: 'none',
+    border: 0,
+    borderBottom: '1px solid var(--ui-stroke-tertiary)',
+    borderLeft: '2px solid transparent',
+    color: 'var(--ui-text-primary)',
+    cursor: 'pointer',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.25rem',
+    minWidth: 0,
+    padding: `0.5rem ${PAD}`,
+    textAlign: 'left',
+    width: '100%'
+  },
+  listRowSelected: { background: 'var(--ui-bg-tertiary)', borderLeft: '2px solid var(--ui-accent)' },
+  listTitle: { fontSize: '0.8125rem', fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  listMeta: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.3rem', minWidth: 0 },
+  muted: { color: 'var(--ui-text-tertiary)', fontSize: '0.7rem' },
+  // Header block: the title row, then the summary line, each padded off the pane edge on its own.
+  headerWrap: { borderBottom: '1px solid var(--ui-stroke-secondary)', display: 'flex', flex: 'none', flexDirection: 'column', minWidth: 0, paddingBottom: '0.6rem' },
+  header: {
+    alignItems: 'center',
+    display: 'flex',
+    flex: 'none',
+    flexWrap: 'wrap',
+    gap: '0.4rem 0.5rem',
+    minWidth: 0,
+    paddingBottom: '0.4rem',
+    paddingLeft: PAD,
+    paddingRight: PAD,
+    paddingTop: '0.6rem'
+  },
+  headerTitle: {
+    flex: '1 1 10rem',
+    fontSize: '0.9375rem',
+    fontWeight: 600,
+    minWidth: 0,
+    overflowWrap: 'anywhere'
+  },
+  summary: {
+    color: 'var(--ui-text-tertiary)',
+    fontSize: '0.75rem',
+    minWidth: 0,
+    overflowWrap: 'anywhere',
+    paddingLeft: PAD,
+    paddingRight: PAD
+  },
+  sections: { display: 'flex', flexDirection: 'column', gap: '0.75rem', minWidth: 0 },
+  sectionTitle: { color: 'var(--ui-text-secondary)', fontSize: '0.75rem', fontWeight: 500, marginBottom: '0.25rem', overflowWrap: 'anywhere' },
+  // Last-resort guard: a string that cannot break at all scrolls inside the box instead of being clipped.
+  diffBox: {
+    background: 'var(--ui-editor-surface-background)',
+    border: '1px solid var(--ui-stroke-secondary)',
+    borderRadius: '6px',
+    boxSizing: 'border-box',
+    maxWidth: '100%',
+    minWidth: 0,
+    overflowX: 'auto',
+    paddingBottom: '0.25rem'
+  },
+  // Fixed gutters (old no, new no, sign) and a text column that shrinks and wraps; a wrapped
+  // continuation line stays in the text column, under the text, not under the gutter.
+  row: {
+    display: 'grid',
+    fontFamily: mono,
+    fontSize: '0.75rem',
+    gridTemplateColumns: '4ch 4ch 2ch minmax(0, 1fr)',
+    lineHeight: 1.55,
+    minWidth: 0
+  },
+  gutter: { color: 'var(--ui-text-quaternary)', paddingRight: '0.5ch', textAlign: 'right', userSelect: 'none', whiteSpace: 'nowrap' },
+  sign: { paddingLeft: '0.5ch', userSelect: 'none', whiteSpace: 'nowrap' },
+  rowText: { minWidth: 0, overflowWrap: 'anywhere', paddingRight: '0.75ch', whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+  fileRow: {
+    alignItems: 'center',
+    background: 'var(--ui-bg-tertiary)',
+    color: 'var(--ui-text-primary)',
+    display: 'flex',
+    fontFamily: mono,
+    fontSize: '0.75rem',
+    fontWeight: 600,
+    gap: '0.5rem',
+    minWidth: 0,
+    overflowWrap: 'anywhere',
+    padding: '0.35rem 0.75rem'
+  },
+  hunkRow: { background: 'var(--ui-bg-quaternary)', color: 'var(--ui-text-tertiary)', fontFamily: mono, fontSize: '0.7rem', overflowWrap: 'anywhere', padding: '0.15rem 0.75rem' },
+  noteRow: { color: 'var(--ui-text-tertiary)', fontFamily: mono, fontSize: '0.75rem', overflowWrap: 'anywhere', padding: '0.35rem 0.75rem', whiteSpace: 'pre-wrap' }
+}
 
 const ROW_TONE = {
   add: {
@@ -201,116 +331,49 @@ const ROW_TONE = {
 
 const SIGN = { add: '+', remove: '-', context: ' ' }
 
-const gutter = {
-  color: 'var(--ui-text-quaternary)',
-  flex: 'none',
-  minWidth: '3.25ch',
-  padding: '0 0.5ch',
-  textAlign: 'right',
-  userSelect: 'none'
-}
-
 // ---------------------------------------------------------------------------------------------
-// Diff view
+// Diff view (pure components: props in, tree out)
 // ---------------------------------------------------------------------------------------------
 
-function DiffRow({ row, t }) {
+export function DiffRow({ row, t }) {
   if (row.kind === 'file') {
-    return jsxs('div', {
-      style: {
-        alignItems: 'center',
-        background: 'var(--ui-bg-tertiary)',
-        color: 'var(--ui-text-primary)',
-        display: 'flex',
-        fontFamily: mono,
-        fontSize: '0.75rem',
-        fontWeight: 600,
-        gap: '0.5rem',
-        padding: '0.35rem 0.75rem'
-      },
-      children: [jsx(Codicon, { name: 'file' }), row.text]
-    })
+    return jsxs('div', { style: STYLES.fileRow, children: [jsx(Codicon, { name: 'file' }), row.text] })
   }
 
   if (row.kind === 'hunk') {
-    return jsx('div', {
-      style: {
-        background: 'var(--ui-bg-quaternary)',
-        color: 'var(--ui-text-tertiary)',
-        fontFamily: mono,
-        fontSize: '0.7rem',
-        padding: '0.15rem 0.75rem'
-      },
-      children: row.text
-    })
+    return jsx('div', { style: STYLES.hunkRow, children: row.text })
   }
 
   if (row.kind === 'note') {
-    return jsx('div', {
-      style: {
-        color: 'var(--ui-text-tertiary)',
-        fontFamily: mono,
-        fontSize: '0.75rem',
-        padding: '0.35rem 0.75rem',
-        whiteSpace: 'pre-wrap'
-      },
-      children: row.text
-    })
+    return jsx('div', { style: STYLES.noteRow, children: row.text })
   }
 
   return jsxs('div', {
     'aria-label': t(`row_${row.kind}`),
-    style: {
-      ...ROW_TONE[row.kind],
-      display: 'flex',
-      fontFamily: mono,
-      fontSize: '0.75rem',
-      lineHeight: 1.55,
-      whiteSpace: 'pre'
-    },
+    style: { ...STYLES.row, ...ROW_TONE[row.kind] },
     children: [
-      jsx('span', { style: gutter, children: row.oldNo ?? '' }),
-      jsx('span', { style: gutter, children: row.newNo ?? '' }),
-      jsx('span', { style: { flex: 'none', width: '2ch' }, children: SIGN[row.kind] }),
-      jsx('span', { children: row.text || ' ' })
+      jsx('span', { style: STYLES.gutter, children: row.oldNo ?? '' }),
+      jsx('span', { style: STYLES.gutter, children: row.newNo ?? '' }),
+      jsx('span', { style: STYLES.sign, children: SIGN[row.kind] }),
+      jsx('span', { style: STYLES.rowText, children: row.text || ' ' })
     ]
   })
 }
 
-function DiffView({ sections, newFileLabel, t }) {
+export function DiffView({ sections, newFileLabel, t }) {
   return jsx('div', {
-    style: { display: 'flex', flexDirection: 'column', gap: '0.75rem' },
+    style: STYLES.sections,
     children: sections.map((section, index) => {
-      const rows = parseSection(section)
       const lead = section.kind === 'create' ? [{ kind: 'file', text: newFileLabel }] : []
+      const rows = [...lead, ...parseSection(section)]
 
       return jsxs(
         'div',
         {
+          style: { minWidth: 0 },
           children: [
-            section.title
-              ? jsx('div', {
-                  style: {
-                    color: 'var(--ui-text-secondary)',
-                    fontSize: '0.75rem',
-                    fontWeight: 500,
-                    marginBottom: '0.25rem'
-                  },
-                  children: section.title
-                })
-              : null,
-            jsx('div', {
-              style: {
-                background: 'var(--ui-editor-surface-background)',
-                border: '1px solid var(--ui-stroke-secondary)',
-                borderRadius: '6px',
-                overflowX: 'auto'
-              },
-              children: jsx('div', {
-                style: { minWidth: 'max-content', padding: '0 0 0.25rem' },
-                children: [...lead, ...rows].map((row, i) => jsx(DiffRow, { row, t }, i))
-              })
-            })
+            section.title ? jsx('div', { style: STYLES.sectionTitle, children: section.title }) : null,
+            jsx('div', { style: STYLES.diffBox, children: rows.map((row, i) => jsx(DiffRow, { row, t }, i)) })
           ]
         },
         index
@@ -320,147 +383,32 @@ function DiffView({ sections, newFileLabel, t }) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// One pending item
+// List pane
 // ---------------------------------------------------------------------------------------------
 
-function ItemCard({ item, open, onToggle }) {
-  const t = usePluginI18n(ID)
-  const queryClient = useQueryClient()
-  const [confirming, setConfirming] = useState(false)
+export function ListRow({ item, selected, onSelect, t }) {
+  const key = itemKey(item)
 
-  const diff = useQuery({
-    enabled: open,
-    queryFn: () => CTX.rest(pendingPath(item, 'diff')),
-    queryKey: [ID, 'diff', item.subsystem, item.profile, item.id],
-    refetchOnWindowFocus: false,
-    staleTime: Infinity
-  })
-
-  const resolve = useMutation({
-    mutationFn: verb =>
-      CTX.rest(pendingPath(item, verb), { method: 'POST' }).then(result => ({ result, verb })),
-    onError: (error, verb) => host.notifyError(error, t(verb === 'accept' ? 'acceptError' : 'rejectError')),
-    onSuccess: ({ result, verb }) => {
-      host.notify(resultToast(verb, result, t))
-      queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
-    }
-  })
-
-  const busy = resolve.isPending
-  const gone = diff.data?.status === 'already_handled'
-
-  useEffect(() => {
-    if (gone) {
-      queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
-    }
-  }, [gone, queryClient])
-
-  return jsxs('section', {
-    style: {
-      border: '1px solid var(--ui-stroke-secondary)',
-      borderRadius: '8px',
-      margin: '0 0.75rem 0.75rem'
-    },
+  return jsxs('button', {
+    'aria-current': selected,
+    onClick: () => onSelect(key),
+    style: selected ? { ...STYLES.listRow, ...STYLES.listRowSelected } : STYLES.listRow,
+    type: 'button',
     children: [
-      jsxs('header', {
-        style: {
-          alignItems: 'center',
-          display: 'flex',
-          flexWrap: 'wrap',
-          gap: '0.5rem',
-          padding: '0.5rem 0.75rem'
-        },
+      jsx('span', { style: STYLES.listTitle, children: item.subject }),
+      jsxs('span', {
+        style: STYLES.listMeta,
         children: [
-          jsxs('button', {
-            'aria-expanded': open,
-            onClick: onToggle,
-            style: {
-              alignItems: 'center',
-              background: 'none',
-              border: 0,
-              color: 'var(--ui-text-primary)',
-              cursor: 'pointer',
-              display: 'flex',
-              flex: '1 1 12rem',
-              gap: '0.4rem',
-              minWidth: 0,
-              padding: 0,
-              textAlign: 'left'
-            },
-            type: 'button',
-            children: [
-              jsx(Codicon, { name: open ? 'chevron-down' : 'chevron-right' }),
-              jsx('span', {
-                style: { fontSize: '0.875rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' },
-                children: item.subject
-              }),
-              jsx(Badge, { variant: item.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${item.subsystem}`) }),
-              jsx(Badge, { variant: 'muted', children: t(`action_${item.action}`) }),
-              jsx(Badge, { variant: 'outline', children: item.profile }),
-              item.origin === 'background_review'
-                ? jsx(Tip, { label: t('autoTip'), children: jsx(Badge, { variant: 'muted', children: t('auto') }) })
-                : null
-            ]
-          }),
-          jsx('span', {
-            style: { color: 'var(--ui-text-tertiary)', fontSize: '0.7rem' },
-            children: relativeTime(item.created_at * 1000)
-          }),
-          jsx(Button, {
-            disabled: busy,
-            onClick: () => {
-              haptic('tap')
-              resolve.mutate('accept')
-            },
-            size: 'sm',
-            type: 'button',
-            children: t('accept')
-          }),
-          jsx(Button, {
-            disabled: busy,
-            onClick: () => setConfirming(true),
-            size: 'sm',
-            type: 'button',
-            variant: 'outline',
-            children: t('reject')
-          })
+          jsx(Badge, { size: 'xs', variant: item.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${item.subsystem}`) }),
+          jsx(Badge, { size: 'xs', variant: 'muted', children: t(`action_${item.action}`) }),
+          jsx(Badge, { size: 'xs', variant: 'outline', children: item.profile }),
+          item.origin === 'background_review' ? jsx(Badge, { size: 'xs', variant: 'muted', children: t('auto') }) : null,
+          jsx('span', { style: STYLES.muted, children: relativeTime(item.created_at * 1000) })
         ]
-      }),
-      item.summary
-        ? jsx('div', {
-            style: { color: 'var(--ui-text-tertiary)', fontSize: '0.75rem', padding: '0 0.75rem 0.5rem 2rem' },
-            children: item.summary
-          })
-        : null,
-      open
-        ? jsx('div', {
-            style: { padding: '0 0.75rem 0.75rem' },
-            children: diff.isError
-              ? jsx(ErrorState, { description: String(diff.error?.message || ''), title: t('diffError') })
-              : diff.isLoading
-                ? jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.75rem' }, children: t('loading') })
-                : gone
-                  ? jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.75rem' }, children: t('alreadyHandled') })
-                  : jsx(DiffView, { newFileLabel: t(item.subsystem === 'memory' ? 'newEntry' : 'newFile'), sections: diff.data?.sections ?? [], t })
-          })
-        : null,
-      jsx(ConfirmDialog, {
-        confirmLabel: t('reject'),
-        description: t('rejectBody', item.subject),
-        destructive: true,
-        dismissOnConfirm: true,
-        onClose: () => setConfirming(false),
-        onConfirm: () => resolve.mutateAsync('reject'),
-        open: confirming,
-        title: t('rejectTitle')
       })
     ]
   })
 }
-
-// ---------------------------------------------------------------------------------------------
-// Data hook, pane, status chip
-// ---------------------------------------------------------------------------------------------
 
 const pendingKey = profile => [ID, 'pending', profile]
 const fetchPending = () => CTX.rest('/pending')
@@ -476,71 +424,82 @@ function usePending() {
   })
 }
 
-function ReviewPane() {
-  const t = usePluginI18n(ID)
-  const { data, error, isError, isLoading, refetch } = usePending()
+/** Items the list shows, with the same filters for both panes (the detail needs them to pick the
+ *  next item after an accept or reject). */
+function useVisible() {
+  const query = usePending()
   const focused = useValue(host.state.focusedSessionProfile) || 'default'
-  const [scope, setScope] = useState(null)
-  const [kind, setKind] = useState('all')
-  const [openKeys, setOpenKeys] = useState({})
-
-  const items = data?.items ?? []
+  const scope = useValue($scope)
+  const kind = useValue($kind)
+  const items = query.data?.items ?? []
   const focusedCount = visibleItems(items, 'focused', focused).length
   const effective = scope ?? (focusedCount > 0 ? 'focused' : 'all')
   const inScope = visibleItems(items, effective, focused)
-  const kindCounts = countBySubsystem(inScope)
-  const shown = visibleItems(items, effective, focused, kind)
-  const gateOn = (data?.profiles ?? []).some(p => Object.values(p.gates ?? {}).some(Boolean))
-  const missing = isError && /404/.test(String(error?.message || ''))
 
-  const isOpen = (item, index) => openKeys[itemKey(item)] ?? (index === 0 && shown.length === 1)
+  return {
+    ...query,
+    effective,
+    focused,
+    focusedCount,
+    inScope,
+    items,
+    kind,
+    kindCounts: countBySubsystem(inScope),
+    shown: visibleItems(items, effective, focused, kind)
+  }
+}
 
-  const bar = children => ({
-    style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' },
-    children
+function FilterButton({ active, label, onClick }) {
+  return jsx(Button, {
+    'aria-pressed': active,
+    onClick,
+    size: 'xs',
+    type: 'button',
+    variant: active ? 'chip' : 'ghost',
+    children: label
   })
+}
 
-  const header = jsxs('div', {
-    style: {
-      borderBottom: '1px solid var(--ui-stroke-secondary)',
-      display: 'flex',
-      flexDirection: 'column',
-      gap: '0.4rem',
-      padding: '0.5rem 0.75rem'
-    },
+function ListPane() {
+  const t = usePluginI18n(ID)
+  const v = useVisible()
+  const selection = useValue($selection)
+  const missing = v.isError && /404/.test(String(v.error?.message || ''))
+  const gateOn = (v.data?.profiles ?? []).some(p => Object.values(p.gates ?? {}).some(Boolean))
+
+  // Keep a selection while anything is listed: the detail pane is never blank by accident.
+  useEffect(() => {
+    if (v.shown.length && !v.shown.some(item => itemKey(item) === selection)) {
+      $selection.set(itemKey(v.shown[0]))
+    }
+  }, [v.shown, selection])
+
+  const bar = jsxs('div', {
+    style: STYLES.bar,
     children: [
-      jsxs('div', bar([
-        jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600 }, children: t('paneTitle') }),
-        items.length ? jsx(Badge, { variant: 'warn', children: items.length }) : null,
-        jsx('span', { style: { flex: 1 } }),
-        jsx(Button, {
-          onClick: () => setScope('focused'),
-          size: 'xs',
-          type: 'button',
-          variant: effective === 'focused' ? 'chip' : 'ghost',
-          children: t('scopeFocused', focused, focusedCount)
-        }),
-        jsx(Button, {
-          onClick: () => setScope('all'),
-          size: 'xs',
-          type: 'button',
-          variant: effective === 'all' ? 'chip' : 'ghost',
-          children: t('scopeAll', items.length)
-        })
-      ])),
-      jsx('div', {
-        ...bar(KINDS.map(k =>
-          jsx(Button, {
-            'aria-pressed': kind === k,
-            onClick: () => setKind(k),
-            size: 'xs',
-            type: 'button',
-            variant: kind === k ? 'chip' : 'ghost',
-            children: t('kindFilter', t(`kind_${k}`), kindCounts[k])
-          }, k)
-        )),
+      jsxs('div', {
+        style: STYLES.barRow,
+        children: [
+          jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600, minWidth: 0 }, children: t('paneTitle') }),
+          v.items.length ? jsx(Badge, { variant: 'warn', children: v.items.length }) : null
+        ]
+      }),
+      jsxs('div', {
+        'aria-label': t('scopeGroup'),
         role: 'group',
-        'aria-label': t('kindGroup')
+        style: STYLES.barRow,
+        children: [
+          jsx(FilterButton, { active: v.effective === 'focused', label: t('scopeFocused', v.focused, v.focusedCount), onClick: () => $scope.set('focused') }),
+          jsx(FilterButton, { active: v.effective === 'all', label: t('scopeAll', v.items.length), onClick: () => $scope.set('all') })
+        ]
+      }),
+      jsx('div', {
+        'aria-label': t('kindGroup'),
+        role: 'group',
+        style: STYLES.barRow,
+        children: KINDS.map(k =>
+          jsx(FilterButton, { active: v.kind === k, label: t('kindFilter', t(`kind_${k}`), v.kindCounts[k]), onClick: () => $kind.set(k) }, k)
+        )
       })
     ]
   })
@@ -549,94 +508,199 @@ function ReviewPane() {
 
   if (missing) {
     body = jsx(ErrorState, { description: t('backendMissing'), title: t('loadError') })
-  } else if (isError) {
+  } else if (v.isError) {
     body = jsx(ErrorState, {
-      children: jsx(Button, { onClick: () => refetch(), size: 'sm', type: 'button', variant: 'outline', children: t('retry') }),
-      description: String(error?.message || ''),
+      children: jsx(Button, { onClick: () => v.refetch(), size: 'sm', type: 'button', variant: 'outline', children: t('retry') }),
+      description: String(v.error?.message || ''),
       title: t('loadError')
     })
-  } else if (isLoading) {
-    body = jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.75rem', padding: '1rem' }, children: t('loading') })
-  } else if (!shown.length && inScope.length) {
-    body = jsxs('div', {
-      children: [
-        jsx(EmptyState, { description: t('emptyKind', t(`kind_${kind}`)), title: t('emptyTitle') }),
-        jsx('div', {
-          style: { display: 'flex', justifyContent: 'center' },
-          children: jsx(Button, {
-            onClick: () => setKind('all'),
-            size: 'sm',
-            type: 'button',
-            variant: 'outline',
-            children: t('showEveryKind')
-          })
-        })
-      ]
-    })
-  } else if (!shown.length) {
-    body = jsxs('div', {
-      children: [
-        jsx(EmptyState, {
-          description: items.length ? t('emptyElsewhere', items.length) : gateOn ? t('emptyBody') : t('gateOff'),
-          title: t('emptyTitle')
-        }),
-        items.length && effective === 'focused'
-          ? jsx('div', {
-              style: { display: 'flex', justifyContent: 'center' },
-              children: jsx(Button, {
-                onClick: () => setScope('all'),
-                size: 'sm',
-                type: 'button',
-                variant: 'outline',
-                children: t('showAll')
-              })
-            })
-          : null
-      ]
-    })
+  } else if (v.isLoading) {
+    body = jsx('div', { style: { ...STYLES.muted, padding: PAD }, children: t('loading') })
+  } else if (!v.shown.length) {
+    const description = v.inScope.length
+      ? t('emptyKind', t(`kind_${v.kind}`))
+      : v.items.length
+        ? t('emptyElsewhere', v.items.length)
+        : gateOn
+          ? t('emptyBody')
+          : t('gateOff')
+
+    body = jsx(EmptyState, { description, title: t('emptyTitle') })
   } else {
-    body = jsx('div', {
-      style: { paddingTop: '0.75rem' },
-      children: shown.map((item, index) =>
-        jsx(
-          ItemCard,
-          {
-            item,
-            onToggle: () => setOpenKeys(prev => ({ ...prev, [itemKey(item)]: !isOpen(item, index) })),
-            open: isOpen(item, index)
-          },
-          itemKey(item)
-        )
-      )
-    })
+    body = v.shown.map(item =>
+      jsx(ListRow, { item, onSelect: key => $selection.set(key), selected: itemKey(item) === selection, t }, itemKey(item))
+    )
   }
 
   return jsxs('div', {
-    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
-    children: [header, jsx(ScrollArea, { style: { flex: 1, minHeight: 0 }, children: body })]
+    style: STYLES.paneRoot,
+    children: [bar, jsx('div', { style: STYLES.listScroll, children: body })]
   })
 }
 
-export function openReview() {
-  if (typeof host.openWorkspace === 'function') {
-    // Re-calling with the same id refreshes the tab in place and brings it to the front.
-    closeTab = host.openWorkspace(`${ID}:review`, {
-      onClose: () => {
-        closeTab = null
-      },
-      render: () => jsx(ReviewPane, {}),
-      title: TITLE
+// ---------------------------------------------------------------------------------------------
+// Detail pane
+// ---------------------------------------------------------------------------------------------
+
+export function DetailHeader({ item, busy, onAccept, onReject, t }) {
+  const row = jsxs('header', {
+    style: STYLES.header,
+    children: [
+      jsx('span', { style: STYLES.headerTitle, children: item.subject }),
+      jsx(Button, { disabled: busy, onClick: onAccept, size: 'sm', type: 'button', children: t('accept') }),
+      jsx(Button, { disabled: busy, onClick: onReject, size: 'sm', type: 'button', variant: 'outline', children: t('reject') }),
+      jsxs('div', {
+        style: { ...STYLES.listMeta, flexBasis: '100%' },
+        children: [
+          jsx(Badge, { variant: item.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${item.subsystem}`) }),
+          jsx(Badge, { variant: 'muted', children: t(`action_${item.action}`) }),
+          jsx(Badge, { variant: 'outline', children: item.profile }),
+          item.origin === 'background_review'
+            ? jsx(Tip, { label: t('autoTip'), children: jsx(Badge, { variant: 'muted', children: t('auto') }) })
+            : null,
+          jsx('span', { style: STYLES.muted, children: relativeTime(item.created_at * 1000) })
+        ]
+      })
+    ]
+  })
+
+  return jsxs('div', {
+    style: STYLES.headerWrap,
+    children: [row, item.summary ? jsx('div', { style: STYLES.summary, children: item.summary }) : null]
+  })
+}
+
+function Detail({ item, shown }) {
+  const t = usePluginI18n(ID)
+  const queryClient = useQueryClient()
+  const confirming = useValue($confirming)
+
+  const diff = useQuery({
+    queryFn: () => CTX.rest(pendingPath(item, 'diff')),
+    queryKey: [ID, 'diff', item.subsystem, item.profile, item.id],
+    refetchOnWindowFocus: false,
+    staleTime: Infinity
+  })
+
+  const resolve = useMutation({
+    mutationFn: verb => CTX.rest(pendingPath(item, verb), { method: 'POST' }).then(result => ({ result, verb })),
+    onError: (error, verb) => host.notifyError(error, t(verb === 'accept' ? 'acceptError' : 'rejectError')),
+    onSuccess: ({ result, verb }) => {
+      host.notify(resultToast(verb, result, t))
+
+      if (result?.status !== 'failed') {
+        $selection.set(nextKeyAfter(shown, itemKey(item)))
+      }
+
+      queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
+    }
+  })
+
+  const gone = diff.data?.status === 'already_handled'
+
+  useEffect(() => {
+    if (gone) {
+      queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
+    }
+  }, [gone, queryClient])
+
+  const body = diff.isError
+    ? jsx(ErrorState, { description: String(diff.error?.message || ''), title: t('diffError') })
+    : diff.isLoading
+      ? jsx('div', { style: STYLES.muted, children: t('loading') })
+      : gone
+        ? jsx('div', { style: STYLES.muted, children: t('alreadyHandled') })
+        : jsx(DiffView, { newFileLabel: t(item.subsystem === 'memory' ? 'newEntry' : 'newFile'), sections: diff.data?.sections ?? [], t })
+
+  return jsxs('div', {
+    style: STYLES.paneRoot,
+    children: [
+      jsx(DetailHeader, {
+        busy: resolve.isPending,
+        item,
+        onAccept: () => {
+          haptic('tap')
+          resolve.mutate('accept')
+        },
+        onReject: () => $confirming.set(itemKey(item)),
+        t
+      }),
+      jsx('div', { style: STYLES.detailScroll, children: body }),
+      jsx(ConfirmDialog, {
+        confirmLabel: t('reject'),
+        description: t('rejectBody', item.subject),
+        destructive: true,
+        dismissOnConfirm: true,
+        onClose: () => $confirming.set(null),
+        onConfirm: () => resolve.mutateAsync('reject'),
+        open: confirming === itemKey(item),
+        title: t('rejectTitle')
+      })
+    ]
+  })
+}
+
+
+function DetailPane() {
+  const t = usePluginI18n(ID)
+  const v = useVisible()
+  const selection = useValue($selection)
+  const item = v.items.find(i => itemKey(i) === selection)
+
+  if (!item) {
+    return jsx('div', {
+      style: STYLES.paneRoot,
+      children: jsx(EmptyState, { description: v.items.length ? t('selectBody') : t('emptyBody'), title: t('selectTitle') })
     })
+  }
+
+  // Keyed by item, so the diff query, mutation and dialog state belong to exactly one pending write.
+  return jsx(Detail, { item, shown: v.shown }, itemKey(item))
+}
+
+/** Route page for desktops without the pane APIs: both panes side by side in one page. */
+function FallbackPage() {
+  return jsxs('div', {
+    style: { display: 'flex', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden' },
+    children: [
+      jsx('div', { style: { borderRight: '1px solid var(--ui-stroke-secondary)', flex: '0 0 300px', minHeight: 0, minWidth: 0 }, children: jsx(ListPane, {}) }),
+      jsx('div', { style: { flex: '1 1 auto', minHeight: 0, minWidth: 0 }, children: jsx(DetailPane, {}) })
+    ]
+  })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reveal, watcher, status chip
+// ---------------------------------------------------------------------------------------------
+
+/** Show both panes (bringing back a closed one) and optionally select an item. Never opens a
+ *  main-workspace tab. Desktops without the pane APIs get the route page instead. */
+export function openReview(key) {
+  if (key) {
+    $selection.set(key)
+  }
+
+  if (useRouteFallback || typeof host.openWorkspace !== 'function') {
+    host.navigate(ROUTE)
 
     return
   }
 
-  host.navigate(ROUTE)
+  for (const pane of [LIST_PANE, DETAIL_PANE]) {
+    if (typeof host.undismissPane === 'function') {
+      host.undismissPane(pane)
+    }
+
+    if (typeof host.revealPane === 'function') {
+      host.revealPane(pane)
+    }
+  }
 }
 
 /**
- * Open the review tab once per new pending write. Keys already announced (and still pending) never
- * reopen it, and the announced set survives restarts through plugin storage. Returns the new count.
+ * Announce each new pending write once with a toast whose action reveals it. Keys already announced
+ * (and still pending) are never announced again; the set survives restarts through plugin storage.
+ * Returns the number of new items.
  */
 export function announce(ctx, items) {
   if (!Array.isArray(items)) {
@@ -657,17 +721,21 @@ export function announce(ctx, items) {
   ctx.storage.set('announced', keep)
 
   if (fresh.length) {
-    openReview()
-    host.notify({ kind: 'info', message: ctx.i18n.t('newPending', fresh.length) })
+    const first = fresh[0]
+
+    host.notify({
+      action: { label: ctx.i18n.t('review'), onClick: () => openReview(first) },
+      kind: 'info',
+      message: ctx.i18n.t('newPending', fresh.length)
+    })
   }
 
   return fresh.length
 }
 
 /**
- * Background watcher, started in register(): it runs whether or not the pane, the route or the status
- * chip is mounted. It reads through the shared query client with the pane's own key, so a mounted
- * pane and the watcher share one request per interval instead of polling twice.
+ * Background watcher, started in register(): it runs whether or not either pane is mounted. It
+ * reads through the shared query client with the panes' own key, so they share one request.
  */
 function startWatcher(ctx) {
   const tick = () => {
@@ -676,7 +744,7 @@ function startWatcher(ctx) {
     return queryClient
       .fetchQuery({ queryFn: fetchPending, queryKey: pendingKey(profile), staleTime: POLL_MS - 500 })
       .then(data => announce(ctx, data?.items))
-      .catch(() => 0) // backend off or unreachable: the pane shows the error when opened
+      .catch(() => 0) // backend off or unreachable: the list pane shows the error
   }
 
   ctx.setTimeout(tick, 1500)
@@ -760,18 +828,24 @@ const en = {
   newEntry: 'New entry',
   newFile: 'New file',
   newPending: n => `${n} new change${n === 1 ? '' : 's'} to review`,
-  paneTitle: 'Review pending writes',
+  detailTitle: 'Change',
+  listTitle: 'Pending writes',
+  paneTitle: 'Pending writes',
   reject: 'Reject',
   rejectBody: name => `The proposed change to ${name} is discarded. Hermes can propose it again.`,
   rejectError: 'Could not reject the change',
   rejectTitle: 'Reject this change?',
   rejected: name => `Rejected change to ${name}`,
   retry: 'Retry',
+  review: 'Review',
   row_add: 'added line',
   row_context: 'unchanged line',
   row_remove: 'removed line',
   scopeAll: n => `All profiles (${n})`,
+  scopeGroup: 'Profiles',
   scopeFocused: (profile, n) => `${profile} (${n})`,
+  selectBody: 'Pick a change in the list to see its diff.',
+  selectTitle: 'No change selected',
   showAll: 'Show all profiles',
   showEveryKind: 'Show all kinds'
 }
@@ -783,20 +857,32 @@ export default {
   name: 'Skill Review',
   register(ctx) {
     CTX = ctx
+    useRouteFallback = typeof host.openWorkspace !== 'function'
     ctx.i18n.register({ en })
     ctx.onDispose(() => {
-      if (closeTab) {
-        closeTab()
-      }
-
-      closeTab = null
       CTX = null
     })
 
     startWatcher(ctx)
 
-    ctx.registerMany([
-      { id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(ReviewPane, {}) },
+    const contributions = [
+      {
+        id: 'list',
+        area: 'panes',
+        title: en.listTitle,
+        // Its own tiling column on the workspace's right edge, like Bots' Routines pane. 'right'
+        // placement is the collapsible right sidebar's role, so this docks explicitly instead.
+        data: { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, width: '300px', minWidth: '240px' },
+        render: () => jsx(ListPane, {})
+      },
+      {
+        id: 'detail',
+        area: 'panes',
+        title: en.detailTitle,
+        // A second column immediately right of the list, not a tab stacked on it.
+        data: { placement: 'main', dock: { pane: LIST_PANE, pos: 'right' }, width: '560px', minWidth: '320px' },
+        render: () => jsx(DetailPane, {})
+      },
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 110, render: () => jsx(StatusChip, {}) },
       {
         area: PALETTE_AREA,
@@ -804,10 +890,16 @@ export default {
           id: `${ID}.open`,
           keywords: ['skill', 'memory', 'review', 'pending', 'diff', 'approve'],
           label: 'Review pending skill and memory changes',
-          run: openReview
+          run: () => openReview()
         },
         id: 'open'
       }
-    ])
+    ]
+
+    if (useRouteFallback) {
+      contributions.push({ id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(FallbackPage, {}) })
+    }
+
+    ctx.registerMany(contributions)
   }
 }
