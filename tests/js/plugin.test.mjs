@@ -16,7 +16,7 @@ globalThis.__host = {
 }
 register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
-const { parseSection, planAutoOpen, visibleItems, itemKey, resultToast, openReview } = mod
+const { parseSection, planAutoOpen, visibleItems, itemKey, resultToast, openReview, countBySubsystem, pendingPath, messages } = mod
 
 const plugin = mod.default
 
@@ -57,26 +57,60 @@ test('openReview uses openWorkspace when present and navigates otherwise', () =>
 })
 
 test('planAutoOpen announces only keys that are new', () => {
-  const a = { profile: 'dev', id: 'a1' }
-  const b = { profile: 'ops', id: 'a1' } // same id in another profile is a different item
+  const a = { subsystem: 'skills', profile: 'dev', id: 'a1' }
+  const b = { subsystem: 'skills', profile: 'ops', id: 'a1' } // same id in another profile is a different item
+  const c = { subsystem: 'memory', profile: 'dev', id: 'a1' } // and so is the same id in the other subsystem
   let r = planAutoOpen([a], [])
-  assert.deepEqual(r.fresh, ['dev/a1'])
+  assert.deepEqual(r.fresh, ['skills/dev/a1'])
   assert.deepEqual(planAutoOpen([a], r.keep).fresh, [], 'seen items never reopen')
-  r = planAutoOpen([a, b], r.keep)
-  assert.deepEqual(r.fresh, ['ops/a1'])
-  assert.deepEqual(planAutoOpen([b], r.keep).keep, ['ops/a1'], 'resolved items are pruned')
-  assert.deepEqual(planAutoOpen([], ['dev/a1']).keep, [])
+  r = planAutoOpen([a, b, c], r.keep)
+  assert.deepEqual(r.fresh, ['skills/ops/a1', 'memory/dev/a1'])
+  assert.deepEqual(planAutoOpen([b], r.keep).keep, ['skills/ops/a1'], 'resolved items are pruned')
+  assert.deepEqual(planAutoOpen([], ['skills/dev/a1']).keep, [])
 })
 
-test('visibleItems filters by focused profile unless scope is all', () => {
-  const items = [{ profile: 'dev', id: '1' }, { profile: 'ops', id: '2' }]
-  assert.deepEqual(visibleItems(items, 'focused', 'ops').map(itemKey), ['ops/2'])
-  assert.equal(visibleItems(items, 'all', 'ops').length, 2)
+test('visibleItems filters by focused profile and by subsystem', () => {
+  const items = [
+    { subsystem: 'skills', profile: 'dev', id: '1' },
+    { subsystem: 'memory', profile: 'dev', id: '2' },
+    { subsystem: 'memory', profile: 'ops', id: '3' }
+  ]
+  assert.deepEqual(visibleItems(items, 'focused', 'dev').map(i => i.id), ['1', '2'])
+  assert.deepEqual(visibleItems(items, 'all', 'dev').map(i => i.id), ['1', '2', '3'])
+  assert.deepEqual(visibleItems(items, 'all', 'dev', 'memory').map(i => i.id), ['2', '3'])
+  assert.deepEqual(visibleItems(items, 'focused', 'dev', 'skills').map(i => i.id), ['1'])
+  assert.deepEqual(visibleItems(items, 'all', 'dev', 'all').length, 3)
+})
+
+test('countBySubsystem counts each kind and the combined total', () => {
+  const items = [{ subsystem: 'skills' }, { subsystem: 'memory' }, { subsystem: 'memory' }]
+  assert.deepEqual(countBySubsystem(items), { all: 3, memory: 2, skills: 1 })
+  assert.deepEqual(countBySubsystem([]), { all: 0, memory: 0, skills: 0 })
+})
+
+test('pendingPath encodes every segment and names the subsystem', () => {
+  const item = { subsystem: 'memory', profile: 'dev', id: 'ab12' }
+  assert.equal(pendingPath(item, 'diff'), '/pending/memory/dev/ab12/diff')
+  assert.equal(pendingPath({ ...item, id: 'a/b' }, 'accept'), '/pending/memory/dev/a%2Fb/accept')
+})
+
+test('every action the backend can report has a label', () => {
+  for (const action of ['create', 'edit', 'patch', 'delete', 'write_file', 'remove_file', 'batch', 'add', 'remove', 'replace', 'unknown']) {
+    assert.ok(messages.en[`action_${action}`], action)
+  }
+  for (const kind of ['skills', 'memory']) assert.ok(messages.en[`kind_${kind}`], kind)
 })
 
 test('parseSection: create is all added with line numbers', () => {
   const rows = parseSection({ kind: 'create', text: 'a\nb\n' })
   assert.deepEqual(rows.map(r => [r.kind, r.text, r.newNo]), [['add', 'a', 1], ['add', 'b', 2]])
+})
+
+test('parseSection: memory entry patch renders as a one-line replace', () => {
+  const text = '--- a/USER.md\n+++ b/USER.md\n@@ -1 +1 @@\n-Likes dark mode\n+Likes light mode\n'
+  const rows = parseSection({ kind: 'diff', text })
+  assert.deepEqual(rows.map(r => [r.kind, r.text]),
+    [['file', 'USER.md'], ['hunk', '@@ -1 +1 @@'], ['remove', 'Likes dark mode'], ['add', 'Likes light mode']])
 })
 
 test('parseSection: delete is all removed', () => {
@@ -113,8 +147,8 @@ test('parseSection: notes such as a failed patch render as note rows', () => {
 
 test('resultToast maps every backend status', () => {
   const t = (k, a) => `${k}:${a ?? ''}`
-  assert.deepEqual(resultToast('accept', { status: 'applied', item: { skill: 's' } }, t), { kind: 'success', message: 'accepted:s' })
-  assert.deepEqual(resultToast('reject', { status: 'rejected', item: { skill: 's' } }, t), { kind: 'info', message: 'rejected:s' })
+  assert.deepEqual(resultToast('accept', { status: 'applied', item: { subject: 's' } }, t), { kind: 'success', message: 'accepted:s' })
+  assert.deepEqual(resultToast('reject', { status: 'rejected', item: { subject: 's' } }, t), { kind: 'info', message: 'rejected:s' })
   assert.equal(resultToast('accept', { status: 'already_handled' }, t).kind, 'info')
   assert.equal(resultToast('accept', { status: 'failed', error: 'x' }, t).kind, 'error')
 })

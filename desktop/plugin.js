@@ -1,8 +1,8 @@
 /**
  * Skill Review: Hermes Desktop half.
  *
- * Shows every skill write that Hermes staged under skills.write_approval as a visual diff, with Accept
- * and Reject buttons. It opens a review tab by itself when a new pending write appears, and shows a
+ * Shows every skill and memory write that Hermes staged under skills.write_approval and
+ * memory.write_approval as a visual diff, with Accept and Reject buttons. It opens a review tab by itself when a new pending write appears, and shows a
  * count in the status bar. The backend is dashboard/plugin_api.py (/api/plugins/skill-review).
  *
  * Plain ESM, loaded uncompiled: UI is jsx() calls. Only @hermes/plugin-sdk, react and
@@ -37,7 +37,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'skill-review'
 const ROUTE = '/skill-review'
 const POLL_MS = 3000
-const TITLE = 'Skill review'
+const TITLE = 'Pending writes'
 
 let CTX = null
 let closeTab = null
@@ -46,7 +46,19 @@ let closeTab = null
 // Pure helpers (exported for the node tests)
 // ---------------------------------------------------------------------------------------------
 
-export const itemKey = item => `${item.profile}/${item.id}`
+// The id is unique only inside one profile's queue for one subsystem, so the key carries all three.
+export const itemKey = item => `${item.subsystem}/${item.profile}/${item.id}`
+
+export const KINDS = ['all', 'skills', 'memory']
+
+export const countBySubsystem = items => ({
+  all: items.length,
+  memory: items.filter(item => item.subsystem === 'memory').length,
+  skills: items.filter(item => item.subsystem === 'skills').length
+})
+
+export const pendingPath = (item, verb) =>
+  `/pending/${encodeURIComponent(item.subsystem)}/${encodeURIComponent(item.profile)}/${encodeURIComponent(item.id)}/${verb}`
 
 /** Keys that were not announced before, and the announced set to keep (pruned to what is still pending). */
 export function planAutoOpen(items, announced) {
@@ -58,8 +70,11 @@ export function planAutoOpen(items, announced) {
   return { fresh, keep }
 }
 
-export function visibleItems(items, scope, focused) {
-  return scope === 'all' ? items : items.filter(item => item.profile === focused)
+/** Items for the chosen profile scope ('focused' | 'all') and kind ('all' | 'skills' | 'memory'). */
+export function visibleItems(items, scope, focused, kind = 'all') {
+  const inScope = scope === 'all' ? items : items.filter(item => item.profile === focused)
+
+  return kind === 'all' ? inScope : inScope.filter(item => item.subsystem === kind)
 }
 
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
@@ -144,7 +159,7 @@ export function parseSection(section) {
 
 /** One toast per backend status. Returns { kind, message }. */
 export function resultToast(verb, result, t) {
-  const name = result?.item?.skill || ''
+  const name = result?.item?.subject || ''
 
   switch (result?.status) {
     case 'applied':
@@ -309,17 +324,15 @@ function ItemCard({ item, open, onToggle }) {
 
   const diff = useQuery({
     enabled: open,
-    queryFn: () => CTX.rest(`/pending/${encodeURIComponent(item.profile)}/${encodeURIComponent(item.id)}/diff`),
-    queryKey: [ID, 'diff', item.profile, item.id],
+    queryFn: () => CTX.rest(pendingPath(item, 'diff')),
+    queryKey: [ID, 'diff', item.subsystem, item.profile, item.id],
     refetchOnWindowFocus: false,
     staleTime: Infinity
   })
 
   const resolve = useMutation({
     mutationFn: verb =>
-      CTX.rest(`/pending/${encodeURIComponent(item.profile)}/${encodeURIComponent(item.id)}/${verb}`, {
-        method: 'POST'
-      }).then(result => ({ result, verb })),
+      CTX.rest(pendingPath(item, verb), { method: 'POST' }).then(result => ({ result, verb })),
     onError: (error, verb) => host.notifyError(error, t(verb === 'accept' ? 'acceptError' : 'rejectError')),
     onSuccess: ({ result, verb }) => {
       host.notify(resultToast(verb, result, t))
@@ -373,8 +386,9 @@ function ItemCard({ item, open, onToggle }) {
               jsx(Codicon, { name: open ? 'chevron-down' : 'chevron-right' }),
               jsx('span', {
                 style: { fontSize: '0.875rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' },
-                children: item.skill
+                children: item.subject
               }),
+              jsx(Badge, { variant: item.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${item.subsystem}`) }),
               jsx(Badge, { variant: 'muted', children: t(`action_${item.action}`) }),
               jsx(Badge, { variant: 'outline', children: item.profile }),
               item.origin === 'background_review'
@@ -421,12 +435,12 @@ function ItemCard({ item, open, onToggle }) {
                 ? jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.75rem' }, children: t('loading') })
                 : gone
                   ? jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.75rem' }, children: t('alreadyHandled') })
-                  : jsx(DiffView, { newFileLabel: t('newFile'), sections: diff.data?.sections ?? [], t })
+                  : jsx(DiffView, { newFileLabel: t(item.subsystem === 'memory' ? 'newEntry' : 'newFile'), sections: diff.data?.sections ?? [], t })
           })
         : null,
       jsx(ConfirmDialog, {
         confirmLabel: t('reject'),
-        description: t('rejectBody', item.skill),
+        description: t('rejectBody', item.subject),
         destructive: true,
         dismissOnConfirm: true,
         onClose: () => setConfirming(false),
@@ -458,43 +472,66 @@ function ReviewPane() {
   const { data, error, isError, isLoading, refetch } = usePending()
   const focused = useValue(host.state.focusedSessionProfile) || 'default'
   const [scope, setScope] = useState(null)
+  const [kind, setKind] = useState('all')
   const [openKeys, setOpenKeys] = useState({})
 
   const items = data?.items ?? []
   const focusedCount = visibleItems(items, 'focused', focused).length
   const effective = scope ?? (focusedCount > 0 ? 'focused' : 'all')
-  const shown = visibleItems(items, effective, focused)
-  const gateOn = (data?.profiles ?? []).some(p => p.gate)
+  const inScope = visibleItems(items, effective, focused)
+  const kindCounts = countBySubsystem(inScope)
+  const shown = visibleItems(items, effective, focused, kind)
+  const gateOn = (data?.profiles ?? []).some(p => Object.values(p.gates ?? {}).some(Boolean))
   const missing = isError && /404/.test(String(error?.message || ''))
 
   const isOpen = (item, index) => openKeys[itemKey(item)] ?? (index === 0 && shown.length === 1)
 
+  const bar = children => ({
+    style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' },
+    children
+  })
+
   const header = jsxs('div', {
     style: {
-      alignItems: 'center',
       borderBottom: '1px solid var(--ui-stroke-secondary)',
       display: 'flex',
-      flexWrap: 'wrap',
-      gap: '0.5rem',
+      flexDirection: 'column',
+      gap: '0.4rem',
       padding: '0.5rem 0.75rem'
     },
     children: [
-      jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600 }, children: t('paneTitle') }),
-      items.length ? jsx(Badge, { variant: 'warn', children: items.length }) : null,
-      jsx('span', { style: { flex: 1 } }),
-      jsx(Button, {
-        onClick: () => setScope('focused'),
-        size: 'xs',
-        type: 'button',
-        variant: effective === 'focused' ? 'chip' : 'ghost',
-        children: t('scopeFocused', focused, focusedCount)
-      }),
-      jsx(Button, {
-        onClick: () => setScope('all'),
-        size: 'xs',
-        type: 'button',
-        variant: effective === 'all' ? 'chip' : 'ghost',
-        children: t('scopeAll', items.length)
+      jsxs('div', bar([
+        jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600 }, children: t('paneTitle') }),
+        items.length ? jsx(Badge, { variant: 'warn', children: items.length }) : null,
+        jsx('span', { style: { flex: 1 } }),
+        jsx(Button, {
+          onClick: () => setScope('focused'),
+          size: 'xs',
+          type: 'button',
+          variant: effective === 'focused' ? 'chip' : 'ghost',
+          children: t('scopeFocused', focused, focusedCount)
+        }),
+        jsx(Button, {
+          onClick: () => setScope('all'),
+          size: 'xs',
+          type: 'button',
+          variant: effective === 'all' ? 'chip' : 'ghost',
+          children: t('scopeAll', items.length)
+        })
+      ])),
+      jsx('div', {
+        ...bar(KINDS.map(k =>
+          jsx(Button, {
+            'aria-pressed': kind === k,
+            onClick: () => setKind(k),
+            size: 'xs',
+            type: 'button',
+            variant: kind === k ? 'chip' : 'ghost',
+            children: t('kindFilter', t(`kind_${k}`), kindCounts[k])
+          }, k)
+        )),
+        role: 'group',
+        'aria-label': t('kindGroup')
       })
     ]
   })
@@ -511,6 +548,22 @@ function ReviewPane() {
     })
   } else if (isLoading) {
     body = jsx('div', { style: { color: 'var(--ui-text-tertiary)', fontSize: '0.75rem', padding: '1rem' }, children: t('loading') })
+  } else if (!shown.length && inScope.length) {
+    body = jsxs('div', {
+      children: [
+        jsx(EmptyState, { description: t('emptyKind', t(`kind_${kind}`)), title: t('emptyTitle') }),
+        jsx('div', {
+          style: { display: 'flex', justifyContent: 'center' },
+          children: jsx(Button, {
+            onClick: () => setKind('all'),
+            size: 'sm',
+            type: 'button',
+            variant: 'outline',
+            children: t('showEveryKind')
+          })
+        })
+      ]
+    })
   } else if (!shown.length) {
     body = jsxs('div', {
       children: [
@@ -609,7 +662,7 @@ function StatusChip() {
   }
 
   return jsx(Tip, {
-    label: t('chipTip', items.length),
+    label: t('chipTip', items.length, countBySubsystem(items)),
     children: jsxs('button', {
       onClick: () => {
         haptic('tap')
@@ -635,15 +688,20 @@ function StatusChip() {
 
 // ---------------------------------------------------------------------------------------------
 
+export const messages = { en: null }
+
 const en = {
   accept: 'Accept',
-  acceptError: 'Could not accept the skill change',
+  acceptError: 'Could not accept the change',
   accepted: name => `Accepted change to ${name}`,
+  action_add: 'add',
   action_batch: 'batch',
   action_create: 'new skill',
   action_delete: 'delete',
   action_edit: 'rewrite',
   action_patch: 'patch',
+  action_remove: 'remove',
+  action_replace: 'replace',
   action_remove_file: 'remove file',
   action_unknown: 'change',
   action_write_file: 'write file',
@@ -652,22 +710,29 @@ const en = {
   autoTip: 'Proposed by the background review, not a chat turn',
   backendMissing:
     'The review backend is not running. Add skill-review to plugins.enabled in config.yaml and restart the gateway.',
-  chipLabel: 'Skill review',
-  chipTip: n => `${n} skill change${n === 1 ? '' : 's'} waiting for review`,
+  chipLabel: 'Review',
+  chipTip: (n, c) => `${n} pending write${n === 1 ? '' : 's'} (${c.skills} skills, ${c.memory} memory)`,
   diffError: 'Could not load the diff',
-  emptyBody: 'When Hermes proposes a skill change, it shows up here to accept or reject.',
+  emptyBody: 'When Hermes proposes a skill or memory change, it shows up here to accept or reject.',
   emptyElsewhere: n => `Nothing for this profile. ${n} waiting in other profiles.`,
-  emptyTitle: 'No skill changes waiting',
+  emptyKind: kind => `Nothing under ${kind} for this profile.`,
+  emptyTitle: 'No changes waiting',
   failed: reason => `Change not applied${reason ? `: ${reason}` : ''}. It stays pending.`,
-  gateOff: 'Skill writes are saved right away. Set skills.write_approval to true to review them first.',
-  loadError: 'Could not load skill changes',
+  gateOff: 'Writes are saved right away. Set skills.write_approval or memory.write_approval to true to review them first.',
+  kindFilter: (label, n) => `${label} (${n})`,
+  kindGroup: 'Kind of change',
+  kind_all: 'All',
+  kind_memory: 'Memory',
+  kind_skills: 'Skills',
+  loadError: 'Could not load pending changes',
   loading: 'Loading…',
+  newEntry: 'New entry',
   newFile: 'New file',
-  newPending: n => `${n} new skill change${n === 1 ? '' : 's'} to review`,
-  paneTitle: 'Skill review',
+  newPending: n => `${n} new change${n === 1 ? '' : 's'} to review`,
+  paneTitle: 'Review pending writes',
   reject: 'Reject',
   rejectBody: name => `The proposed change to ${name} is discarded. Hermes can propose it again.`,
-  rejectError: 'Could not reject the skill change',
+  rejectError: 'Could not reject the change',
   rejectTitle: 'Reject this change?',
   rejected: name => `Rejected change to ${name}`,
   retry: 'Retry',
@@ -676,8 +741,11 @@ const en = {
   row_remove: 'removed line',
   scopeAll: n => `All profiles (${n})`,
   scopeFocused: (profile, n) => `${profile} (${n})`,
-  showAll: 'Show all profiles'
+  showAll: 'Show all profiles',
+  showEveryKind: 'Show all kinds'
 }
+
+messages.en = en
 
 export default {
   id: ID,
@@ -701,8 +769,8 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: `${ID}.open`,
-          keywords: ['skill', 'review', 'pending', 'diff', 'approve'],
-          label: 'Review pending skill changes',
+          keywords: ['skill', 'memory', 'review', 'pending', 'diff', 'approve'],
+          label: 'Review pending skill and memory changes',
           run: openReview
         },
         id: 'open'
