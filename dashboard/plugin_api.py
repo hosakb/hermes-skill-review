@@ -8,7 +8,8 @@ built from the record and the profile's current entries with the memory store's 
 Acceptance runs the same applier as ``/skills approve`` and ``/memory approve``.
 Authentication is the gateway's own plugin API auth; this module adds none. Outside Hermes's own
 functions it opens pending records, and reads MEMORY.md, USER.md, every SKILL.md and a staged write's
-target file only to fingerprint them for the evaluation cache (read-only).
+target file only to fingerprint them for the evaluation cache (read-only). An edit rewrites one op of
+a pending record; its dry-run scan writes only inside a temporary folder.
 """
 
 from __future__ import annotations
@@ -21,13 +22,15 @@ import json
 import os
 import posixpath
 import re
+import socket
+import tempfile
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 
 router = APIRouter()
 
@@ -415,7 +418,7 @@ def _single_op_record(subsystem: str, record: dict[str, Any], index: int) -> dic
     payload = record["payload"]
     if payload.get("action") != "batch":
         return record
-    op = payload["operations"][index]
+    op = _ops(payload)[index]  # index counts object ops only, as _record_ops numbers them
     if subsystem == MEMORY:
         single = {"action": "batch", "target": payload.get("target"), "operations": [op]}
     else:
@@ -428,14 +431,17 @@ def _without_op(record: dict[str, Any], index: int) -> Optional[dict[str, Any]]:
     payload = record["payload"]
     if payload.get("action") != "batch":
         return None
-    remaining = [op for i, op in enumerate(payload["operations"]) if i != index]
+    dropped = _ops(payload)[index]
+    remaining = [op for op in payload["operations"] if op is not dropped]
     return {**record, "payload": {**payload, "operations": remaining}} if remaining else None
 
 
 def _claim_and_resolve(subsystem: str, record_id: str, *, op_fingerprint: Optional[str], apply: bool,
-                       expected_key: Optional[str] = None, profile: str = "") -> dict[str, Any]:
+                       expected_key: Optional[str] = None, profile: str = "",
+                       edit: Optional[tuple[str, str]] = None) -> dict[str, Any]:
     """Resolve one op (``op_fingerprint``) or the whole record (None). Caller holds the queue lock
-    inside the profile scope. Returns ``{status, error, item}``."""
+    inside the profile scope. Returns ``{status, error, item}``. ``edit`` is ``(field, text)``: that
+    op is applied with its proposed text replaced; the staged record itself is never rewritten."""
     from tools import write_approval as wa
     from utils import atomic_json_write
     path = _queue_dir(subsystem) / f"{record_id}.json"
@@ -467,7 +473,8 @@ def _claim_and_resolve(subsystem: str, record_id: str, *, op_fingerprint: Option
                 return {"status": "already_handled", "error": None, "item": item}
             index = again[0]
         if apply:
-            target = record if index is None else _single_op_record(subsystem, record, index)
+            source = record if edit is None or index is None else _with_edit(record, index, *edit)
+            target = source if index is None else _single_op_record(subsystem, source, index)
             ok, error, _result = _apply(subsystem, target)
             if not ok:
                 os.replace(claim, path)  # untouched: the bytes we claimed go back
@@ -952,3 +959,322 @@ def accept_all(profile: str, subsystem: str, key: str) -> dict[str, Any]:
 @router.post("/files/{profile}/{subsystem}/{key}/reject-all")
 def reject_all(profile: str, subsystem: str, key: str) -> dict[str, Any]:
     return _resolve_all(profile, subsystem, key, apply=False)
+
+
+# =================================================================================================
+# Editing a proposed change, and where a file lives. New routes; contract v1 above is unchanged.
+#
+#   GET  /files/{profile}/{subsystem}/{key}/edits
+#        {"status": "ok", "blocks": {block_id: {"field", "text", "limit"}}} for every block whose
+#        proposed text can be edited, or {"status": "gone"}. ``limit`` is {"label", "max", "base",
+#        "strip"} or None: the count after an edit is base + len(text), text stripped when "strip".
+#   POST /files/{profile}/{subsystem}/{key}/blocks/{block_id}/edit   body {"text": str, "apply": bool}
+#        Replaces that one op's proposed text. apply=true accepts the edited op through the same
+#        claim and single-op Hermes apply as accept, and on failure leaves the staged record exactly
+#        as it was. apply=false runs the scan Hermes would run and rewrites only that op's text.
+#        {"status", "error", "block_id" (the edited block's new id, when saved), "file_gone"}
+#   GET  /files/{profile}/{subsystem}/{key}/location
+#        {"status": "ok", "path", "exists", "host", "user"} for the live file, {"status": "refused"}
+#        when it resolves outside the profile's memories/ or skills/ folder, or {"status": "gone"}.
+#
+# Hermes stages a write without scanning it (skills) or scans only some shapes (a memory batch is
+# dry-run, a single memory op is not), so "Save as proposal" runs the scan that accepting would run:
+# the memory store's threat scan on the new text and on the entry a patch produces, and Skills Guard
+# (``_security_scan_skill``, under the record's origin) on a copy of the file in a temporary folder.
+# =================================================================================================
+
+_EDIT_MAX_CHARS = 100_000  # Hermes's MAX_SKILL_CONTENT_CHARS; a memory store is far smaller
+
+
+def _edit_body(raw: Any) -> tuple[str, bool]:
+    """``(text, apply)`` from ``{"text": str, "apply": bool}``; nothing else is accepted (no paths, no keys)."""
+    if (not isinstance(raw, dict) or set(raw) - {"text", "apply"} or not isinstance(raw.get("text"), str)
+            or not isinstance(raw.get("apply", False), bool)):
+        raise HTTPException(status_code=422, detail='body must be {"text": string, "apply": boolean}')
+    return raw["text"], raw.get("apply", False)
+
+
+def _edit_field(subsystem: str, op: dict[str, Any]) -> Optional[str]:
+    """The op field that holds its proposed text, or None for a removal (nothing to edit)."""
+    action = op.get("action", "")
+    if subsystem == MEMORY:
+        if action not in {"add", "replace", "patch"}:
+            return None
+        return "new_text" if not op.get("content") and op.get("new_text") else "content"
+    if action in {"create", "edit"} or (action == "patch" and op.get("content")):
+        return "content"
+    return {"patch": "new_string", "write_file": "file_content"}.get(action)
+
+
+def _with_edit(record: dict[str, Any], index: int, field: str, text: str) -> dict[str, Any]:
+    """A copy of the record with op ``index``'s proposed text replaced; nothing else changes."""
+    out = copy.deepcopy(record)
+    _ops(out["payload"])[index][field] = text
+    return out
+
+
+def _block_id_of(record: dict[str, Any], op: dict[str, Any]) -> str:
+    return f"{record.get('id', '')}-{_fingerprint(op)}"
+
+
+def _entry_op(entry: Optional[dict[str, Any]], block_id: str):
+    for record, index, op in (entry or {}).get("ops", []):
+        if _block_id_of(record, op) == block_id:
+            return record, index, op
+    return None
+
+
+def _read_target(entry: dict[str, Any]) -> Optional[str]:
+    """Current text of a skill file, as the last uncached evaluation of ``entry`` located it."""
+    target = entry.get("_target")
+    try:
+        return target.read_text(encoding="utf-8-sig") if target is not None and target.is_file() else None
+    except OSError:
+        return None
+
+
+def _skill_after_text(entry: dict[str, Any], op: dict[str, Any], field: str, text: str) -> Optional[str]:
+    """The file after this op with ``text`` as its proposed text; None when a patch no longer folds."""
+    if field != "new_string":
+        return text
+    from tools import write_approval as wa
+    current = _read_target(entry)
+    if current is None:
+        return None
+    folded, error = wa._fold_patch(current, op.get("old_string") or "", text, op.get("replace_all"))
+    return None if error else folded
+
+
+def _memory_target(entry: dict[str, Any]) -> str:
+    return "user" if entry["file"] == "USER.md" else "memory"
+
+
+def _stale_fixable(subsystem: str, entry: dict[str, Any], op: dict[str, Any], reason: str) -> bool:
+    """Whether new text can fix a stale block: content validation yes, a missing target no."""
+    if subsystem == MEMORY:
+        if op.get("action") == "add":
+            return True
+        from tools.memory_tool import load_on_disk_store
+        pinned = op.get("matched_entry")
+        return bool(pinned) and pinned in load_on_disk_store()._entries_for(_memory_target(entry))
+    if entry["rel"] != "SKILL.md":
+        return False
+    from tools import skill_manager_tool as smt
+    field = _edit_field(subsystem, op)
+    after = _skill_after_text(entry, op, field, op.get(field) or "")
+    return after is not None and reason == _content_errors(smt, after, "SKILL.md")
+
+
+def _edit_refusal(subsystem: str, entry: dict[str, Any], op: dict[str, Any],
+                  block: Optional[dict[str, Any]]) -> Optional[str]:
+    if _edit_field(subsystem, op) is None:
+        return "This change only removes text, so there is nothing to edit."
+    if block is not None and block["stale"] and not _stale_fixable(subsystem, entry, op, block["stale"]):
+        return f"Editing cannot fix this change: {block['stale']}"
+    return None
+
+
+def _edit_limit(subsystem: str, entry: dict[str, Any], op: dict[str, Any], field: str, text: str,
+                store: Any) -> Optional[dict[str, Any]]:
+    """Hermes's size limit for this text, when it is a straight function of the text's length."""
+    if subsystem == MEMORY:
+        from tools.memory_tool_store import ENTRY_DELIMITER, MemoryStore
+        target = _memory_target(entry)
+        entries = list(store._entries_for(target))
+        action, content, old = op.get("action", ""), text, op.get("old_text") or ""
+        if action != "patch":
+            content, old = content.strip(), old.strip()
+        if action == "add" and content in entries:
+            return None
+        working = list(entries)
+        error, *_ = MemoryStore._apply_batch_op(working, action, content, old, "op", op.get("matched_entry"))
+        if error:
+            return None
+        total = len(ENTRY_DELIMITER.join(working))
+        return {"label": entry["file"], "max": store._char_limit(target), "base": total - len(content),
+                "strip": action != "patch"}
+    from tools.skill_manager_tool import MAX_SKILL_CONTENT_CHARS
+    if field == "new_string" and op.get("replace_all"):
+        return None
+    after = _skill_after_text(entry, op, field, text)
+    if after is None:
+        return None
+    return {"label": entry["rel"], "max": MAX_SKILL_CONTENT_CHARS, "base": len(after) - len(text), "strip": False}
+
+
+def _inside(path: Any, root: Any) -> bool:
+    """True when ``path`` resolves (symlinks followed) to something strictly inside ``root``."""
+    real, base = os.path.realpath(path), os.path.realpath(root)
+    return real != base and os.path.commonpath([real, base]) == base
+
+
+def _edit_scan(subsystem: str, entry: dict[str, Any], record: dict[str, Any], op: dict[str, Any],
+               field: str, text: str) -> Optional[str]:
+    """The refusal Hermes's content scan gives the edited text, or None."""
+    if subsystem == MEMORY:
+        from tools import memory_tool_store as mts
+        checked = [text]
+        if op.get("action") == "patch" and op.get("matched_entry"):
+            checked.append(op["matched_entry"].replace(op.get("old_text") or "", text, 1))
+        return next((error for error in map(mts._scan_memory_content, checked) if error), None)
+    from tools import skill_manager_tool as smt
+    from tools.skill_manager_scan import _replaying_background_write, _scan_baseline
+    from tools.skill_provenance import BACKGROUND_REVIEW
+    rel = "SKILL.md" if field == "content" else entry["rel"]
+    after = _skill_after_text(entry, op, field, text)
+    current = None if op.get("action") == "create" else _read_target(entry)
+    token = _replaying_background_write.set(record.get("origin") == BACKGROUND_REVIEW)
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill-review-scan-") as tmp:
+            skill_dir = Path(tmp) / "skill"
+            target = skill_dir / rel
+            if not _inside(target, skill_dir):
+                return "That file is not inside the skill."
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if current is not None:
+                target.write_text(current, encoding="utf-8")
+            scope, baseline, error = _scan_baseline(skill_dir, target)
+            if error:
+                return error
+            target.write_text(after if after is not None else text, encoding="utf-8")
+            return smt._security_scan_skill(skill_dir, baseline, scope)
+    finally:
+        _replaying_background_write.reset(token)
+
+
+def _claim_and_rewrite(subsystem: str, profile: str, key: str, record_id: str, fingerprint: str,
+                       field: str, text: str) -> dict[str, Any]:
+    """Save as proposal: claim the record, rewrite that one op's text in what we claimed, put it back
+    with Hermes's ``atomic_json_write``. Same claim as a resolve, so a concurrent chat approve or a
+    second edit finds nothing, and an op that changed meanwhile is not rewritten."""
+    from utils import atomic_json_write
+    gone = {"status": "already_handled", "error": None, "block_id": None}
+    path = _queue_dir(subsystem) / f"{record_id}.json"
+    claim = path.with_name(path.name + _CLAIM_SUFFIX)
+    try:
+        os.rename(path, claim)
+    except FileNotFoundError:
+        return gone
+    try:
+        record = json.loads(claim.read_text(encoding="utf-8-sig"))
+        again = [i for i, op, label in _record_ops(subsystem, record)
+                 if _fingerprint(op) == fingerprint and _file_key(profile, subsystem, label) == key]
+        if not again:
+            os.replace(claim, path)
+            return gone
+        edited = _with_edit(record, again[0], field, text)
+        atomic_json_write(path, edited)
+        claim.unlink()
+    except BaseException:
+        if claim.exists() and not path.exists():
+            os.replace(claim, path)
+        raise
+    return {"status": "saved", "error": None, "block_id": _block_id_of(edited, _ops(edited["payload"])[again[0]])}
+
+
+def _edit(subsystem: str, profile: str, key: str, block_id: str, text: str, apply: bool) -> dict[str, Any]:
+    """Caller holds the resolve lock and the queue lock inside the profile scope."""
+    record_id, fingerprint = _parse_block_id(block_id)
+    entry = _file_entries(subsystem, profile).get(key)
+    found = _entry_op(entry, block_id)
+    if found is None:
+        return {"status": "already_handled", "error": None, "block_id": None}
+    record, _index, op = found
+    blocks = {b["id"]: b for b in _evaluate_uncached(subsystem, entry)[1]}  # an edit always re-checks from disk
+    if refusal := _edit_refusal(subsystem, entry, op, blocks.get(block_id)):
+        return {"status": "not_editable", "error": refusal, "block_id": None}
+    field = _edit_field(subsystem, op)
+    if apply:
+        out = _claim_and_resolve(subsystem, record_id, op_fingerprint=fingerprint, apply=True,
+                                 expected_key=key, profile=profile, edit=(field, text))
+        return {"status": out["status"], "error": out["error"], "block_id": None}
+    if blocked := _edit_scan(subsystem, entry, record, op, field, text):
+        return {"status": "blocked", "error": blocked, "block_id": None}
+    return _claim_and_rewrite(subsystem, profile, key, record_id, fingerprint, field, text)
+
+
+@router.get("/files/{profile}/{subsystem}/{key}/edits")
+def file_edits(profile: str, subsystem: str, key: str) -> dict[str, Any]:
+    _check_subsystem(subsystem)
+    _check_key(key)
+    home = _resolve_profile(profile)
+    with _profile_scope(home):
+        entry = _find_entry(subsystem, profile, key)
+        if entry is None:
+            return {"status": "gone"}
+        blocks = {b["id"]: b for b in _evaluate_uncached(subsystem, entry)[1]}
+        store = None
+        if subsystem == MEMORY:
+            from tools.memory_tool import load_on_disk_store
+            store = load_on_disk_store()
+        out = {}
+        for record, _index, op in entry["ops"]:
+            block_id = _block_id_of(record, op)
+            if _edit_refusal(subsystem, entry, op, blocks.get(block_id)) is not None:
+                continue
+            field = _edit_field(subsystem, op)
+            text = op.get(field) or ""
+            out[block_id] = {"field": field, "text": text,
+                             "limit": _edit_limit(subsystem, entry, op, field, text, store)}
+    return {"status": "ok", "blocks": out}
+
+
+@router.post("/files/{profile}/{subsystem}/{key}/blocks/{block_id}/edit")
+def edit_block(profile: str, subsystem: str, key: str, block_id: str, raw: Any = Body(...)) -> dict[str, Any]:
+    text, apply = _edit_body(raw)
+    _check_subsystem(subsystem)
+    _check_key(key)
+    _parse_block_id(block_id)
+    if len(text) > _EDIT_MAX_CHARS:
+        raise HTTPException(status_code=413, detail=f"an edit is at most {_EDIT_MAX_CHARS:,} characters")
+    home = _resolve_profile(profile)
+    with _resolve_lock, _profile_scope(home):
+        with _queue_lock(subsystem):
+            outcome = _edit(subsystem, profile, key, block_id, text, apply)
+            gone = key not in _file_entries(subsystem, profile)
+    return {**outcome, "file_gone": gone}
+
+
+def _live_target(subsystem: str, entry: dict[str, Any]) -> tuple[Path, Optional[Path], bool]:
+    """``(profile folder, live file or None, refused)`` as Hermes resolves the file."""
+    if subsystem == MEMORY:
+        from tools.memory_tool import get_memory_dir
+        from tools.memory_tool_store import MemoryStore
+        return Path(get_memory_dir()), MemoryStore._path_for(_memory_target(entry)), False
+    from hermes_constants import get_skills_dir
+    from tools import skill_manager_tool as smt
+    root, name = Path(get_skills_dir()), entry.get("name") or ""
+    if not name or smt._validate_name(Path(name).name):
+        return root, None, True
+    found = smt._find_skill(name)
+    if not found:
+        return root, None, False  # a new skill: nothing to open yet
+    if entry["rel"] == "SKILL.md":
+        return root, Path(found["path"]) / "SKILL.md", False
+    target, error = smt._resolve_supporting_file(Path(found["path"]), entry["rel"])
+    return root, target, error is not None
+
+
+def _login_name() -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return os.environ.get("USER") or os.environ.get("USERNAME") or ""
+
+
+@router.get("/files/{profile}/{subsystem}/{key}/location")
+def file_location(profile: str, subsystem: str, key: str) -> dict[str, Any]:
+    _check_subsystem(subsystem)
+    _check_key(key)
+    home = _resolve_profile(profile)
+    with _profile_scope(home):
+        entry = _find_entry(subsystem, profile, key)
+        if entry is None:
+            return {"status": "gone"}
+        root, target, refused = _live_target(subsystem, entry)
+    folder = "memories" if subsystem == MEMORY else "skills"
+    if refused or (target is not None and not _inside(target, root)):
+        return {"status": "refused", "error": f"This file is not inside the profile's {folder} folder, so it is not opened."}
+    return {"status": "ok", "path": str(target) if target is not None else None,
+            "exists": target is not None and os.path.isfile(target), "host": socket.gethostname(), "user": _login_name()}
