@@ -1357,7 +1357,7 @@ export function FileList({ files, lastOpened, selection, onSelect, t }) {
   })
 }
 
-export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
+export function BlockView({ block, isNew, busy, onAccept, onReject, removal, t }) {
   const stale = block.state === 'stale'
   const tone = stale ? FILE_STYLES.blockStale : isNew ? FILE_STYLES.blockNew : FILE_STYLES.blockOlder
 
@@ -1376,7 +1376,8 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
           canAcceptBlock(block)
             ? jsx(Button, { disabled: busy, onClick: onAccept, size: 'xs', style: STYLES.button, type: 'button', children: t('accept') })
             : null,
-          jsx(Button, { disabled: busy, onClick: onReject, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('reject') })
+          jsx(Button, { disabled: busy, onClick: onReject, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('reject') }),
+          removal ? jsx(RemoveEntryButton, { block, busy, removal, t }) : null
         ]
       })
     ]
@@ -1390,6 +1391,7 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
     style: { ...FILE_STYLES.block, ...tone },
     children: [
       head,
+      removal ? jsx(RemoveEntryRow, { block, removal, t }) : null,
       block.state === 'conflict' ? jsx('div', { style: FILE_STYLES.blockNote, children: t('conflictAbove') }) : null,
       stale && block.reason ? jsx('div', { style: FILE_STYLES.blockNote, children: t('staleReason', block.reason) }) : null,
       ...segmentRows({ type: 'block', block }).map((row, i) => jsx(DiffRow, { dim: stale, row, t }, i))
@@ -1397,7 +1399,7 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
   })
 }
 
-export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, t }) {
+export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, removal, t }) {
   return jsx('div', {
     style: STYLES.diffBox,
     children: contextPlan(segments, gaps).map(segment => {
@@ -1416,6 +1418,7 @@ export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, t
             isNew: isNewBlock(block, prior),
             onAccept: () => onBlock({ blockId: block.id, verb: 'accept' }),
             onReject: () => onBlock({ blockId: block.id, verb: 'reject' }),
+            removal,
             t
           },
           block.id
@@ -1458,7 +1461,7 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
 }
 
 /** The whole detail pane for one file, as a pure view: data and callbacks in, tree out. */
-export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, expansion, onExpand, t }) {
+export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, expansion, onExpand, removal, t }) {
   // A response for another file (a late answer after the user moved on) counts as not loaded yet.
   const own = data && diffMatches(data, file) ? data : undefined
   const shownFile = own?.status === 'ok' ? own.file : file
@@ -1477,6 +1480,7 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
             onBlock: onAction,
             onExpand: (gapId, dir) => onExpand?.(shownFile, gapId, dir),
             prior,
+            removal,
             segments,
             t
           })
@@ -1505,6 +1509,197 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
       })
     ]
   })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Remove entirely: on a memory block that replaces or patches one existing entry, a third action
+// deletes that entry and drops the proposal, so neither the red line nor the green one stays.
+//   POST /files/{profile}/{subsystem}/{key}/blocks/{id}/remove-entry
+//        -> { status: 'removed' | 'already_handled' | 'failed', error, file_gone }
+// It asks first, in a row under the block head. Skill blocks never offer it.
+// ---------------------------------------------------------------------------------------------
+
+/** null, or { key: fileKey, blockId, phase: 'confirm' | 'busy' | 'error', error }. One block at a time. */
+export const $removal = atom(null)
+
+$selection.listen(next => {
+  if ($removal.get() && $removal.get().key !== next) {
+    $removal.set(null)
+  }
+})
+
+export const removeEntryPath = (file, blockId) => `${fileBase(file)}/blocks/${encodeURIComponent(blockId)}/remove-entry`
+
+/** A pending or conflicting memory block that swaps one existing line for new text. An add has no
+ *  removed line, a plain remove no added one; a multi-line entry has several removed lines. */
+export function canRemoveEntry(block, subsystem) {
+  return (
+    subsystem === 'memory' &&
+    (block?.state === 'pending' || block?.state === 'conflict') &&
+    (block.removed?.length ?? 0) === 1 &&
+    (block.added?.length ?? 0) > 0
+  )
+}
+
+/** The removal state of this one block, or null. */
+export const removalFor = (current, file, blockId) =>
+  current && current.key === fileKey(file) && current.blockId === blockId ? current : null
+
+/**
+ * POST the removal. Success toasts, refetches and returns to the list when the file is gone. A
+ * failure leaves the file open and puts the error in the block's own row, where the user is.
+ */
+export async function performRemove({ file, blockId, queryClient, rest, t }) {
+  const base = { blockId, key: fileKey(file) }
+  let result = null
+
+  $removal.set({ ...base, phase: 'busy', error: null })
+
+  try {
+    result = await rest(removeEntryPath(file, blockId), { method: 'POST' })
+  } catch (error) {
+    $removal.set({ ...base, phase: 'error', error: String(error?.message || '') || t('removeError') })
+
+    return null
+  }
+
+  const done = result?.status === 'removed' || result?.status === 'already_handled'
+
+  if (done) {
+    $removal.set(null)
+    host.notify(result.status === 'removed' ? { kind: 'success', message: t('entryRemoved') } : { kind: 'info', message: t('alreadyHandled') })
+  } else {
+    $removal.set({ ...base, phase: 'error', error: String(result?.error || '') || t('removeError') })
+  }
+
+  queryClient.invalidateQueries({ queryKey: diffKey(file) })
+
+  if (done) {
+    queryClient.invalidateQueries({ queryKey: [ID, 'files'] })
+    queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
+
+    if (result.file_gone) {
+      leaveFile(file)
+    }
+  }
+
+  return result
+}
+
+export const REMOVE_STYLES = {
+  // Quiet like Reject; the label carries the theme's removed-line red.
+  button: { ...STYLES.button, color: 'var(--ui-diff-remove-foreground)' },
+  // Continues the block head, so the question sits directly above the lines it deletes.
+  row: {
+    alignItems: 'center',
+    background: 'var(--ui-bg-tertiary)',
+    borderTop: '1px solid var(--ui-stroke-tertiary)',
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '0.3rem 0.5rem',
+    minWidth: 0,
+    padding: '0.3rem 0.6rem'
+  },
+  question: { color: 'var(--ui-text-primary)', flex: '1 1 12rem', fontSize: '0.75rem', fontWeight: 500, minWidth: 0, overflowWrap: 'anywhere' },
+  error: {
+    color: 'var(--ui-diff-remove-foreground)',
+    flex: '1 1 12rem',
+    fontSize: '0.75rem',
+    minWidth: 0,
+    overflowWrap: 'anywhere',
+    whiteSpace: 'pre-wrap'
+  }
+}
+
+/** removal: { file, current ($removal value), onAsk(blockId), onConfirm(blockId), onCancel() }. */
+export function RemoveEntryButton({ block, busy, removal, t }) {
+  if (!canRemoveEntry(block, removal.file?.subsystem)) {
+    return null
+  }
+
+  const mine = removalFor(removal.current, removal.file, block.id)
+  const open = mine?.phase === 'confirm' || mine?.phase === 'busy'
+
+  return jsx(Tip, {
+    label: t('removeEntryTip'),
+    children: jsx(Button, {
+      'aria-expanded': open,
+      disabled: busy || open,
+      onClick: () => removal.onAsk(block.id),
+      size: 'xs',
+      style: REMOVE_STYLES.button,
+      type: 'button',
+      variant: 'outline',
+      children: t('removeEntry')
+    })
+  })
+}
+
+/** The confirm question with Delete and Cancel, or the error of a removal that failed. */
+export function RemoveEntryRow({ block, removal, t }) {
+  const mine = removalFor(removal.current, removal.file, block.id)
+
+  if (!mine) {
+    return null
+  }
+
+  if (mine.phase === 'error') {
+    return jsxs('div', {
+      role: 'alert',
+      style: REMOVE_STYLES.row,
+      children: [
+        jsx('span', { style: REMOVE_STYLES.error, children: mine.error }),
+        jsx('span', {
+          style: STYLES.actions,
+          children: jsx(Button, { onClick: removal.onCancel, size: 'xs', style: STYLES.button, type: 'button', variant: 'ghost', children: t('removeDismiss') })
+        })
+      ]
+    })
+  }
+
+  const working = mine.phase === 'busy'
+
+  return jsxs('div', {
+    'aria-label': t('removeConfirm'),
+    onKeyDown: event => {
+      if (event.key === 'Escape' && !working) {
+        removal.onCancel()
+      }
+    },
+    role: 'group',
+    style: REMOVE_STYLES.row,
+    children: [
+      jsx('span', { style: REMOVE_STYLES.question, children: t('removeConfirm') }),
+      jsxs('span', {
+        style: STYLES.actions,
+        children: [
+          jsx(Button, {
+            disabled: working,
+            loading: working,
+            onClick: () => removal.onConfirm(block.id),
+            size: 'xs',
+            style: STYLES.button,
+            type: 'button',
+            variant: 'destructive',
+            children: t('removeDelete')
+          }),
+          // Focus lands on Cancel, the safe choice, when the question opens.
+          jsx(Button, { autoFocus: true, disabled: working, onClick: removal.onCancel, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('removeCancel') })
+        ]
+      })
+    ]
+  })
+}
+
+const REMOVE_EN = {
+  entryRemoved: 'Entry removed',
+  removeCancel: 'Cancel',
+  removeConfirm: 'Delete this entry and drop the proposal?',
+  removeDelete: 'Delete',
+  removeDismiss: 'Dismiss',
+  removeEntry: 'Remove entirely',
+  removeEntryTip: 'Deletes the existing entry and drops this proposal. Neither version is kept.',
+  removeError: 'Could not remove the entry'
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1913,11 +2108,21 @@ function FileDetail({ file }) {
   })
 
   const confirmId = `reject-all:${key}`
+  const removing = useValue($removal)
+
+  const removal = {
+    current: removing,
+    file,
+    onAsk: blockId => $removal.set({ blockId, error: null, key, phase: 'confirm' }),
+    onCancel: () => $removal.set(null),
+    onConfirm: blockId => performRemove({ blockId, file, queryClient, rest: (path, opts) => CTX.rest(path, opts), t })
+  }
+
   // Which context gaps are open; reset when the shown diff's version changes (expansionFor).
   const [expansion, setExpansion] = useState(null)
 
   return jsx(FileDetailView, {
-    busy: act.isPending,
+    busy: act.isPending || removing?.phase === 'busy',
     confirmOpen: confirming === confirmId,
     data: diff.data,
     error: diff.isError ? diff.error : null,
@@ -1935,6 +2140,7 @@ function FileDetail({ file }) {
     expansion,
     onExpand: (shown, gapId, dir) => setExpansion(prev => expandGap(prev, shown, gapId, dir)),
     prior,
+    removal,
     t
   })
 }
@@ -2526,6 +2732,7 @@ const en = {
 
 messages.en = en
 Object.assign(en, NOTIFY_EN, LIST_EN)
+Object.assign(en, REMOVE_EN)
 Object.assign(en, EXPAND_EN)
 
 export default {
