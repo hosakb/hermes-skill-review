@@ -308,7 +308,10 @@ test('Accept all is disabled when no block can be accepted', () => {
 
 test('the detail view shows loading, error and gone states', () => {
   const base = { busy: false, confirmOpen: false, file: MEMORY_FILE, onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t }
-  assert.match(text(expand(FileDetailView({ ...base, data: undefined, loading: true }))), /loading/)
+  // Loading is a skeleton in the diff box's place, with the file's header already filled in.
+  const loading = expand(FileDetailView({ ...base, data: undefined, loading: true }))
+  assert.ok(walk(loading).some(n => n.props?.role === 'status' && n.props['aria-busy'] === true && n.props['aria-label'] === 'loadingDiff'))
+  assert.match(text(loading), /MEMORY\.md/)
   const failed = expand(FileDetailView({ ...base, data: undefined, error: new Error('500 boom') }))
   assert.ok(walk(failed).some(n => n.props?.title === 'diffError' && /500 boom/.test(n.props.description)))
   assert.match(text(expand(FileDetailView({ ...base, data: GONE }))), /fileGone/)
