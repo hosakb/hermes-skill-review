@@ -1,7 +1,8 @@
 // Resolves the three specifiers a desktop plugin may import to in-memory stubs.
 const SDK_NAMES = ['Badge', 'Button', 'Codicon', 'ConfirmDialog', 'EmptyState', 'ErrorState', 'ScrollArea', 'Tip',
   'PALETTE_AREA', 'ROUTES_AREA', 'STATUSBAR_AREAS', 'haptic', 'host', 'relativeTime', 'useMutation',
-  'usePluginI18n', 'useQuery', 'useQueryClient', 'useValue', 'queryClient', 'atom']
+  'usePluginI18n', 'useQuery', 'useQueryClient', 'useValue', 'queryClient', 'atom',
+  'SegmentedControl', 'ContextMenu', 'ContextMenuCheckboxItem', 'ContextMenuContent', 'ContextMenuTrigger']
 
 const sdk = `
 ${SDK_NAMES.filter(n => !['PALETTE_AREA', 'ROUTES_AREA', 'STATUSBAR_AREAS', 'host', 'haptic', 'relativeTime', 'queryClient', 'atom'].includes(n))
