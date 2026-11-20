@@ -49,7 +49,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'skill-review'
@@ -994,10 +994,14 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
   })
 }
 
-export function FileDiffView({ segments, prior, busy, onBlock, t }) {
+export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, t }) {
   return jsx('div', {
     style: STYLES.diffBox,
-    children: segments.map((segment, index) => {
+    children: contextPlan(segments, gaps).map(segment => {
+      if (segment.type === 'gap') {
+        return jsx(ExpandRow, { gap: segment, onExpand: onExpand ?? (() => {}), t }, `g${segment.id}`)
+      }
+
       if (segment.type === 'block') {
         const block = segment.block
 
@@ -1015,7 +1019,7 @@ export function FileDiffView({ segments, prior, busy, onBlock, t }) {
         )
       }
 
-      return jsx('div', { style: FILE_STYLES.context, children: segmentRows(segment).map((row, i) => jsx(DiffRow, { row, t }, i)) }, `c${index}`)
+      return jsx('div', { 'data-context': segment.key, style: FILE_STYLES.context, children: segmentRows(segment).map((row, i) => jsx(DiffRow, { row, t }, i)) }, `c${segment.key}`)
     })
   })
 }
@@ -1051,7 +1055,7 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
 }
 
 /** The whole detail pane for one file, as a pure view: data and callbacks in, tree out. */
-export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, t }) {
+export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, expansion, onExpand, t }) {
   // A response for another file (a late answer after the user moved on) counts as not loaded yet.
   const own = data && diffMatches(data, file) ? data : undefined
   const shownFile = own?.status === 'ok' ? own.file : file
@@ -1064,7 +1068,15 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
       ? jsx(DiffSkeleton, { t })
       : own.status === 'gone'
         ? jsx('div', { style: STYLES.muted, children: t('fileGone') })
-        : jsx(FileDiffView, { busy, onBlock: onAction, prior, segments, t })
+        : jsx(FileDiffView, {
+            busy,
+            gaps: expansionFor(expansion, shownFile).gaps,
+            onBlock: onAction,
+            onExpand: (gapId, dir) => onExpand?.(shownFile, gapId, dir),
+            prior,
+            segments,
+            t
+          })
 
   return jsxs('div', {
     style: STYLES.paneRoot,
@@ -1498,6 +1510,8 @@ function FileDetail({ file }) {
   })
 
   const confirmId = `reject-all:${key}`
+  // Which context gaps are open; reset when the shown diff's version changes (expansionFor).
+  const [expansion, setExpansion] = useState(null)
 
   return jsx(FileDetailView, {
     busy: act.isPending,
@@ -1515,6 +1529,8 @@ function FileDetail({ file }) {
     },
     onAskRejectAll: () => $confirming.set(confirmId),
     onCloseConfirm: () => $confirming.set(null),
+    expansion,
+    onExpand: (shown, gapId, dir) => setExpansion(prev => expandGap(prev, shown, gapId, dir)),
     prior,
     t
   })
@@ -1570,6 +1586,180 @@ const FILE_EN = {
   stale: 'stale',
   staleCount: n => `${n} stale`,
   staleReason: reason => `Can no longer apply: ${reason}`
+}
+
+// ---------------------------------------------------------------------------------------------
+// Context expansion. The diff (contract v1) already carries every line of the current file as
+// context segments, numbered as Hermes reads the file, so folding and unfolding is local: no extra
+// request, and the lines always match the version on screen. Next to each change CONTEXT_LINES stay
+// visible; the rest of each gap folds into one expand row. State is per file, per gap, and resets
+// when the shown diff's version changes, because a new version can move lines.
+// ---------------------------------------------------------------------------------------------
+
+export const CONTEXT_LINES = 3
+export const EXPAND_STEP = 10
+
+/** The open gaps of `file` at its current version: { key, version, gaps: { [gapId]: { up, down, all } } }. */
+export function expansionFor(state, file) {
+  const key = fileKey(file)
+  const version = diffVersion(file)
+
+  return state && state.key === key && state.version === version ? state : { gaps: {}, key, version }
+}
+
+/** One more step (`up` or `down`) or the whole gap (`all`) for `gapId`. */
+export function expandGap(state, file, gapId, dir) {
+  const current = expansionFor(state, file)
+  const gap = current.gaps[gapId] ?? { all: false, down: 0, up: 0 }
+  const next = dir === 'all' ? { ...gap, all: true } : { ...gap, [dir]: gap[dir] + EXPAND_STEP }
+
+  return { ...current, gaps: { ...current.gaps, [gapId]: next } }
+}
+
+/**
+ * Segments to render: blocks as they are, each context segment as visible `context` runs around at most
+ * one `gap`. A gap is `top` (above the first change: it opens upward), `bottom` (below the last:
+ * it opens downward) or `between` (both). `down` lines extend from the upper edge, `up` lines from
+ * the lower edge. A gap's id is its first and last line number.
+ */
+export function contextPlan(segments, gaps = {}) {
+  const blockAt = segments.map(s => s.type === 'block')
+  const first = blockAt.indexOf(true)
+  const last = blockAt.lastIndexOf(true)
+  const out = []
+
+  segments.forEach((segment, index) => {
+    if (segment.type !== 'context') {
+      out.push(segment)
+
+      return
+    }
+
+    const lines = segment.lines ?? []
+    const n = lines.length
+
+    if (!n) {
+      return
+    }
+
+    const id = `${lines[0].no}-${lines[n - 1].no}`
+    const position = first < 0 ? null : index < first ? 'top' : index > last ? 'bottom' : 'between'
+    const open = gaps?.[id] ?? {}
+    let head = position === 'top' ? 0 : CONTEXT_LINES
+    let tail = position === 'bottom' ? 0 : CONTEXT_LINES
+    head = Math.min(n, head + (open.down ?? 0))
+    tail = Math.min(n - head, tail + (open.up ?? 0))
+
+    if (!position || open.all || head + tail >= n) {
+      out.push({ key: id, lines, type: 'context' })
+
+      return
+    }
+
+    if (head) {
+      out.push({ key: `${id}:head`, lines: lines.slice(0, head), type: 'context' })
+    }
+
+    out.push({ firstHidden: lines[head].no, hidden: n - head - tail, id, lastHidden: lines[n - tail - 1].no, position, type: 'gap' })
+
+    if (tail) {
+      out.push({ key: `${id}:tail`, lines: lines.slice(n - tail), type: 'context' })
+    }
+  })
+
+  return out
+}
+
+export const EXPAND_STYLES = {
+  // Same tone as the hunk header row: a slim band across the diff box that reads as "lines here".
+  row: {
+    alignItems: 'center',
+    background: 'var(--ui-bg-quaternary)',
+    borderLeft: '2px solid transparent',
+    color: 'var(--ui-text-tertiary)',
+    display: 'flex',
+    flexWrap: 'wrap',
+    fontFamily: mono,
+    fontSize: '0.7rem',
+    minWidth: 0
+  },
+  button: {
+    alignItems: 'center',
+    background: 'none',
+    border: 0,
+    color: 'inherit',
+    cursor: 'pointer',
+    display: 'inline-flex',
+    font: 'inherit',
+    gap: '0.35rem',
+    lineHeight: 1.55,
+    maxWidth: '100%',
+    minWidth: 0,
+    overflowWrap: 'anywhere',
+    padding: '0.15rem 0.75rem',
+    textAlign: 'left',
+    whiteSpace: 'normal'
+  },
+  // Show all sits at the row's right end, apart from the step buttons.
+  all: { marginLeft: 'auto', minWidth: 0 }
+}
+
+const STEP_ICON = { down: 'fold-down', up: 'fold-up' }
+
+/** One folded gap: step buttons (alt-click shows everything) and Show all, or only Show all when
+ *  the gap is no bigger than one step. */
+export function ExpandRow({ gap, onExpand, t }) {
+  const { hidden, position } = gap
+  const button = (dir, label, aria, style) =>
+    jsxs(
+      'button',
+      {
+        'aria-label': aria,
+        'data-expand': dir,
+        onClick: event => onExpand(gap.id, dir !== 'all' && event?.altKey ? 'all' : dir),
+        style: style ? { ...EXPAND_STYLES.button, ...style } : EXPAND_STYLES.button,
+        title: dir === 'all' ? undefined : t('expandAltHint'),
+        type: 'button',
+        children: [STEP_ICON[dir] ? jsx(Codicon, { name: STEP_ICON[dir] }) : null, label]
+      },
+      dir
+    )
+
+  const steps = []
+
+  if (hidden > EXPAND_STEP) {
+    if (position === 'top') {
+      steps.push(button('up', t('expandAbove', EXPAND_STEP), t('expandAboveAria', EXPAND_STEP, hidden)))
+    } else if (position === 'bottom') {
+      steps.push(button('down', t('expandBelow', EXPAND_STEP), t('expandBelowAria', EXPAND_STEP, hidden)))
+    } else {
+      steps.push(button('down', t('expandMore', EXPAND_STEP), t('expandDownAria', EXPAND_STEP, hidden)))
+      steps.push(button('up', t('expandMore', EXPAND_STEP), t('expandUpAria', EXPAND_STEP, hidden)))
+    }
+  }
+
+  return jsxs('div', {
+    'data-gap': gap.id,
+    style: EXPAND_STYLES.row,
+    children: [...steps, button('all', t('expandAll', hidden), t(`expandAll_${position}`, hidden), steps.length ? EXPAND_STYLES.all : null)]
+  })
+}
+
+const lineCount = n => `${n} hidden line${n === 1 ? '' : 's'}`
+
+const EXPAND_EN = {
+  expandAbove: n => `Show ${n} more lines above`,
+  expandAboveAria: (n, hidden) => `Show ${n} more lines above, ${hidden} hidden`,
+  expandAll: n => `Show all ${lineCount(n)}`,
+  expandAll_between: n => `Show all ${lineCount(n)} between these changes`,
+  expandAll_bottom: n => `Show all ${lineCount(n)} below`,
+  expandAll_top: n => `Show all ${lineCount(n)} above`,
+  expandAltHint: 'Alt-click shows every hidden line',
+  expandBelow: n => `Show ${n} more lines below`,
+  expandBelowAria: (n, hidden) => `Show ${n} more lines below, ${hidden} hidden`,
+  expandDownAria: (n, hidden) => `Show ${n} more lines below the change above, ${hidden} hidden`,
+  expandMore: n => `Show ${n} more lines`,
+  expandUpAria: (n, hidden) => `Show ${n} more lines above the change below, ${hidden} hidden`
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1933,6 +2123,7 @@ const en = {
 
 messages.en = en
 Object.assign(en, NOTIFY_EN, LIST_EN)
+Object.assign(en, EXPAND_EN)
 
 export default {
   id: ID,
