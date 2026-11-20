@@ -60,6 +60,9 @@ const ROUTE = '/skill-review'
 const POLL_MS = 3000
 
 export const LIST_PANE = `${ID}:list`
+/** The second pane. Desktop turns a plugin off when its only pane is closed (closeTreePane in the
+ *  tree store), so with two registered panes every Close only dismisses the pane it was used on. */
+export const SETTINGS_PANE = `${ID}:settings`
 
 let CTX = null
 let useRouteFallback = false
@@ -1110,8 +1113,9 @@ function DetailPane() {
 }
 
 /** Route page for desktops without the pane APIs: the same list and diff as the pane. */
+/** Desktops without the pane APIs: one route page with the settings above the review. */
 function FallbackPage() {
-  return jsx(ReviewPane, {})
+  return jsxs('div', { style: STYLES.paneRoot, children: [jsx(SettingsPane, {}), jsx(ReviewPane, {})] })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1823,7 +1827,7 @@ export function SortMenu({ value, onChange, t }) {
   })
 }
 
-/** Sort control for the list pane header. Its own component, so the list re-renders only the rows. */
+/** Sort control for the settings pane. Its own component, so a sort change re-renders only it. */
 export function SortControl() {
   const t = usePluginI18n(ID)
   const sort = useValue($sort)
@@ -1833,10 +1837,17 @@ export function SortControl() {
 
 /** The profile picker as a pure view: a trigger that says how many profiles show, and a popover
  *  with All, Only the focused chat's profile, and one checkbox per profile with its file count. */
+export function profileLabel(profiles, hidden, t) {
+  const off = new Set(hidden)
+  const shown = profiles.filter(p => !off.has(p.profile)).length
+
+  return shown === profiles.length ? t('profilesAll', profiles.length) : t('profilesShown', shown, profiles.length)
+}
+
 export function ProfilePicker({ profiles, hidden, focused, onChange, t }) {
   const off = new Set(hidden)
   const shown = profiles.filter(p => !off.has(p.profile)).length
-  const label = shown === profiles.length ? t('profilesAll', profiles.length) : t('profilesShown', shown, profiles.length)
+  const label = profileLabel(profiles, hidden, t)
   const hasFocused = profiles.some(p => p.profile === focused)
 
   return jsxs(Popover, {
@@ -1900,7 +1911,7 @@ export function ProfilePicker({ profiles, hidden, focused, onChange, t }) {
   })
 }
 
-function ProfileControl({ profiles, focused }) {
+export function ProfileControl({ profiles, focused }) {
   const t = usePluginI18n(ID)
   const hidden = useValue($hidden)
 
@@ -1988,12 +1999,14 @@ function useVisibleFiles() {
     ...query,
     files,
     focused,
+    hidden,
     inScope,
     kind,
     kindCounts: countBySubsystem(inScope),
     profileErrors: query.data?.profile_errors ?? [],
     profiles: profileSummary(files),
-    shown: shownFiles(files, hidden, kind, sort)
+    shown: shownFiles(files, hidden, kind, sort),
+    sort
   }
 }
 
@@ -2007,6 +2020,13 @@ function FilesListPane() {
   const missing = v.isError && /404/.test(String(v.error?.message || ''))
   const total = v.files.reduce((sum, f) => sum + (f.counts?.total ?? 0), 0)
 
+  // Desktops without paneVisibility: the list mounting is the best sign the user opened it.
+  useEffect(() => {
+    if (typeof host.paneVisibility !== 'function') {
+      markSeen()
+    }
+  }, [])
+
   const bar = jsxs('div', {
     style: STYLES.bar,
     children: [
@@ -2017,9 +2037,13 @@ function FilesListPane() {
           total ? jsx(Badge, { variant: 'warn', children: total }) : null
         ]
       }),
+      // The settings live in their own pane; the header says what they are set to.
       jsxs('div', {
         style: LIST_STYLES.controls,
-        children: [jsx(ProfileControl, { focused: v.focused, profiles: v.profiles }), jsx(SortControl, {}), jsx(EditorLinkControl, {})]
+        children: [
+          jsx(SettingsSummary, { hidden: v.hidden, profiles: v.profiles, sort: v.sort, t }),
+          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t })
+        ]
       }),
       jsx('div', {
         'aria-label': t('kindGroup'),
@@ -2029,8 +2053,6 @@ function FilesListPane() {
           jsx(FilterButton, { active: v.kind === k, label: t('kindFilter', t(`kind_${k}`), v.kindCounts[k]), onClick: () => $kind.set(k) }, k)
         )
       }),
-      jsx(NotifyModeControl, {}),
-      jsx(AutoOpenControl, {}),
       v.profileErrors.length
         ? jsx('div', { style: { ...STYLES.muted, overflowWrap: 'anywhere' }, children: t('profileErrors', v.profileErrors.map(e => e.profile).join(', ')) })
         : null
@@ -2467,7 +2489,6 @@ export const EDIT_STYLES = {
     whiteSpace: 'pre-wrap'
   },
   tipWrap: { display: 'inline-flex', maxWidth: '100%', minWidth: 0 },
-  popover: { display: 'flex', flexDirection: 'column', gap: '0.45rem', maxWidth: 'calc(100vw - 2rem)', minWidth: 0, width: '20rem' },
   field: { fontFamily: mono, fontSize: '0.7rem', minWidth: 0, width: '100%' },
   help: { color: 'var(--ui-text-tertiary)', fontSize: '0.7rem', minWidth: 0, overflowWrap: 'anywhere' }
 }
@@ -2745,64 +2766,49 @@ function OpenInEditorControl({ file }) {
   })
 }
 
-/** The link settings as a pure view: a gear that opens the two presets, Custom, and a text field. */
+/** The link settings as a pure view: the two presets, Custom, and a text field for Custom. */
 export function EditorLinkSettings({ mode, draft, onMode, onDraft, t }) {
   const problem = mode === 'custom' ? templateProblem(draft) : null
 
-  return jsxs(Popover, {
+  return jsxs('div', {
+    'aria-label': t('editorSettings'),
+    role: 'group',
+    style: SETTINGS_STYLES.section,
     children: [
-      jsx(PopoverTrigger, {
-        asChild: true,
-        children: jsx(Button, {
-          'aria-label': t('editorSettings'),
-          size: 'xs',
-          style: STYLES.button,
-          title: t('editorSettings'),
-          type: 'button',
-          variant: 'ghost',
-          children: jsx(Codicon, { name: 'settings-gear' })
-        })
-      }),
-      jsxs(PopoverContent, {
-        align: 'end',
-        style: EDIT_STYLES.popover,
+      jsx('span', { style: SETTINGS_STYLES.label, children: t('editorSettings') }),
+      jsxs(Select, {
+        onValueChange: onMode,
+        value: mode,
         children: [
-          jsx('span', { style: { fontSize: '0.75rem', fontWeight: 600, minWidth: 0 }, children: t('editorSettings') }),
-          jsxs(Select, {
-            onValueChange: onMode,
-            value: mode,
-            children: [
-              jsx(SelectTrigger, {
-                'aria-label': t('editorSettings'),
-                size: 'xs',
-                style: LIST_STYLES.trigger,
-                children: jsx(SelectValue, { children: jsx('span', { style: STYLES.ellipsis, children: t(`editorPreset_${mode}`) }) })
-              }),
-              jsx(SelectContent, {
-                children: ['remote', 'local', 'custom'].map(id => jsx(SelectItem, { value: id, children: t(`editorPreset_${id}`) }, id))
-              })
-            ]
+          jsx(SelectTrigger, {
+            'aria-label': t('editorSettings'),
+            size: 'xs',
+            style: LIST_STYLES.trigger,
+            children: jsx(SelectValue, { children: jsx('span', { style: STYLES.ellipsis, children: t(`editorPreset_${mode}`) }) })
           }),
-          jsx('span', { style: EDIT_STYLES.help, children: t(`editorPresetHelp_${mode}`) }),
-          mode === 'custom'
-            ? jsx(Input, {
-                'aria-invalid': Boolean(problem),
-                'aria-label': t('editorCustomLabel'),
-                onChange: event => onDraft(event.target.value),
-                placeholder: DEFAULT_EDITOR_TEMPLATE,
-                spellCheck: false,
-                style: EDIT_STYLES.field,
-                value: draft
-              })
-            : null,
-          mode === 'custom' ? jsx('span', { style: problem ? { ...EDIT_STYLES.help, ...EDIT_STYLES.over } : EDIT_STYLES.help, children: t(problem || 'editorPlaceholders') }) : null
+          jsx(SelectContent, {
+            children: ['remote', 'local', 'custom'].map(id => jsx(SelectItem, { value: id, children: t(`editorPreset_${id}`) }, id))
+          })
         ]
-      })
+      }),
+      jsx('span', { style: EDIT_STYLES.help, children: t(`editorPresetHelp_${mode}`) }),
+      mode === 'custom'
+        ? jsx(Input, {
+            'aria-invalid': Boolean(problem),
+            'aria-label': t('editorCustomLabel'),
+            onChange: event => onDraft(event.target.value),
+            placeholder: DEFAULT_EDITOR_TEMPLATE,
+            spellCheck: false,
+            style: EDIT_STYLES.field,
+            value: draft
+          })
+        : null,
+      mode === 'custom' ? jsx('span', { style: problem ? { ...EDIT_STYLES.help, ...EDIT_STYLES.over } : EDIT_STYLES.help, children: t(problem || 'editorPlaceholders') }) : null
     ]
   })
 }
 
-function EditorLinkControl() {
+export function EditorLinkControl() {
   const t = usePluginI18n(ID)
   const template = useValue($editorTemplate)
   const [mode, setMode] = useState(presetOf(template))
@@ -3058,8 +3064,9 @@ const EXPAND_EN = {
  * its saved state. openReview reveals it right after registering, and revealPane expands a
  * collapsed zone, so in practice it opens straight away.
  *
- * Desktop cannot dismiss a pane for a plugin at startup, and closing a plugin's only pane with its X
- * disables the plugin (Capabilities > Plugins turns it back on). Collapsing the tab keeps it.
+ * Desktop cannot dismiss a pane for a plugin at startup. Closing a plugin's ONLY pane turns the
+ * plugin off (closeTreePane in the Desktop tree store counts the plugin's registered panes), so the
+ * settings pane is always registered with this one: Close (X, cmd-W, any menu) then only dismisses.
  */
 export function reviewPaneContribution() {
   return {
@@ -3073,6 +3080,22 @@ export function reviewPaneContribution() {
   }
 }
 
+/**
+ * The second pane: the review settings, a tab in the list's zone. Registered and unregistered
+ * together with the list, so the plugin always has two panes. It is adopted after the list (its dock
+ * names the list) as an inactive tab, so it never takes the zone from the list; defaultCollapsed only
+ * matters if it ever lands in a zone of its own.
+ */
+export function settingsPaneContribution() {
+  return {
+    id: 'settings', // skill-review:settings
+    area: 'panes',
+    title: en.settingsTitle,
+    data: { placement: 'main', dock: { pane: LIST_PANE, pos: 'center' }, defaultCollapsed: true, minWidth: '240px' },
+    render: () => jsx(SettingsPane, {})
+  }
+}
+
 let unregisterPane = null
 
 function ensureReviewPane() {
@@ -3080,9 +3103,24 @@ function ensureReviewPane() {
     return
   }
 
-  const dispose = CTX.register(reviewPaneContribution())
+  const disposers = [CTX.register(reviewPaneContribution()), CTX.register(settingsPaneContribution())]
 
-  unregisterPane = typeof dispose === 'function' ? dispose : () => {}
+  unregisterPane = () => disposers.forEach(dispose => typeof dispose === 'function' && dispose())
+}
+
+/** Bring one of the two panes on screen: forget a Close, register both panes, then reveal (which
+ *  expands a collapsed zone). The undismiss runs first so a closed list is back in the layout before
+ *  the settings pane, which docks next to it, is adopted. */
+function showPane(id) {
+  if (typeof host.undismissPane === 'function') {
+    host.undismissPane(id)
+  }
+
+  ensureReviewPane()
+
+  if (typeof host.revealPane === 'function') {
+    host.revealPane(id)
+  }
 }
 
 /** Show the review pane (registering it, bringing it back if closed, expanding it if collapsed) and
@@ -3101,15 +3139,18 @@ export function openReview(key) {
     return
   }
 
-  ensureReviewPane()
+  showPane(LIST_PANE)
+}
 
-  if (typeof host.undismissPane === 'function') {
-    host.undismissPane(LIST_PANE)
+/** The list header's gear: show the settings pane the same way. */
+export function openSettings() {
+  if (useRouteFallback || typeof host.openWorkspace !== 'function') {
+    host.navigate(ROUTE)
+
+    return
   }
 
-  if (typeof host.revealPane === 'function') {
-    host.revealPane(LIST_PANE)
-  }
+  showPane(SETTINGS_PANE)
 }
 
 /**
@@ -3304,17 +3345,10 @@ export function NotifyModeSwitch({ mode, onChange, t }) {
   })
 }
 
-/** The list pane header's control. Its own component, so list-pane changes stay apart from it. */
-function NotifyModeControl() {
+/** The settings pane's notify control. */
+export function NotifyModeControl() {
   const t = usePluginI18n(ID)
   const mode = useValue($notifyMode)
-
-  // Desktops without paneVisibility: the list mounting is the best sign the user opened it.
-  useEffect(() => {
-    if (typeof host.paneVisibility !== 'function') {
-      markSeen()
-    }
-  }, [])
 
   return jsx(NotifyModeSwitch, { mode, onChange: setNotifyMode, t })
 }
@@ -3334,12 +3368,86 @@ export function AutoOpenSwitch({ on, onChange, t }) {
   })
 }
 
-/** The list pane header's autoOpen checkbox, beside the notify control. */
-function AutoOpenControl() {
+/** The settings pane's autoOpen checkbox, below the notify control. */
+export function AutoOpenControl() {
   const t = usePluginI18n(ID)
   const on = useValue($autoOpen)
 
   return jsx(AutoOpenSwitch, { on, onChange: setAutoOpen, t })
+}
+
+export const SETTINGS_STYLES = {
+  body: { display: 'flex', flexDirection: 'column', gap: '0.9rem', minWidth: 0, padding: PAD },
+  section: { display: 'flex', flexDirection: 'column', gap: '0.35rem', minWidth: 0 },
+  label: { fontSize: '0.75rem', fontWeight: 600, minWidth: 0 }
+}
+
+/** What the settings are set to, for the list header: the profile subset and the sort order. */
+export function SettingsSummary({ profiles, hidden, sort, t }) {
+  const sortText = t(`sort_${SORTS.includes(sort) ? sort : 'newest'}`)
+
+  return jsx('span', {
+    style: { ...STYLES.muted, ...STYLES.ellipsis },
+    children: profiles.length ? t('settingsSummary', profileLabel(profiles, hidden, t), sortText) : sortText
+  })
+}
+
+/** The list header's gear. */
+export function SettingsGearButton({ onOpen, t }) {
+  return jsx(Button, {
+    'aria-label': t('openSettings'),
+    onClick: onOpen,
+    size: 'xs',
+    style: STYLES.button,
+    title: t('openSettings'),
+    type: 'button',
+    variant: 'ghost',
+    children: jsx(Codicon, { name: 'settings-gear' })
+  })
+}
+
+function SettingsSection({ label, children }) {
+  return jsxs('div', { style: SETTINGS_STYLES.section, children: [jsx('span', { style: SETTINGS_STYLES.label, children: label }), children] })
+}
+
+/** The settings pane's content. Every control reads and writes the same persisted atoms the list
+ *  reads, so the two panes always agree. */
+export function SettingsView({ profiles, focused, t }) {
+  return jsxs('div', {
+    style: STYLES.paneRoot,
+    children: [
+      jsx('div', { style: STYLES.bar, children: jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600, minWidth: 0 }, children: t('settingsTitle') }) }),
+      jsxs('div', {
+        style: { ...STYLES.listScroll, ...SETTINGS_STYLES.body },
+        children: [
+          jsxs(SettingsSection, {
+            label: t('scopeGroup'),
+            children: [
+              jsx('div', { style: STYLES.barRow, children: jsx(ProfileControl, { focused, profiles }) }),
+              profiles.length ? null : jsx('span', { style: STYLES.muted, children: t('settingsNoProfiles') })
+            ]
+          }),
+          jsx(SettingsSection, { label: t('sortLabel'), children: jsx('div', { style: STYLES.barRow, children: jsx(SortControl, {}) }) }),
+          jsxs('div', { style: SETTINGS_STYLES.section, children: [jsx(NotifyModeControl, {}), jsx(AutoOpenControl, {})] }),
+          jsx(EditorLinkControl, {})
+        ]
+      })
+    ]
+  })
+}
+
+export function SettingsPane() {
+  const t = usePluginI18n(ID)
+  const v = useVisibleFiles()
+
+  return jsx(SettingsView, { focused: v.focused, profiles: v.profiles, t })
+}
+
+const SETTINGS_EN = {
+  openSettings: 'Review settings',
+  settingsNoProfiles: 'Profiles show up here once they have pending changes.',
+  settingsSummary: (profiles, sort) => `${profiles}, ${sort}`,
+  settingsTitle: 'Review settings'
 }
 
 export const CHIP_STYLES = {
@@ -3499,7 +3607,7 @@ const en = {
 }
 
 messages.en = en
-Object.assign(en, NOTIFY_EN, LIST_EN, EDIT_EN)
+Object.assign(en, NOTIFY_EN, LIST_EN, EDIT_EN, SETTINGS_EN)
 Object.assign(en, REMOVE_EN)
 Object.assign(en, EXPAND_EN)
 
@@ -3521,7 +3629,7 @@ export default {
     loadEditorSettings(ctx)
     startWatcher(ctx)
 
-    // No pane here: openReview registers it on demand (see reviewPaneContribution). A saved entry
+    // No panes here: openReview registers both on demand (see reviewPaneContribution). A saved entry
     // for the old detail pane is never registered again, so Desktop collapses its zone.
     const contributions = [
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 110, render: () => jsx(StatusChip, {}) },
