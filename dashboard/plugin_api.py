@@ -438,10 +438,12 @@ def _without_op(record: dict[str, Any], index: int) -> Optional[dict[str, Any]]:
 
 def _claim_and_resolve(subsystem: str, record_id: str, *, op_fingerprint: Optional[str], apply: bool,
                        expected_key: Optional[str] = None, profile: str = "",
-                       edit: Optional[tuple[str, str]] = None) -> dict[str, Any]:
+                       apply_record: Any = None, edit: Optional[tuple[str, str]] = None) -> dict[str, Any]:
     """Resolve one op (``op_fingerprint``) or the whole record (None). Caller holds the queue lock
-    inside the profile scope. Returns ``{status, error, item}``. ``edit`` is ``(field, text)``: that
-    op is applied with its proposed text replaced; the staged record itself is never rewritten."""
+    inside the profile scope. Returns ``{status, error, item}``. ``apply_record(record, index)``,
+    if given, builds the record to apply from the claimed one in place of that op alone. ``edit`` is
+    ``(field, text)``: that op is applied with its proposed text replaced; the staged record itself is
+    never rewritten."""
     from tools import write_approval as wa
     from utils import atomic_json_write
     path = _queue_dir(subsystem) / f"{record_id}.json"
@@ -473,8 +475,11 @@ def _claim_and_resolve(subsystem: str, record_id: str, *, op_fingerprint: Option
                 return {"status": "already_handled", "error": None, "item": item}
             index = again[0]
         if apply:
-            source = record if edit is None or index is None else _with_edit(record, index, *edit)
-            target = source if index is None else _single_op_record(subsystem, source, index)
+            if apply_record is not None:
+                target = apply_record(record, index)
+            else:
+                source = record if edit is None or index is None else _with_edit(record, index, *edit)
+                target = source if index is None else _single_op_record(subsystem, source, index)
             ok, error, _result = _apply(subsystem, target)
             if not ok:
                 os.replace(claim, path)  # untouched: the bytes we claimed go back
@@ -1238,6 +1243,8 @@ def edit_block(profile: str, subsystem: str, key: str, block_id: str, raw: Any =
     with _resolve_lock, _profile_scope(home):
         with _queue_lock(subsystem):
             outcome = _edit(subsystem, profile, key, block_id, text, apply)
+            if outcome["status"] in ("applied", "saved"):
+                _forget_cached(subsystem)  # as Remove entirely does: never answer an edited file from the cache
             gone = key not in _file_entries(subsystem, profile)
     return {**outcome, "file_gone": gone}
 
@@ -1285,3 +1292,98 @@ def file_location(profile: str, subsystem: str, key: str) -> dict[str, Any]:
         return {"status": "refused", "error": f"This file is not inside the profile's {folder} folder, so it is not opened."}
     return {"status": "ok", "path": str(target) if target is not None else None,
             "exists": target is not None and os.path.isfile(target), "host": socket.gethostname(), "user": _login_name()}
+
+
+# =================================================================================================
+# Remove entirely (memory only): delete the entry that a replace or patch block targets and drop
+# that proposal, so neither the old line nor the new one stays.
+#
+# The deletion is Hermes's own staged remove: a one-op batch ``{"action": "remove", "old_text":
+# entry, "matched_entry": entry}`` on the claimed record, applied through ``_apply_one`` like an
+# accept. Hermes then takes the memory file lock, re-reads the file, refuses if the pinned entry is
+# no longer exactly there, and writes atomically. The op is dropped from the staged record only
+# after that succeeded; a refusal puts the claimed bytes back. Skill blocks are refused: deleting a
+# span of a skill file needs its own design.
+# =================================================================================================
+
+_REMOVABLE_ACTIONS = {"replace", "patch"}
+_NOT_REMOVABLE = ("Remove entirely works only on a change that replaces or patches an existing entry. "
+                  "Nothing was removed.")
+
+
+def _removal_refusal(entry: dict[str, Any], block_id: str, op: dict[str, Any]) -> Optional[str]:
+    """Why this block's entry cannot be removed, or None. Caller holds the queue lock in the
+    profile scope. The block is evaluated fresh from disk, never from the cache."""
+    from tools.memory_tool_store import MemoryStore
+    if op.get("action") not in _REMOVABLE_ACTIONS or not op.get("matched_entry"):
+        return _NOT_REMOVABLE
+    block = next((b for b in _evaluate_uncached(MEMORY, entry)[1] if b["id"] == block_id), None)
+    if block is None or not block["removed"] or not block["added"]:
+        return _NOT_REMOVABLE
+    if block["stale"]:
+        return f"This change can no longer apply, so nothing was removed: {block['stale']}"
+    pinned = op["matched_entry"]
+    if len(block["removed"]) != 1 or block["removed"][0]["text"] != pinned:
+        return ("This entry spans several lines. Remove entirely handles single-line entries only. "
+                "Nothing was removed.")
+    path = MemoryStore._path_for("user" if entry["file"] == "USER.md" else "memory")
+    raw, read_ok = MemoryStore._read_raw_checked(path)
+    if not read_ok:
+        return f"{entry['file']} could not be read. Nothing was removed."
+    count = MemoryStore._parse_entries(raw).count(pinned)
+    if count > 1:
+        return (f"This entry appears more than once in {entry['file']}, so it is not clear which one to "
+                f"delete. Nothing was removed.")
+    if count == 0:
+        return _NOT_REMOVABLE
+    return None
+
+
+def _remove_record(record: dict[str, Any], index: Optional[int]) -> dict[str, Any]:
+    """The claimed record as Hermes would stage a single pinned remove of that op's entry."""
+    payload = record["payload"]
+    op = _ops(payload)[index or 0]
+    remove_op = {"action": "remove", "old_text": op["matched_entry"], "matched_entry": op["matched_entry"]}
+    return {**record, "payload": {"action": "batch", "target": payload.get("target", "memory"),
+                                  "operations": [remove_op]}}
+
+
+def _forget_cached(subsystem: str) -> None:
+    """Drop this profile's cached evaluations of ``subsystem``. The inputs fingerprint already
+    changes with the write; this keeps a removal from ever being answered from the cache."""
+    home = _home_key()
+    with _cache_lock:
+        for cache_key in [k for k in _cache if k[0] == home and k[1] == subsystem]:
+            del _cache[cache_key]
+
+
+@router.post("/files/{profile}/{subsystem}/{key}/blocks/{block_id}/remove-entry")
+def remove_entry_block(profile: str, subsystem: str, key: str, block_id: str) -> dict[str, Any]:
+    from tools import write_approval as wa
+    _check_subsystem(subsystem)
+    _check_key(key)
+    record_id, fingerprint = _parse_block_id(block_id)
+    home = _resolve_profile(profile)
+    if subsystem != MEMORY:
+        return {"status": "failed", "error": "Remove entirely works only on memory entries.", "file_gone": False}
+    with _resolve_lock, _profile_scope(home):
+        with _queue_lock(subsystem):
+            outcome = {"status": "already_handled", "error": None}
+            record = wa.get_pending(subsystem, record_id)
+            found = [] if record is None else [
+                (op, label) for _i, op, label in _record_ops(subsystem, record) if _fingerprint(op) == fingerprint]
+            if found:
+                op, label = found[0]
+                entry = _file_entries(subsystem, profile).get(key)
+                if _file_key(profile, subsystem, label) != key or entry is None:
+                    outcome = {"status": "failed", "error": "that change belongs to another file"}
+                elif refusal := _removal_refusal(entry, block_id, op):
+                    outcome = {"status": "failed", "error": refusal}
+                else:
+                    outcome = _claim_and_resolve(subsystem, record_id, op_fingerprint=fingerprint, apply=True,
+                                                 expected_key=key, profile=profile, apply_record=_remove_record)
+                    if outcome["status"] == "applied":
+                        outcome["status"] = "removed"
+                        _forget_cached(subsystem)
+            gone = key not in _file_entries(subsystem, profile)
+    return {"status": outcome["status"], "error": outcome["error"], "file_gone": gone}
