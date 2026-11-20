@@ -20,6 +20,7 @@ import {
   haptic,
   host,
   PALETTE_AREA,
+  queryClient,
   relativeTime,
   ROUTES_AREA,
   ScrollArea,
@@ -168,8 +169,13 @@ export function resultToast(verb, result, t) {
       return { kind: 'info', message: t('rejected', name) }
     case 'already_handled':
       return { kind: 'info', message: t('alreadyHandled') }
-    default:
-      return { kind: 'error', message: t('failed', result?.error || '') }
+    default: {
+      // A Skills Guard block is a multi-line report: headline in the toast, full report as detail.
+      const error = String(result?.error || '')
+      const [headline] = error.split('\n')
+
+      return { kind: 'error', message: t('failed', headline), ...(error.includes('\n') ? { detail: error } : {}) }
+    }
   }
 }
 
@@ -456,12 +462,15 @@ function ItemCard({ item, open, onToggle }) {
 // Data hook, pane, status chip
 // ---------------------------------------------------------------------------------------------
 
+const pendingKey = profile => [ID, 'pending', profile]
+const fetchPending = () => CTX.rest('/pending')
+
 function usePending() {
   const profile = useValue(host.state.profile)
 
   return useQuery({
-    queryFn: () => CTX.rest('/pending'),
-    queryKey: [ID, 'pending', profile],
+    queryFn: fetchPending,
+    queryKey: pendingKey(profile),
     refetchInterval: POLL_MS,
     refetchIntervalInBackground: true
   })
@@ -625,37 +634,59 @@ export function openReview() {
   host.navigate(ROUTE)
 }
 
-function readAnnounced() {
-  try {
-    const value = CTX.storage.get('announced', [])
-
-    return Array.isArray(value) ? value : []
-  } catch {
-    return []
+/**
+ * Open the review tab once per new pending write. Keys already announced (and still pending) never
+ * reopen it, and the announced set survives restarts through plugin storage. Returns the new count.
+ */
+export function announce(ctx, items) {
+  if (!Array.isArray(items)) {
+    return 0
   }
+
+  let announced = []
+
+  try {
+    const value = ctx.storage.get('announced', [])
+    announced = Array.isArray(value) ? value : []
+  } catch {
+    announced = []
+  }
+
+  const { fresh, keep } = planAutoOpen(items, announced)
+
+  ctx.storage.set('announced', keep)
+
+  if (fresh.length) {
+    openReview()
+    host.notify({ kind: 'info', message: ctx.i18n.t('newPending', fresh.length) })
+  }
+
+  return fresh.length
+}
+
+/**
+ * Background watcher, started in register(): it runs whether or not the pane, the route or the status
+ * chip is mounted. It reads through the shared query client with the pane's own key, so a mounted
+ * pane and the watcher share one request per interval instead of polling twice.
+ */
+function startWatcher(ctx) {
+  const tick = () => {
+    const profile = host.state.profile?.get?.() ?? null
+
+    return queryClient
+      .fetchQuery({ queryFn: fetchPending, queryKey: pendingKey(profile), staleTime: POLL_MS - 500 })
+      .then(data => announce(ctx, data?.items))
+      .catch(() => 0) // backend off or unreachable: the pane shows the error when opened
+  }
+
+  ctx.setTimeout(tick, 1500)
+  ctx.setInterval(tick, POLL_MS)
 }
 
 function StatusChip() {
   const t = usePluginI18n(ID)
   const { data, isError } = usePending()
   const items = data?.items
-
-  // Opens the review tab once per new pending write. Keys already announced (and still pending) never
-  // reopen it, and the announced set survives restarts through plugin storage.
-  useEffect(() => {
-    if (!items) {
-      return
-    }
-
-    const { fresh, keep } = planAutoOpen(items, readAnnounced())
-
-    CTX.storage.set('announced', keep)
-
-    if (fresh.length) {
-      openReview()
-      host.notify({ kind: 'info', message: t('newPending', fresh.length) })
-    }
-  }, [items])
 
   if (isError || !items || !items.length) {
     return null
@@ -761,6 +792,8 @@ export default {
       closeTab = null
       CTX = null
     })
+
+    startWatcher(ctx)
 
     ctx.registerMany([
       { id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(ReviewPane, {}) },

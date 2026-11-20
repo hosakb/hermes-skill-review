@@ -11,8 +11,18 @@ globalThis.__host = {
   navigate(path) { this.navigated = path },
   notify() {},
   notifyError() {},
-  openWorkspace(id, opts) { this.opened = { id, opts }; return () => { this.closed = true } },
-  state: {}
+  openWorkspace(id, opts) { this.opens = (this.opens ?? 0) + 1; this.opened = { id, opts }; return () => { this.closed = true } },
+  state: { profile: { get: () => 'default' } }
+}
+// The background watcher reads through the shared React Query client; the test feeds it pending lists.
+globalThis.__queryClient = {
+  data: { items: [] },
+  fail: false,
+  fetchQuery({ queryKey, queryFn }) {
+    this.lastKey = queryKey
+    this.lastFn = queryFn
+    return this.fail ? Promise.reject(new Error('404')) : Promise.resolve(this.data)
+  }
 }
 register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
@@ -25,17 +35,80 @@ test('default export has the contract fields', () => {
   assert.equal(typeof plugin.register, 'function')
 })
 
-test('register contributes route, status chip and palette command, and tears down on dispose', () => {
-  const registered = []
-  const disposers = []
+function fakeCtx() {
+  const timers = []
   const store = {}
   const ctx = {
-    i18n: { register: bundle => assert.ok(bundle.en.accept) },
-    onDispose: fn => disposers.push(fn),
-    registerMany: list => registered.push(...list),
-    rest: async () => ({}),
-    storage: { get: (k, d) => store[k] ?? d, set: (k, v) => { store[k] = v } }
+    disposers: [],
+    i18n: { register: () => {}, t: (k, n) => `${k}:${n}` },
+    onDispose: fn => ctx.disposers.push(fn),
+    registerMany: () => {},
+    rest: async path => ({ path }),
+    setInterval: (fn, ms) => { timers.push({ fn, ms, every: true }); return () => {} },
+    setTimeout: (fn, ms) => { timers.push({ fn, ms, every: false }); return () => {} },
+    storage: { get: (k, d) => store[k] ?? d, set: (k, v) => { store[k] = v } },
+    store,
+    timers
   }
+  return ctx
+}
+
+const flush = () => new Promise(resolve => setImmediate(resolve))
+
+test('the watcher polls from register(), with no pane or status chip mounted', async () => {
+  const h = globalThis.__host
+  const qc = globalThis.__queryClient
+  const ctx = fakeCtx()
+  h.opens = 0
+  qc.data = { items: [] }
+  plugin.register(ctx)
+  const interval = ctx.timers.find(t => t.every)
+  assert.ok(interval && interval.ms >= 2000 && interval.ms <= 10000, 'polls every few seconds')
+  assert.ok(ctx.timers.some(t => !t.every), 'first check runs soon after load')
+
+  interval.fn(); await flush()
+  assert.deepEqual(qc.lastKey, ['skill-review', 'pending', 'default'], 'shares the pane query key')
+  assert.deepEqual(await qc.lastFn(), { path: '/pending' })
+  assert.equal(h.opens, 0, 'nothing pending: no tab')
+
+  qc.data = { items: [{ subsystem: 'skills', profile: 'default', id: '3e0b9dba' }] }
+  interval.fn(); await flush()
+  assert.equal(h.opens, 1, 'a genuinely new item opens the review tab')
+  assert.equal(h.opened.id, 'skill-review:review')
+
+  interval.fn(); await flush()
+  assert.equal(h.opens, 1, 'the same item never reopens it')
+
+  qc.data.items = [...qc.data.items, { subsystem: 'memory', profile: 'dev', id: 'aa11' }]
+  interval.fn(); await flush()
+  assert.equal(h.opens, 2, 'a further new item opens it again')
+
+  qc.fail = true
+  interval.fn(); await flush()
+  assert.equal(h.opens, 2, 'a failing backend neither throws nor opens')
+  qc.fail = false
+  ctx.disposers.forEach(fn => fn())
+})
+
+test('items seen in an earlier session do not reopen the tab after a restart', async () => {
+  const h = globalThis.__host
+  const qc = globalThis.__queryClient
+  const ctx = fakeCtx()
+  ctx.store.announced = ['skills/default/3e0b9dba']
+  h.opens = 0
+  qc.data = { items: [{ subsystem: 'skills', profile: 'default', id: '3e0b9dba' }] }
+  plugin.register(ctx)
+  ctx.timers.find(t => t.every).fn(); await flush()
+  assert.equal(h.opens, 0)
+  ctx.disposers.forEach(fn => fn())
+})
+
+test('register contributes route, status chip and palette command, and tears down on dispose', () => {
+  const registered = []
+  const ctx = fakeCtx()
+  const disposers = ctx.disposers
+  ctx.registerMany = list => registered.push(...list)
+  ctx.i18n.register = bundle => assert.ok(bundle.en.accept)
   plugin.register(ctx)
   assert.deepEqual(registered.map(c => c.area).sort(), ['palette', 'routes', 'statusBar.right'])
   assert.equal(registered.find(c => c.area === 'routes').data.path, '/skill-review')
@@ -151,6 +224,10 @@ test('resultToast maps every backend status', () => {
   assert.deepEqual(resultToast('reject', { status: 'rejected', item: { subject: 's' } }, t), { kind: 'info', message: 'rejected:s' })
   assert.equal(resultToast('accept', { status: 'already_handled' }, t).kind, 'info')
   assert.equal(resultToast('accept', { status: 'failed', error: 'x' }, t).kind, 'error')
+  const scan = 'Security scan blocked this skill (dangerous findings):\n  - exfiltration: curl ~/.ssh\n  - injection'
+  const blocked = resultToast('accept', { status: 'failed', error: scan }, t)
+  assert.equal(blocked.message, 'failed:Security scan blocked this skill (dangerous findings):')
+  assert.equal(blocked.detail, scan, 'the full scan report is kept, not swallowed')
 })
 
 test('source has no hardcoded colours and imports only allowed specifiers', () => {
