@@ -193,7 +193,8 @@ test('segmentRows: context is grey with the line number, removed and added carry
     { kind: 'context', oldNo: 1, text: 'The test suite runs with `pytest -q` from the repo root.' },
     { kind: 'context', oldNo: 2, text: '§' }
   ])
-  assert.deepEqual(segmentRows(MEMORY_DIFF.segments[1]), [
+  // A paired removed/added line also carries word marks (tests/js/intraline.test.mjs); compared without them here.
+  assert.deepEqual(segmentRows(MEMORY_DIFF.segments[1]).map(({ marks, ...row }) => row), [
     { kind: 'remove', oldNo: 3, text: 'Deploys go to the staging box first.' },
     { kind: 'add', newNo: 3, text: 'Deploys go to staging first, then production after a smoke test.' }
   ])
@@ -213,8 +214,10 @@ test('the composite diff draws context, red removed rows and green added rows in
   assert.equal(rows[3].props.style.color, 'var(--ui-diff-add-foreground)')
   const cells = kids(rows[2])
   assert.deepEqual(cells.slice(0, 3).map(c => c.props.style), [STYLES.gutter, STYLES.gutter, STYLES.sign], 'gutter: old no, new no, sign')
-  assert.deepEqual(cells.map(c => c.props.children), [3, '', '-', 'Deploys go to the staging box first.'])
-  assert.deepEqual(kids(rows[3]).map(c => c.props.children), ['', 3, '+', 'Deploys go to staging first, then production after a smoke test.'])
+  // The text cell may hold marked spans; its visible text is the whole line.
+  const shown = c => [c.props.children].flat(Infinity).map(x => (typeof x === 'object' && x ? x.props.children : x)).join('')
+  assert.deepEqual(cells.map(shown), ['3', '', '-', 'Deploys go to the staging box first.'])
+  assert.deepEqual(kids(rows[3]).map(shown), ['', '3', '+', 'Deploys go to staging first, then production after a smoke test.'])
   assert.deepEqual(kids(ctx).map(c => c.props.children).slice(0, 3), [1, '', ' '])
   const box = walk(tree).find(n => n.props?.style === STYLES.diffBox)
   assert.ok(box, 'the whole file sits in one guarded diff box')
