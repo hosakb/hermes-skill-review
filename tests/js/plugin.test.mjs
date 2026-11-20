@@ -49,7 +49,8 @@ const styleHas = (style, expected) => Object.entries(expected).every(([k, v]) =>
 
 function fakeCtx() {
   const timers = []
-  const store = {}
+  // autoOpen off: these tests cover the notifyMode path (auto-open.test.mjs covers autoOpen on).
+  const store = { autoOpen: false }
   const ctx = {
     disposers: [],
     registered: [],
@@ -76,10 +77,12 @@ test('default export has the contract fields', () => {
   assert.equal(typeof plugin.register, 'function')
 })
 
-test('register adds one review pane on the workspace right edge, no route by default', () => {
+test('register adds no pane at startup; Review registers one pane on the workspace right edge, no route', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
+  assert.deepEqual(ctx.registered.filter(c => c.area === 'panes'), [], 'nothing docks itself at launch')
+  openReview()
   const panes = ctx.registered.filter(c => c.area === 'panes')
   assert.deepEqual(panes.map(p => p.id), ['list'])
   assert.equal(LIST_PANE, 'skill-review:list')
@@ -387,6 +390,7 @@ test('popup mode: a new change toasts exactly once, with a Review action that on
   const ctx = fakeCtx()
   qc.data = { items: [] }
   plugin.register(ctx)
+  await tick(ctx) // the first poll only records
   const item = { subsystem: 'skills', profile: 'default', id: 'p1', created_at: nowSec() + 5 }
   qc.data = { items: [item] }
   await tick(ctx)
@@ -501,6 +505,7 @@ test('switching modes at runtime applies to the next change without a reload', a
   const ctx = fakeCtx()
   qc.data = { items: [] }
   plugin.register(ctx)
+  await tick(ctx) // the first poll only records
   const a = { subsystem: 'skills', profile: 'default', id: 'r1', created_at: nowSec() - 3 }
   qc.data = { items: [a] }
   await tick(ctx)

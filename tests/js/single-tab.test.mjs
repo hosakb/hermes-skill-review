@@ -62,10 +62,11 @@ const dispose = ctx => ctx.disposers.forEach(fn => fn())
 
 // --- registration -----------------------------------------------------------------------------
 
-test('register adds exactly one pane, titled Pending writes, under the old list pane id', () => {
+test('Review registers exactly one pane, titled Pending writes, under the old list pane id', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
+  openReview()
   const panes = ctx.registered.filter(c => c.area === 'panes')
   assert.equal(panes.length, 1, 'one pane, so one tab')
   const [pane] = panes

@@ -3,8 +3,9 @@
  *
  * Shows every skill and memory write that Hermes staged under skills.write_approval and
  * memory.write_approval. One pane on the workspace's right edge holds a list of every pending write
- * and, beside it, the diff of the selected one with Accept and Reject. A new pending write is announced
- * by a toast and the status-bar count; nothing takes over the main view.
+ * and, beside it, the diff of the selected one with Accept and Reject. The pane opens only from the
+ * status-bar Review chip, the palette or a toast, or by itself when a new change arrives and autoOpen
+ * is on. Otherwise a new change shows as a toast or a lit chip. Nothing takes over the main view.
  * The backend is dashboard/plugin_api.py (/api/plugins/skill-review).
  *
  * Plain ESM, loaded uncompiled: UI is jsx() calls. Only @hermes/plugin-sdk, react and
@@ -1410,6 +1411,7 @@ function FilesListPane() {
         )
       }),
       jsx(NotifyModeControl, {}),
+      jsx(AutoOpenControl, {}),
       v.profileErrors.length
         ? jsx('div', { style: { ...STYLES.muted, overflowWrap: 'anywhere' }, children: t('profileErrors', v.profileErrors.map(e => e.profile).join(', ')) })
         : null
@@ -1673,8 +1675,48 @@ const FILE_EN = {
 // Reveal, watcher, status chip
 // ---------------------------------------------------------------------------------------------
 
-/** Show the review pane (bringing it back if closed) and optionally select an item. Never opens a
- *  main-workspace tab. Desktops without the pane APIs get the route page instead. */
+/**
+ * The review pane. register() does not register it: Desktop docks every registered pane at launch
+ * and restores a saved layout, so a pane registered at startup would appear on its own. It is
+ * registered on demand (first Review press or first new change with autoOpen on), the way Bot Mode
+ * registers its Routines pane. Until then a saved layout entry for it stays hidden and its zone
+ * collapses, because Desktop draws no unregistered pane.
+ *
+ * defaultCollapsed makes it arrive as the right edge's slim vertical tab when it first enters the
+ * layout. Desktop applies it only on that first entry: a layout that already holds the pane keeps
+ * its saved state. openReview reveals it right after registering, and revealPane expands a
+ * collapsed zone, so in practice it opens straight away.
+ *
+ * Desktop cannot dismiss a pane for a plugin at startup, and closing a plugin's only pane with its X
+ * disables the plugin (Capabilities > Plugins turns it back on). Collapsing the tab keeps it.
+ */
+export function reviewPaneContribution() {
+  return {
+    id: 'list', // skill-review:list, the same id as before, so saved layouts still match it
+    area: 'panes',
+    title: en.listTitle,
+    // Its own tiling column on the workspace's right edge, like Bots' Routines pane. 'right'
+    // placement is the collapsible right sidebar's role, so this docks explicitly instead.
+    data: { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, defaultCollapsed: true, width: '720px', minWidth: '240px' },
+    render: () => jsx(ReviewPane, {})
+  }
+}
+
+let unregisterPane = null
+
+function ensureReviewPane() {
+  if (unregisterPane || !CTX) {
+    return
+  }
+
+  const dispose = CTX.register(reviewPaneContribution())
+
+  unregisterPane = typeof dispose === 'function' ? dispose : () => {}
+}
+
+/** Show the review pane (registering it, bringing it back if closed, expanding it if collapsed) and
+ *  optionally select an item. Never opens a main-workspace tab. Desktops without the pane APIs get
+ *  the route page instead. */
 export function openReview(key) {
   if (key) {
     $selection.set(key)
@@ -1688,6 +1730,8 @@ export function openReview(key) {
     return
   }
 
+  ensureReviewPane()
+
   if (typeof host.undismissPane === 'function') {
     host.undismissPane(LIST_PANE)
   }
@@ -1698,11 +1742,16 @@ export function openReview(key) {
 }
 
 /**
- * Announce each new pending write once with a toast whose action reveals it. Keys already announced
- * (and still pending) are never announced again; the set survives restarts through plugin storage.
+ * Announce each new pending write once. Keys already announced (and still pending) are never
+ * announced again; the set survives restarts through plugin storage. So a pane the user closed is not
+ * reopened for the same changes. With recordOnly (the watcher's first poll after startup) the
+ * pending keys are only recorded: changes that were waiting before the app started never open the
+ * pane or toast. How a new change is announced:
+ *   autoOpen on:  the review pane opens (no toast, the pane is the signal).
+ *   autoOpen off: notifyMode decides, a toast ('popup') or the lit chip ('light').
  * Returns the number of new items.
  */
-export function announce(ctx, items) {
+export function announce(ctx, items, { recordOnly = false } = {}) {
   if (!Array.isArray(items)) {
     return 0
   }
@@ -1720,7 +1769,15 @@ export function announce(ctx, items) {
 
   ctx.storage.set('announced', keep)
 
-  if (fresh.length && $notifyMode.get() === 'popup') {
+  if (recordOnly || !fresh.length) {
+    return 0
+  }
+
+  // Old desktops show the review as a route page; opening it would take over the main view.
+  if ($autoOpen.get() && !useRouteFallback) {
+    // Keep the change the user is reading; select the new one only when nothing is selected.
+    openReview($selection.get() ? undefined : fresh[0])
+  } else if ($notifyMode.get() === 'popup') {
     const first = fresh[0]
 
     host.notify({
@@ -1738,6 +1795,9 @@ export function announce(ctx, items) {
  * reads through the shared query client with the panes' own key, so they share one request.
  */
 function startWatcher(ctx) {
+  // The first successful poll after startup only records what is already pending.
+  let primed = false
+
   const tick = () => {
     const profile = host.state.profile?.get?.() ?? null
 
@@ -1748,7 +1808,9 @@ function startWatcher(ctx) {
           markSeen() // the user is looking at the list: nothing in it is unseen
         }
 
-        const fresh = announce(ctx, data?.items)
+        const fresh = announce(ctx, data?.items, { recordOnly: !primed })
+
+        primed = primed || Array.isArray(data?.items)
 
         $lit.set($notifyMode.get() === 'light' && hasUnseen(data?.items, $lastSeenAt.get()))
 
@@ -1785,6 +1847,11 @@ export const $notifyMode = atom('popup')
 export const $lit = atom(false)
 const $lastSeenAt = atom(0) // ms; 0 means the pane was never opened
 
+// autoOpen (default on): a change that arrives while the app runs opens the review pane, and
+// notifyMode is not used for it. Off: notifyMode applies as before, a toast ('popup') or the lit
+// chip ('light'). The chip lights by the unseen rule in both cases, and opening the pane clears it.
+export const $autoOpen = atom(true)
+
 const listPaneVisible = () =>
   typeof host.paneVisibility === 'function' && host.paneVisibility(LIST_PANE)?.get?.() === true
 
@@ -1804,7 +1871,10 @@ function loadNotifySettings(ctx) {
   const mode = readStored(ctx, 'notifyMode', 'popup')
   const seen = Number(readStored(ctx, 'lastSeenAt', 0))
 
+  const autoOpen = readStored(ctx, 'autoOpen', true)
+
   $notifyMode.set(NOTIFY_MODES.includes(mode) ? mode : 'popup')
+  $autoOpen.set(typeof autoOpen === 'boolean' ? autoOpen : true)
   $lastSeenAt.set(Number.isFinite(seen) ? seen : 0)
   $lit.set(false)
 }
@@ -1819,6 +1889,16 @@ export function setNotifyMode(mode) {
 
   if (mode !== 'light') {
     $lit.set(false)
+  }
+}
+
+export function setAutoOpen(on) {
+  $autoOpen.set(on === true)
+
+  try {
+    CTX?.storage.set('autoOpen', on === true)
+  } catch {
+    // storage unavailable: the choice holds for this session
   }
 }
 
@@ -1868,6 +1948,29 @@ function NotifyModeControl() {
   return jsx(NotifyModeSwitch, { mode, onChange: setNotifyMode, t })
 }
 
+export const AUTO_OPEN_STYLES = {
+  row: { alignItems: 'center', cursor: 'pointer', display: 'flex', gap: '0.4rem', minWidth: 0 },
+  text: { ...STYLES.muted, color: 'var(--ui-text-secondary)', minWidth: 0, overflowWrap: 'anywhere' }
+}
+
+export function AutoOpenSwitch({ on, onChange, t }) {
+  return jsxs('label', {
+    style: AUTO_OPEN_STYLES.row,
+    children: [
+      jsx(Checkbox, { checked: on, onCheckedChange: value => onChange(value === true) }),
+      jsx('span', { style: AUTO_OPEN_STYLES.text, children: t('autoOpenLabel') })
+    ]
+  })
+}
+
+/** The list pane header's autoOpen checkbox, beside the notify control. */
+function AutoOpenControl() {
+  const t = usePluginI18n(ID)
+  const on = useValue($autoOpen)
+
+  return jsx(AutoOpenSwitch, { on, onChange: setAutoOpen, t })
+}
+
 export const CHIP_STYLES = {
   button: {
     alignItems: 'center',
@@ -1898,7 +2001,7 @@ export function ReviewChip({ count, counts, lit, mode, onOpen, onMode, t }) {
       jsx(Codicon, { name: 'git-pull-request' }),
       t('chipLabel'),
       lit ? jsx('span', { 'aria-hidden': true, style: CHIP_STYLES.dot }) : null,
-      jsx(Badge, { size: 'xs', variant: 'warn', children: count })
+      count ? jsx(Badge, { size: 'xs', variant: 'warn', children: count }) : null
     ]
   })
 
@@ -1933,11 +2036,8 @@ function StatusChip() {
   const { data, isError } = usePending()
   const lit = useValue($lit)
   const mode = useValue($notifyMode)
-  const items = data?.items
-
-  if (isError || !items || !items.length) {
-    return null
-  }
+  // Always shown, so Review can open the pane with nothing pending; no badge at 0 or on error.
+  const items = isError || !Array.isArray(data?.items) ? [] : data.items
 
   return jsx(ReviewChip, {
     count: items.length,
@@ -1954,6 +2054,7 @@ function StatusChip() {
 }
 
 const NOTIFY_EN = {
+  autoOpenLabel: 'Open this tab automatically when a change arrives',
   chipUnseen: 'New changes since you last opened Review',
   notifyLabel: 'When a new change arrives',
   notifyLight: 'Light up icon',
@@ -2038,24 +2139,17 @@ export default {
     ctx.i18n.register({ en })
     ctx.onDispose(() => {
       CTX = null
+      unregisterPane?.()
+      unregisterPane = null
     })
 
     loadNotifySettings(ctx)
     loadListSettings(ctx)
     startWatcher(ctx)
 
+    // No pane here: openReview registers it on demand (see reviewPaneContribution). A saved entry
+    // for the old detail pane is never registered again, so Desktop collapses its zone.
     const contributions = [
-      {
-        // One tab holding the list and the diff. The id stays 'list' so saved layouts keep it; a
-        // saved entry for the old detail pane is unregistered now, and the desktop collapses its zone.
-        id: 'list',
-        area: 'panes',
-        title: en.listTitle,
-        // Its own tiling column on the workspace's right edge, like Bots' Routines pane. 'right'
-        // placement is the collapsible right sidebar's role, so this docks explicitly instead.
-        data: { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, width: '720px', minWidth: '240px' },
-        render: () => jsx(ReviewPane, {})
-      },
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 110, render: () => jsx(StatusChip, {}) },
       {
         area: PALETTE_AREA,
