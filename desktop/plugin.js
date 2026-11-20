@@ -196,6 +196,372 @@ export function parseSection(section) {
   return rows
 }
 
+// ---------------------------------------------------------------------------------------------
+// Word marks inside a change block. intralineSegments diffs one removed line against one added
+// line by tokens; pairLines decides which removed line is compared with which added line. Both are
+// pure. Every pair is capped (tokens per side, DP cells) and so is a whole block, so a huge line
+// falls back to plain tinting instead of freezing the UI.
+// ---------------------------------------------------------------------------------------------
+
+const TOKEN = /\s+|[\p{L}\p{M}\p{N}_']+|[^]/gu
+const WORD = /^[\p{L}\p{M}\p{N}_']+$/u
+const SPACE = /^\s+$/u
+
+export const INTRALINE_LIMITS = { tokens: 2500, cells: 4_000_000, blockCells: 16_000_000, pairChecks: 2500, similarity: 0.4 }
+
+/** Whitespace runs, word runs (letters, digits, underscore, apostrophe) and single other characters. */
+export const tokenize = text => String(text ?? '').match(TOKEN) ?? []
+
+const plain = text => [{ text, changed: false }]
+
+/** Shared token ratio of two lines (whitespace ignored): 2 * shared / (count a + count b). */
+export function lineSimilarity(a, b) {
+  const left = tokenize(a).filter(x => !SPACE.test(x))
+  const right = tokenize(b).filter(x => !SPACE.test(x))
+
+  if (!left.length || !right.length) {
+    return 0
+  }
+
+  const counts = new Map()
+  left.forEach(x => counts.set(x, (counts.get(x) ?? 0) + 1))
+  let shared = 0
+
+  for (const x of right) {
+    const n = counts.get(x)
+
+    if (n) {
+      shared += 1
+      counts.set(x, n - 1)
+    }
+  }
+
+  return (2 * shared) / (left.length + right.length)
+}
+
+// Edit script over tokens: 0 equal, 1 only in a (removed), 2 only in b (added). Null when the
+// middle left after trimming the common prefix and suffix needs more DP cells than `cells`.
+function tokenOps(a, b, cells) {
+  let pre = 0
+
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) {
+    pre += 1
+  }
+
+  let suf = 0
+
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) {
+    suf += 1
+  }
+
+  const n = a.length - pre - suf
+  const m = b.length - pre - suf
+
+  if ((n + 1) * (m + 1) > cells) {
+    return null
+  }
+
+  // lcs[i * w + j] = length of the longest common subsequence of a[pre+i..] and b[pre+j..].
+  const w = m + 1
+  const lcs = new Uint16Array((n + 1) * w)
+
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      lcs[i * w + j] = a[pre + i] === b[pre + j] ? lcs[(i + 1) * w + j + 1] + 1 : Math.max(lcs[(i + 1) * w + j], lcs[i * w + j + 1])
+    }
+  }
+
+  const ops = []
+
+  for (let k = 0; k < pre; k += 1) ops.push({ op: 0, text: a[k] })
+
+  let i = 0
+  let j = 0
+
+  while (i < n || j < m) {
+    if (i < n && j < m && a[pre + i] === b[pre + j]) {
+      ops.push({ op: 0, text: a[pre + i] })
+      i += 1
+      j += 1
+    } else if (j >= m || (i < n && lcs[(i + 1) * w + j] >= lcs[i * w + j + 1])) {
+      ops.push({ op: 1, text: a[pre + i] })
+      i += 1
+    } else {
+      ops.push({ op: 2, text: b[pre + j] })
+      j += 1
+    }
+  }
+
+  for (let k = a.length - suf; k < a.length; k += 1) ops.push({ op: 0, text: a[k] })
+
+  return { ops, cost: (n + 1) * (m + 1) }
+}
+
+// A pure removal or addition bounded by the same whitespace on both ends could take either one.
+// Always take the space before it, so "a b c" to "a c" marks " b", wherever the diff matched.
+function slideToLeadingSpace(ops) {
+  let start = 0
+
+  while (start < ops.length) {
+    if (ops[start].op === 0) {
+      start += 1
+      continue
+    }
+
+    let end = start
+
+    while (end < ops.length && ops[end].op !== 0) end += 1
+
+    const kind = ops[start].op
+    const pure = ops.slice(start, end).every(o => o.op === kind)
+
+    while (pure && start > 0 && ops[start - 1].op === 0 && SPACE.test(ops[start - 1].text) && ops[start - 1].text === ops[end - 1].text) {
+      ops[start - 1].op = kind
+      ops[end - 1].op = 0
+      start -= 1
+      end -= 1
+    }
+
+    start = end
+  }
+}
+
+// A changed word of 4+ characters whose shared prefix + suffix covers at least half of it is
+// marked only where the characters differ. Returns [prefix, suffix] lengths in code points.
+function charSplit(left, right) {
+  if (!WORD.test(left) || !WORD.test(right)) {
+    return null
+  }
+
+  const a = [...left]
+  const b = [...right]
+
+  if (a.length < 4 || b.length < 4) {
+    return null
+  }
+
+  let pre = 0
+
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre += 1
+
+  let suf = 0
+
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf += 1
+
+  return 2 * (pre + suf) >= Math.max(a.length, b.length) ? [pre, suf] : null
+}
+
+// One side's tokens with changed flags: merge, absorb a lone space between two changed spans,
+// drop a span that is only whitespace, then build segments.
+function sideSegments(tokens) {
+  const changed = i => tokens[i]?.changed === true
+
+  for (let i = 1; i < tokens.length - 1; i += 1) {
+    if (!tokens[i].changed && SPACE.test(tokens[i].text) && changed(i - 1) && changed(i + 1)) {
+      tokens[i].changed = true
+      tokens[i].absorbed = true
+    }
+  }
+
+  for (let i = 0; i < tokens.length; ) {
+    if (!tokens[i].changed) {
+      i += 1
+      continue
+    }
+
+    let end = i
+
+    while (end < tokens.length && tokens[end].changed) end += 1
+
+    if (tokens.slice(i, end).every(x => SPACE.test(x.text))) {
+      tokens.slice(i, end).forEach(x => { x.changed = false })
+    }
+
+    i = end
+  }
+
+  const segments = []
+  const push = (text, isChanged) => {
+    if (!text) return
+    const last = segments[segments.length - 1]
+    if (last && last.changed === isChanged) last.text += text
+    else segments.push({ text, changed: isChanged })
+  }
+
+  tokens.forEach((token, i) => {
+    if (token.changed && token.split && !changed(i - 1) && !changed(i + 1)) {
+      const chars = [...token.text]
+      const [pre, suf] = token.split
+      push(chars.slice(0, pre).join(''), false)
+      push(chars.slice(pre, chars.length - suf).join(''), true)
+      push(chars.slice(chars.length - suf).join(''), false)
+    } else {
+      push(token.text, token.changed)
+    }
+  })
+
+  return segments.length ? segments : plain('')
+}
+
+/**
+ * Word marks for one removed line against one added line. Returns { old, new, capped, cost }:
+ * `old` and `new` are segment arrays ({ text, changed }) that join back to the input exactly.
+ * `capped` is true when a limit was hit; then nothing is marked.
+ */
+export function intralineSegments(oldText, newText, limits = INTRALINE_LIMITS) {
+  const a = tokenize(oldText)
+  const b = tokenize(newText)
+  const fallback = { old: plain(String(oldText ?? '')), new: plain(String(newText ?? '')), capped: true, cost: 0 }
+
+  if (a.length > limits.tokens || b.length > limits.tokens) {
+    return fallback
+  }
+
+  const result = tokenOps(a, b, limits.cells)
+
+  if (!result) {
+    return fallback
+  }
+
+  const { ops, cost } = result
+  slideToLeadingSpace(ops)
+
+  const left = []
+  const right = []
+
+  for (let k = 0; k < ops.length; ) {
+    if (ops[k].op === 0) {
+      left.push({ text: ops[k].text, changed: false })
+      right.push({ text: ops[k].text, changed: false })
+      k += 1
+      continue
+    }
+
+    let end = k
+
+    while (end < ops.length && ops[end].op !== 0) end += 1
+
+    const removed = ops.slice(k, end).filter(o => o.op === 1).map(o => ({ text: o.text, changed: true }))
+    const added = ops.slice(k, end).filter(o => o.op === 2).map(o => ({ text: o.text, changed: true }))
+
+    if (removed.length === 1 && added.length === 1) {
+      const split = charSplit(removed[0].text, added[0].text)
+      if (split) {
+        removed[0].split = split
+        added[0].split = split
+      }
+    }
+
+    left.push(...removed)
+    right.push(...added)
+    k = end
+  }
+
+  return { old: sideSegments(left), new: sideSegments(right), capped: false, cost }
+}
+
+/**
+ * Which removed line to compare with which added line, as [removedIndex, addedIndex] pairs.
+ * Equal counts pair by position; otherwise each removed line, in order, takes its most similar
+ * unused added line. A pair under the similarity threshold is left out (no marks).
+ */
+export function pairLines(removed, added, limits = INTRALINE_LIMITS) {
+  if (!removed.length || !added.length) {
+    return []
+  }
+
+  if (removed.length === added.length) {
+    return removed.map((_, i) => [i, i]).filter(([i, j]) => lineSimilarity(removed[i], added[j]) >= limits.similarity)
+  }
+
+  if (removed.length * added.length > limits.pairChecks) {
+    return []
+  }
+
+  const used = new Set()
+  const pairs = []
+
+  removed.forEach((text, i) => {
+    let best = -1
+    let score = limits.similarity
+
+    added.forEach((other, j) => {
+      if (used.has(j)) return
+      const s = lineSimilarity(text, other)
+      if (s > score || (s === score && best < 0)) {
+        best = j
+        score = s
+      }
+    })
+
+    if (best >= 0) {
+      used.add(best)
+      pairs.push([i, best])
+    }
+  })
+
+  return pairs
+}
+
+/**
+ * Marks for a whole block: { removed, added }, one entry per line, a segment array for a paired
+ * line with at least one changed span, else null. A pure addition or removal gets no marks.
+ */
+export function blockMarks(removed, added, limits = INTRALINE_LIMITS) {
+  const out = { removed: removed.map(() => null), added: added.map(() => null) }
+  let budget = limits.blockCells
+
+  for (const [i, j] of pairLines(removed, added, limits)) {
+    if (budget <= 0) break
+
+    const r = intralineSegments(removed[i], added[j], { ...limits, cells: Math.min(limits.cells, budget) })
+
+    budget -= r.cost
+
+    if (r.old.some(s => s.changed) || r.new.some(s => s.changed)) {
+      out.removed[i] = r.old
+      out.added[j] = r.new
+    }
+  }
+
+  return out
+}
+
+// Marks are computed once per block or section object (both come from a cached query).
+const MARK_CACHE = new WeakMap()
+
+/** Add `marks` to each run of removed rows followed by added rows (notes may sit between them). */
+export function markRows(rows, owner) {
+  const out = rows.map(row => ({ ...row }))
+  const groups = []
+  let group = null
+
+  out.forEach((row, index) => {
+    if (row.kind === 'remove' && (!group || group.added.length)) {
+      group = { removed: [], added: [] }
+      groups.push(group)
+    }
+
+    if (row.kind === 'remove') group.removed.push(index)
+    else if (row.kind === 'add' && group) group.added.push(index)
+    else if (row.kind !== 'note') group = null
+  })
+
+  const all = owner ? (MARK_CACHE.get(owner) ?? null) : null
+  const computed = all ?? groups.map(g => blockMarks(g.removed.map(i => out[i].text), g.added.map(i => out[i].text)))
+
+  if (owner && !all) {
+    MARK_CACHE.set(owner, computed)
+  }
+
+  groups.forEach((g, k) => {
+    g.removed.forEach((index, n) => { if (computed[k]?.removed[n]) out[index].marks = computed[k].removed[n] })
+    g.added.forEach((index, n) => { if (computed[k]?.added[n]) out[index].marks = computed[k].added[n] })
+  })
+
+  return out
+}
+
 /** `text` as a sentence that ends exactly once: Hermes's error text often ends with its own period,
  *  so one is added only when no terminal punctuation is there already. */
 export function endSentence(text) {
@@ -375,11 +741,47 @@ const ROW_TONE = {
 
 const SIGN = { add: '+', remove: '-', context: ' ' }
 
+// A changed span inside a tinted row: a stronger wash of the row's own hue (its border colour mixed
+// over the row tint), plus line-through or underline so the change does not rely on colour alone.
+// No padding, margin or border, so marking a span never moves the text; clone keeps rounded ends
+// on each piece of a span that wraps. Stale blocks use the dim pair.
+const mark = (tone, weight, line) => ({
+  background: `color-mix(in srgb, var(--ui-diff-${tone}-border) ${weight}%, transparent)`,
+  borderRadius: '2px',
+  boxDecorationBreak: 'clone',
+  textDecorationColor: `color-mix(in srgb, var(--ui-diff-${tone}-foreground) ${weight + 30}%, transparent)`,
+  textDecorationLine: line,
+  textDecorationThickness: '1px',
+  textUnderlineOffset: '0.2em',
+  WebkitBoxDecorationBreak: 'clone'
+})
+
+export const MARK_STYLES = {
+  add: mark('add', 30, 'underline'),
+  remove: mark('remove', 30, 'line-through'),
+  addDim: mark('add', 15, 'underline'),
+  removeDim: mark('remove', 15, 'line-through')
+}
+
+const MARK_TAG = { add: 'ins', remove: 'del' }
+
+function rowText(row, dim) {
+  if (!row.marks) {
+    return row.text || ' '
+  }
+
+  const style = MARK_STYLES[dim ? `${row.kind}Dim` : row.kind]
+
+  return row.marks.map((segment, i) =>
+    segment.changed ? jsx(MARK_TAG[row.kind], { 'data-mark': row.kind, style, children: segment.text }, i) : segment.text
+  )
+}
+
 // ---------------------------------------------------------------------------------------------
 // Diff view (pure components: props in, tree out)
 // ---------------------------------------------------------------------------------------------
 
-export function DiffRow({ row, t }) {
+export function DiffRow({ row, t, dim = false }) {
   if (row.kind === 'file') {
     return jsxs('div', { style: STYLES.fileRow, children: [jsx(Codicon, { name: 'file' }), row.text] })
   }
@@ -399,7 +801,7 @@ export function DiffRow({ row, t }) {
       jsx('span', { style: STYLES.gutter, children: row.oldNo ?? '' }),
       jsx('span', { style: STYLES.gutter, children: row.newNo ?? '' }),
       jsx('span', { style: STYLES.sign, children: SIGN[row.kind] }),
-      jsx('span', { style: STYLES.rowText, children: row.text || ' ' })
+      jsx('span', { style: STYLES.rowText, children: rowText(row, dim) })
     ]
   })
 }
@@ -409,7 +811,7 @@ export function DiffView({ sections, newFileLabel, t }) {
     style: STYLES.sections,
     children: sections.map((section, index) => {
       const lead = section.kind === 'create' ? [{ kind: 'file', text: newFileLabel }] : []
-      const rows = [...lead, ...parseSection(section)]
+      const rows = [...lead, ...markRows(parseSection(section), section)]
 
       return jsxs(
         'div',
@@ -817,11 +1219,12 @@ export function segmentRows(segment) {
   }
 
   const block = segment.block ?? {}
-
-  return [
+  const rows = [
     ...(block.removed ?? []).map(line => ({ kind: 'remove', oldNo: line.no, text: line.text })),
     ...(block.added ?? []).map(line => ({ kind: 'add', newNo: line.no, text: line.text }))
   ]
+
+  return markRows(rows, segment.block)
 }
 
 const formatStaged = seconds =>
@@ -989,7 +1392,7 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
       head,
       block.state === 'conflict' ? jsx('div', { style: FILE_STYLES.blockNote, children: t('conflictAbove') }) : null,
       stale && block.reason ? jsx('div', { style: FILE_STYLES.blockNote, children: t('staleReason', block.reason) }) : null,
-      ...segmentRows({ type: 'block', block }).map((row, i) => jsx(DiffRow, { row, t }, i))
+      ...segmentRows({ type: 'block', block }).map((row, i) => jsx(DiffRow, { dim: stale, row, t }, i))
     ]
   })
 }
