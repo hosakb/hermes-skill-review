@@ -2,7 +2,7 @@
 
 ![Skill Review: a review tab with the pending file list and per-change diff blocks](docs/banner.png)
 
-Skill Review is a Hermes Desktop plugin with a Python backend that shows staged skill and memory writes as visual diffs in one review tab, where you accept or reject each proposed change.
+Skill Review is a Hermes Desktop plugin with a Python backend that shows staged skill and memory writes as visual diffs in one review tab, where you accept or reject each proposed change. Its Library mode lists each profile's identity, memory and skill files and edits them in place.
 
 ## What it does
 
@@ -19,6 +19,19 @@ With `skills.write_approval` or `memory.write_approval` on, Hermes does not writ
 - A Review button in the status bar shows the pending count. Click it to open the tab. Right-click it to pick the notification mode.
 - New changes show a popup or light up the Review button, as you choose. With auto-open on, the tab opens by itself instead.
 - Settings live under Settings > Plugins > Skill Review.
+
+### Library
+
+A switch at the top of the list, Pending N | Library, changes what the tab shows. Pending is the review list above.
+
+- Library lists the default profile and every named profile, minus the profiles you hid in the settings. Each profile has three groups: Identity (`SOUL.md`, `PROJECT.md`, `AGENTS.md`, each when it exists in the profile folder), Memory (`MEMORY.md`, `USER.md`) and Skills (each skill folder with its `SKILL.md` and the text files under `references/`, `templates/`, `scripts/` and `assets/`). Skills in external skill folders from `skills.external_dirs` are listed too.
+- Every profile, skill and file row shows how many pending changes it has. Pending changes to files that do not exist yet, such as a new skill, are listed under "Not on disk yet" and open in Pending. The counts add up to the Pending total.
+- The search box filters by file, skill or profile name.
+- Selecting a file opens it in an editor with line numbers. Save writes the text straight to the file, with no staging. Revert puts back the text you opened. A file with unsaved text has a blue dot in the list, and switching to another file or to Pending asks before it drops the text.
+- If the file has pending changes, a link above the editor opens them in Pending.
+- Save refuses if the file changed on disk since you opened it, and offers Reload. Reload replaces your text with the file as it is now.
+- Save runs the checks Hermes runs on its own writes and refuses with Hermes's reason if one fails. Your text stays in the editor. For `MEMORY.md` and `USER.md` that is the profile's `memory.memory_char_limit` or `memory.user_char_limit` and the memory threat scan on new or changed entries. For skill files it is the 100,000-character limit, for `SKILL.md` a valid frontmatter with `name` and `description` and a description of at most 60 characters, and the Skills Guard scan when `skills.guard_agent_created` is on. Identity files can be at most 200,000 characters.
+- Pending changes to a file you saved are checked again, and the review list marks the ones that no longer apply as stale.
 
 ## Requirements
 
@@ -65,6 +78,8 @@ The gateway imports the Python backend when it starts. After an install or updat
 
 Accepting a block takes Hermes's pending-queue lock, cuts that operation out of its record and applies it with the same code as `/skills approve` and `/memory approve`. If Hermes refuses to apply it, the record stays as it was. Rejecting drops the operation from its record, and a record with no operations left is deleted.
 
+Library uses `GET /library` for the tree and `GET` and `PUT /library/<profile>/<key>` for one file. The key is an opaque value the backend builds; on every request the backend lists the files it allows for that profile again and looks the key up there, so the Desktop half never sends a path. A file is on that list only when its real path, with symlinks followed, is inside the profile folder, or for a skill file inside the skills folder Hermes found it in. A save compares the SHA-256 of the file's bytes with the one from when you opened it, runs Hermes's checks, then writes a temporary file in the same folder, flushes it to disk and renames it over the file. It holds the memory store's file lock for `MEMORY.md` and `USER.md` and Hermes's per-skill lock for skill files, and looks the key up again once it holds them.
+
 The diff marks a block stale when its file changed so that the change no longer applies, and marks a conflict when it overlaps another pending block. Accept all works through the file's blocks in staged order, checks each one again against the file on disk, and skips stale and conflicting blocks with a reason.
 
 ## Disclosure
@@ -74,9 +89,11 @@ The diff marks a block stale when its file changed so that the change no longer 
 - No credentials. The plugin reads no secrets, tokens or `.env` files.
 - No tools, hooks, shell commands or background processes. The Python `register()` does nothing.
 - It reads pending records under `<HERMES_HOME>/pending/` and, for the default profile and every profile under `<HERMES_HOME>/profiles/`, each profile's `MEMORY.md`, `USER.md` and `SKILL.md` files. If you set external skill folders in Hermes, it reads `SKILL.md` files there too.
+- Library also reads each profile's `SOUL.md`, `PROJECT.md` and `AGENTS.md` and the supporting files of every skill, in the profile's skills folder and in external skill folders.
+- On Save in Library, the plugin writes that one file itself: `SOUL.md`, `PROJECT.md`, `AGENTS.md`, `MEMORY.md`, `USER.md`, a `SKILL.md` or a skill's supporting file, including skills in external skill folders. It writes nothing else, and only after you press Save. It creates `MEMORY.md` or `USER.md` when you save one that did not exist. To serialise saves across Hermes processes it holds a lock file at `<profile>/pending/.skill-review-library.lock`.
 - It writes pending records: rejecting a block removes it from its record, and an edit or Remove entirely rewrites it.
 - On Accept, Hermes's own approval code writes the change to the profile's skill or memory files, the same as `/skills approve` or `/memory approve`.
-- Editing a skill change runs Hermes's content scan on a copy of the file in a temporary folder, which is deleted right after.
+- Editing a skill change, and saving a skill file in Library, runs Hermes's content scan on a copy of the file in a temporary folder, which is deleted right after.
 - The backend keeps an in-memory cache of up to 512 diff results. Nothing is cached on disk.
 - The Desktop half stores its settings in Desktop plugin storage: notification mode, auto-open, shown profiles, sort order, which changes it already announced and when you last opened each file.
 
@@ -88,6 +105,12 @@ The diff marks a block stale when its file changed so that the change no longer 
 - Word highlights stop at 2,500 tokens per line and 4,000,000 comparison cells per line pair (16,000,000 per block). Longer lines are tinted without word marks. Diffs themselves are not truncated.
 - An edit can be at most 100,000 characters, and Hermes's own size limit for the file still applies.
 - Remove entirely handles single-line memory entries only, and refuses if the entry appears more than once in the file.
+- Library opens UTF-8 text files of at most 1 MB. It lists supporting files only under `references/`, `templates/`, `scripts/` and `assets/`, and leaves out files that are not UTF-8 text.
+- The Library editor does not wrap lines. A long line scrolls sideways.
+- Once you edit a file with Windows line endings in Library, it is saved with Unix line endings, because the browser's text box turns every line ending into a line feed.
+- The profile picker in the settings lists only profiles with pending changes, so a profile with none cannot be hidden from Library.
+- The Skills Guard scan on a Library save sees only the file you save, not the rest of the skill folder, the same as when you edit a proposed change.
+- Library writes files directly. A Hermes process that holds a file's text in memory, such as a running chat with `SOUL.md` already in its prompt, sees the new text only when it reads the file again.
 
 ## Development
 
