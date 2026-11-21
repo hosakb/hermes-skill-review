@@ -839,17 +839,69 @@ def test_a_skill_file_outside_its_own_skill_folder_is_refused(api, root):
 
 
 @pytest.mark.parametrize("where", ["inside", "outside"])
-def test_a_file_with_a_second_hard_link_is_refused(client, root, tmp_path, where):
+def test_a_file_with_a_second_hard_link_is_not_listed_and_refused(client, api, root, tmp_path, where):
     path = home_of(root, "dev") / "SOUL.md"
     path.write_text("one\n")
     twin = (home_of(root, "dev") if where == "inside" else tmp_path) / "twin.md"
     os.link(path, twin)
-    f = find(client, "dev", "SOUL.md")
+    assert prof(tree(client), "dev")["identity"] == [], "left out of the list"
+    with api._profile_scope(home_of(root, "dev")):
+        key = api._library_key("dev", path)
+    response = read(client, "dev", key)
+    assert response.status_code == 404, "not listed, so the key is unknown"
+    assert save(client, "dev", key, "pwned\n", "absent").status_code == 404
+    assert twin.read_text() == "one\n"
+
+
+def test_a_hard_link_made_after_the_lookup_is_refused_on_read_and_save(client, api, root, tmp_path, monkeypatch):
+    """The 403 on the opened fd stays as the second guard."""
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    f, body = opened(client, "dev", "SOUL.md")
+    twin = tmp_path / "twin.md"
+    real, calls = api._library_entry, []
+    _swap_after_lookup(api, monkeypatch, lambda: os.link(path, twin))
     response = read(client, "dev", f["key"])
     assert response.status_code == 403 and "hard link" in response.json()["detail"]
-    response = save(client, "dev", f["key"], "pwned\n", "absent")
+    twin.unlink()
+
+    def looking(profile, key):  # the save looks up twice; link right after the one under the locks
+        entry = real(profile, key)
+        calls.append(1)
+        if len(calls) == 2:
+            os.link(path, twin)
+        return entry
+
+    monkeypatch.setattr(api, "_library_entry", looking)
+    response = save(client, "dev", f["key"], "pwned\n", body["version"])
     assert response.status_code == 403 and "hard link" in response.json()["detail"]
     assert twin.read_text() == "one\n"
+
+
+def test_a_hardlinked_supporting_file_is_not_listed(client, root, tmp_path):
+    folder = make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    os.link(folder / "references" / "a.md", tmp_path / "twin.md")
+    [demo] = prof(tree(client), "dev")["skills"]
+    assert [f["name"] for f in demo["files"]] == ["SKILL.md"]
+
+
+@pytest.mark.parametrize("how", ["symlink", "hardlink"])
+def test_a_skill_whose_skill_md_is_left_out_is_left_out_whole(client, api, root, tmp_path, how):
+    elsewhere = tmp_path / "other-home" / "SKILL.md"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text(skill_content("demo"))
+    folder = make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    (folder / "SKILL.md").unlink()
+    if how == "symlink":
+        (folder / "SKILL.md").symlink_to(elsewhere)
+    else:
+        os.link(elsewhere, folder / "SKILL.md")
+    make_skill(root, "dev", "plain")
+    assert [s["name"] for s in prof(tree(client), "dev")["skills"]] == ["plain"]
+    with api._profile_scope(home_of(root, "dev")):
+        key = api._library_key("dev", folder / "references" / "a.md")
+    assert read(client, "dev", key).status_code == 404
+    assert save(client, "dev", key, "x\n", "absent").status_code == 404
 
 
 # --- review cycle 1: audit ledger and memory flags --------------------------------------------------
@@ -961,3 +1013,83 @@ def test_a_swap_after_the_last_check_still_writes_into_the_checked_folder(client
     assert sorted(p.name for p in outside.iterdir()) == ["a.md"]
     if response.status_code == 200:
         assert (folder / "references.old" / "a.md").read_text() == "mine\n"
+
+
+# --- review cycle 2: POSIX only, the response after a write, file owner ------------------------------
+
+def test_library_needs_dir_fd_support(api, monkeypatch):
+    assert api._library_supported() is True
+    for name in ("open", "rename", "stat", "unlink"):
+        monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) - {getattr(os, name)})
+        assert api._library_supported() is False, name
+        monkeypatch.undo()
+    monkeypatch.delattr(os, "O_NOFOLLOW")
+    assert api._library_supported() is False
+    monkeypatch.undo()
+    monkeypatch.delattr(os, "O_DIRECTORY")
+    assert api._library_supported() is False
+
+
+def test_library_routes_answer_501_where_the_system_cannot_do_it(client, api, stage, root, monkeypatch):
+    (home_of(root, "dev") / "SOUL.md").write_text("one\n")
+    f, body = opened(client, "dev", "SOUL.md")
+    write_memory(root, "dev", ["alpha fact"])
+    stage("dev", {"action": "add", "target": "memory", "content": "beta fact"})
+    monkeypatch.setattr(api, "_library_supported", lambda: False)
+    for response in (client.get(f"{BASE}/library"), read(client, "dev", f["key"]),
+                     save(client, "dev", f["key"], "two\n", body["version"])):
+        assert response.status_code == 501, response.text
+        assert "Linux or macOS" in response.json()["detail"]
+    assert (home_of(root, "dev") / "SOUL.md").read_text() == "one\n"
+    assert client.get(f"{BASE}/pending").json()["total"] == 1, "Pending keeps working"
+    assert len(client.get(f"{BASE}/files").json()["files"]) == 1
+
+
+def test_a_failed_reread_after_the_write_still_reports_the_save(client, api, root, monkeypatch):
+    import hashlib
+    from fastapi import HTTPException
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    f, body = opened(client, "dev", "SOUL.md")
+
+    def gone(entry):
+        raise HTTPException(status_code=404, detail="gone")
+
+    monkeypatch.setattr(api, "_read_library_bytes", gone)
+    response = save(client, "dev", f["key"], "two\n", body["version"])
+    assert response.status_code == 200, response.text
+    version = response.json()["version"]
+    assert version.partition(":")[0] == hashlib.sha256(b"two\n").hexdigest()
+    assert path.read_text() == "two\n"
+
+
+def test_a_save_keeps_the_owner_of_the_file(client, root, monkeypatch):
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    st = path.stat()
+    f, body = opened(client, "dev", "SOUL.md")
+    calls = []
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    assert save(client, "dev", f["key"], "two\n", body["version"]).status_code == 200
+    assert calls == [(st.st_uid, st.st_gid)]
+
+
+def test_a_save_goes_ahead_when_the_owner_cannot_be_kept(client, root, monkeypatch):
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    f, body = opened(client, "dev", "SOUL.md")
+
+    def refuse(fd, uid, gid):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchown", refuse)
+    assert save(client, "dev", f["key"], "two\n", body["version"]).status_code == 200
+    assert path.read_text() == "two\n"
+
+
+def test_a_new_file_is_not_chowned(client, root, monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    f, _body = opened(client, "dev", "USER.md")
+    assert save(client, "dev", f["key"], "Name is Ben", "absent").status_code == 200
+    assert calls == []

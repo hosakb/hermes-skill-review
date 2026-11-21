@@ -1430,6 +1430,29 @@ def _skill_file_allowed(path: Path, skill_dir: Path) -> bool:
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _NOT_LISTED = "That file is not in the library. Reload the list."
+_UNSUPPORTED = ("Library needs Linux or macOS: it opens files through folder handles without following "
+                "symlinks, and this system cannot do that. Pending works as usual.")
+
+
+def _library_supported() -> bool:
+    """Whether this system has what the folder walk and the relative rename need (POSIX only).
+    Python lists ``os.rename`` in ``supports_dir_fd`` but never ``os.replace``, though both are the
+    same renameat call and take ``src_dir_fd``/``dst_dir_fd`` together; ``os.rename`` stands for both."""
+    return (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+            and all(fn in os.supports_dir_fd for fn in (os.open, os.rename, os.stat, os.unlink)))
+
+
+def _require_library() -> None:
+    if not _library_supported():
+        raise HTTPException(status_code=501, detail=_UNSUPPORTED)
+
+
+def _single_link(path: Path) -> bool:
+    """False for a file with a second hard link; it is not listed (and refused if one appears later)."""
+    try:
+        return os.lstat(path).st_nlink <= 1
+    except FileNotFoundError:
+        return True
 
 
 def _open_plain(path: Path) -> Optional[int]:
@@ -1489,11 +1512,13 @@ def _library_candidates(profile: str) -> list[dict[str, Any]]:
     home = Path(get_hermes_home())
     out: list[dict[str, Any]] = []
 
-    def add(kind: str, name: str, path: Path, **extra: Any) -> None:
+    def add(kind: str, name: str, path: Path, **extra: Any) -> bool:
         parts = _plain_parts(home, path)
-        if parts and _contained(path, home):
-            out.append({"key": _library_key(profile, path), "kind": kind, "name": name, "path": path,
-                        "root": home, "parts": parts, "skill": None, **extra})
+        if not (parts and _contained(path, home) and _single_link(path)):
+            return False
+        out.append({"key": _library_key(profile, path), "kind": kind, "name": name, "path": path,
+                    "root": home, "parts": parts, "skill": None, **extra})
+        return True
 
     for name in LIBRARY_IDENTITY:
         if os.path.lexists(home / name):
@@ -1504,9 +1529,12 @@ def _library_candidates(profile: str) -> list[dict[str, Any]]:
     root = Path(get_skills_dir())
     if _plain_parts(home, root) and root.is_dir():
         for skill_dir in sorted(smt._iter_skill_dirs(root), key=lambda d: d.relative_to(root).as_posix()):
+            # A skill whose SKILL.md is left out (a link into another home, say) is left out whole.
             for rel in _skill_files(skill_dir):
-                if _skill_file_allowed(skill_dir / rel, skill_dir):
-                    add("skill", rel, skill_dir / rel, skill=skill_dir.name, skill_dir=skill_dir)
+                ok = _skill_file_allowed(skill_dir / rel, skill_dir) and add(
+                    "skill", rel, skill_dir / rel, skill=skill_dir.name, skill_dir=skill_dir)
+                if rel == "SKILL.md" and not ok:
+                    break
     return out
 
 
@@ -1771,6 +1799,7 @@ def _library_body(raw: Any) -> tuple[str, str]:
 
 @router.get("/library")
 def list_library() -> dict[str, Any]:
+    _require_library()
     profiles = []
     for name in _known_profiles():
         try:
@@ -1781,9 +1810,11 @@ def list_library() -> dict[str, Any]:
     return {"profiles": profiles, "total": sum(p["pending"] for p in profiles)}
 
 
-def _write_at(folder: int, name: str, data: bytes, mode: int) -> None:
+def _write_at(folder: int, name: str, data: bytes, mode: int, owner: Optional[tuple[int, int]] = None) -> None:
     """Temp file in ``folder``, written and fsynced, then renamed over ``name``; both relative to the
-    folder fd. On any failure the temp file is removed and ``name`` is untouched."""
+    folder fd. ``owner`` (uid, gid) is set on the temp file before the rename, so the file never
+    shows with another owner; a refusal (not root, not the owner) keeps the writer's ids. On any
+    failure the temp file is removed and ``name`` is untouched."""
     tmp = f".skill-review-{secrets.token_hex(8)}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=folder)
     try:
@@ -1792,6 +1823,9 @@ def _write_at(folder: int, name: str, data: bytes, mode: int) -> None:
             while view:
                 view = view[os.write(fd, view):]
             os.fchmod(fd, mode)
+            if owner is not None and hasattr(os, "fchown"):
+                with suppress(PermissionError):  # EPERM / EACCES
+                    os.fchown(fd, *owner)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -1805,9 +1839,10 @@ def _write_at(folder: int, name: str, data: bytes, mode: int) -> None:
 
 
 def _library_write(entry: dict[str, Any], folder_id: tuple[int, int], before: Optional[os.stat_result],
-                   text: str) -> None:
+                   text: str) -> bytes:
     """After the checks: open the folder again through the same O_NOFOLLOW walk and write only if it
-    is the folder the save checked and the file is the inode it read (or still absent)."""
+    is the folder the save checked and the file is the inode it read (or still absent). Returns the
+    bytes written."""
     changed = HTTPException(status_code=409, detail=f"{entry['name']} or its folder changed on disk while saving. "
                                                     f"Nothing was written. Reload it.")
     try:
@@ -1826,13 +1861,15 @@ def _library_write(entry: dict[str, Any], folder_id: tuple[int, int], before: Op
                 not stat.S_ISREG(now.st_mode) or now.st_nlink > 1 or _identity(now) != _identity(before))):
             raise changed
         mode = stat.S_IMODE(before.st_mode) if before is not None else (0o600 if entry["kind"] == "memory" else 0o644)
+        data = text.encode("utf-8")
         try:
-            _write_at(folder, name, text.encode("utf-8"), mode)
+            _write_at(folder, name, data, mode, None if before is None else (before.st_uid, before.st_gid))
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not write {entry['name']}: "
                                                         f"{exc.strerror or exc}. The file on disk is unchanged.")
     finally:
         os.close(folder)
+    return data
 
 
 @contextmanager
@@ -1859,6 +1896,7 @@ def _ledger_record(entry: dict[str, Any]) -> Iterator[None]:
 
 @router.get("/library/{owner}/{key}")
 def read_library_file(owner: str, key: str) -> dict[str, Any]:
+    _require_library()
     _check_key(key)
     home = _resolve_profile(owner)
     with _profile_scope(home):
@@ -1871,6 +1909,7 @@ def read_library_file(owner: str, key: str) -> dict[str, Any]:
 
 @router.put("/library/{owner}/{key}")
 def save_library_file(owner: str, key: str, raw: Any = Body(...)) -> dict[str, Any]:
+    _require_library()
     text, version = _library_body(raw)
     _check_key(key)
     if len(text) > LIBRARY_READ_MAX:
@@ -1895,8 +1934,12 @@ def save_library_file(owner: str, key: str, raw: Any = Body(...)) -> dict[str, A
             if refusal := _library_refusal(entry, text, _library_text(entry, current)):
                 raise HTTPException(status_code=422, detail=refusal)
             with _ledger_record(entry):
-                _library_write(entry, folder_id, before, text)
+                written = _library_write(entry, folder_id, before, text)
             if subsystem := _LIBRARY_KINDS[entry["kind"]]:
                 _forget_cached(subsystem)  # as accept and edit do: pending blocks are evaluated again
-            saved, st = _read_library_bytes(entry)
-            return {"status": "saved", "file": _library_public(entry), "version": _library_version(saved, st)}
+            try:
+                saved, st = _read_library_bytes(entry)
+                version = _library_version(saved, st)
+            except HTTPException:  # written, but not readable back: the hash still matches what is on disk
+                version = f"{hashlib.sha256(written).hexdigest()}:0"
+            return {"status": "saved", "file": _library_public(entry), "version": version}
