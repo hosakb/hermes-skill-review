@@ -2009,7 +2009,7 @@ function useVisibleFiles() {
   }
 }
 
-function FilesListPane() {
+export function FilesListPane() {
   const t = usePluginI18n(ID)
   const v = useVisibleFiles()
   const selection = useValue($selection)
@@ -2030,13 +2030,8 @@ function FilesListPane() {
   const bar = jsxs('div', {
     style: STYLES.bar,
     children: [
-      jsxs('div', {
-        style: STYLES.barRow,
-        children: [
-          jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600, minWidth: 0 }, children: t('paneTitle') }),
-          total ? jsx(Badge, { variant: 'warn', children: total }) : null
-        ]
-      }),
+      // Pending | Library, with the Pending total where the title and its badge were.
+      jsx('div', { style: STYLES.barRow, children: jsx(ModeControl, { total }) }),
       // The settings live in their own pane; the header says what they are set to.
       jsxs('div', {
         style: LIST_STYLES.controls,
@@ -2202,6 +2197,815 @@ function FileDetailPane() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Library mode: each profile's identity, memory and skill files, opened in an editor that saves
+// straight to the file. Routes beside the review ones:
+//   GET /library                    the tree, per profile, with each file's pending count
+//   GET /library/{profile}/{key}    { file, text, version, limit }
+//   PUT /library/{profile}/{key}    { text, version }; 409 when the file changed on disk since
+//                                   that version, 422 when one of Hermes's checks refuses the text
+// The key is the backend's opaque file key; the plugin never sends a path.
+// ---------------------------------------------------------------------------------------------
+
+export const MODES = ['pending', 'library']
+export const $mode = atom('pending')
+/** Open Library file, as libId(profile, key). */
+export const $libSelection = atom(null)
+/** The open file once loaded or typed in: { id, profile, key, name, kind, skill, original, text,
+ *  version, limit, error, conflict, saving }. Outside the pane, so a remount keeps the text. */
+export const $libEditor = atom(null)
+/** { run } while the discard prompt is open: what to do once the user agrees. */
+export const $libDiscard = atom(null)
+/** Node id to open state. Profiles start open, skills start folded. */
+export const $libOpen = atom({})
+export const $libSearch = atom('')
+
+export const libraryPath = () => '/library'
+export const libraryFilePath = (profile, key) => `/library/${encodeURIComponent(profile)}/${encodeURIComponent(key)}`
+export const libId = (profile, key) => `${profile}/${key}`
+// Keys never hold a slash, so the profile is everything before the last one.
+const splitLibId = id => ({ key: id.slice(id.lastIndexOf('/') + 1), profile: id.slice(0, id.lastIndexOf('/')) })
+const libraryFileKey = id => [ID, 'library', 'file', id]
+
+export const isDirty = session => Boolean(session) && session.text !== session.original
+
+// Every session built from a loaded file gets the next number: opening, reopening after a discard
+// and reloading each start a new one, so a late answer is matched to its session, not its file.
+let sessionSerial = 0
+
+/** The editing session for `id`: the one in $libEditor when it is for this file, else a clean one
+ *  built from the loaded file, else null while it loads. */
+export function librarySession(current, id, data) {
+  if (id && current?.id === id) {
+    return current
+  }
+
+  // A late answer for another file is never shown as this one.
+  if (!id || data?.status !== 'ok' || !data.file || data.file.key !== splitLibId(id).key) {
+    return null
+  }
+
+  sessionSerial += 1
+
+  return {
+    conflict: null,
+    error: null,
+    gen: sessionSerial,
+    id,
+    key: data.file.key,
+    kind: data.file.kind,
+    limit: data.limit ?? null,
+    name: data.file.name,
+    original: data.text,
+    profile: splitLibId(id).profile,
+    saving: false,
+    skill: data.file.skill ?? null,
+    text: data.text,
+    version: data.version
+  }
+}
+
+export function changeLibraryText(session, text) {
+  if (session && !session.saving) {
+    $libEditor.set({ ...session, text })
+  }
+}
+
+export function revertLibrary(session) {
+  if (session && !session.saving) {
+    $libEditor.set({ ...session, error: null, text: session.original })
+  }
+}
+
+/** Run `action` now, or once the user agrees to drop the unsaved text. */
+export function requestLeave(action) {
+  if (isDirty($libEditor.get())) {
+    $libDiscard.set({ run: action })
+
+    return
+  }
+
+  action()
+}
+
+export function confirmDiscard() {
+  const ask = $libDiscard.get()
+
+  $libDiscard.set(null)
+  $libEditor.set(null)
+  ask?.run()
+}
+
+export const cancelDiscard = () => $libDiscard.set(null)
+
+export function selectLibraryFile(id) {
+  if (id === $libSelection.get()) {
+    return
+  }
+
+  requestLeave(() => {
+    $libEditor.set(null)
+    $libSelection.set(id)
+  })
+}
+
+export function setMode(mode) {
+  if (!MODES.includes(mode) || mode === $mode.get()) {
+    return
+  }
+
+  if (mode === 'library') {
+    $mode.set(mode)
+
+    return
+  }
+
+  requestLeave(() => {
+    $libEditor.set(null)
+    $mode.set(mode)
+  })
+}
+
+/** Switch to Pending with this file's review entry selected. The kind filter opens up so the
+ *  file is in the list as well as in the detail. */
+export function openPendingFor(profile, review) {
+  if (!review) {
+    return
+  }
+
+  requestLeave(() => {
+    $libEditor.set(null)
+    $kind.set('all')
+    $selection.set(`${review.subsystem}/${profile}/${review.key}`)
+    $mode.set('pending')
+  })
+}
+
+export function toggleNode(id, open) {
+  $libOpen.set({ ...$libOpen.get(), [id]: !open })
+}
+
+/** Profiles outside the hidden list; with a search, only what matches. A profile or skill whose
+ *  name matches keeps all its files; otherwise files match by name (SOUL.md, references/a.md). */
+export function filterLibrary(profiles, hidden = [], query = '') {
+  const off = new Set(hidden)
+  const q = String(query ?? '').trim().toLowerCase()
+  const has = value => String(value ?? '').toLowerCase().includes(q)
+  const shown = (profiles ?? []).filter(p => !off.has(p.profile))
+
+  if (!q) {
+    return shown
+  }
+
+  return shown
+    .map(p => {
+      if (has(p.profile)) {
+        return p
+      }
+
+      const files = list => (list ?? []).filter(f => has(f.name))
+
+      return {
+        ...p,
+        identity: files(p.identity),
+        memory: files(p.memory),
+        skills: (p.skills ?? []).map(s => (has(s.name) ? s : { ...s, files: files(s.files) })).filter(s => s.files.length),
+        staged: (p.staged ?? []).filter(s => has(s.file))
+      }
+    })
+    .filter(p => has(p.profile) || p.identity.length || p.memory.length || p.skills.length || p.staged.length)
+}
+
+/** The tree as flat rows in display order. A search opens every node. */
+export function treeRows(profiles, open = {}, query = '') {
+  const all = Boolean(String(query ?? '').trim())
+  const rows = []
+
+  for (const p of profiles ?? []) {
+    const pid = `p:${p.profile}`
+    const pOpen = all || open[pid] !== false
+    rows.push({ depth: 0, error: p.error ?? null, id: pid, label: p.profile, open: pOpen, pending: p.pending ?? 0, profile: p.profile, type: 'profile' })
+
+    if (!pOpen) {
+      continue
+    }
+
+    const group = (name, items) => {
+      if (items?.length) {
+        rows.push({ depth: 1, id: `g:${p.profile}:${name}`, label: `libGroup_${name}`, profile: p.profile, type: 'group' })
+      }
+    }
+
+    const fileRow = (f, depth, skill = null) => ({
+      depth,
+      file: f,
+      id: libId(p.profile, f.key),
+      label: f.name,
+      pending: f.pending ?? 0,
+      profile: p.profile,
+      skill,
+      type: 'file'
+    })
+
+    for (const name of ['identity', 'memory']) {
+      group(name, p[name])
+      ;(p[name] ?? []).forEach(f => rows.push(fileRow(f, 2)))
+    }
+
+    group('skills', p.skills)
+
+    for (const s of p.skills ?? []) {
+      const sid = `s:${p.profile}:${s.files?.[0]?.key ?? s.name}`
+      const sOpen = all || open[sid] === true
+      rows.push({ depth: 2, id: sid, label: s.name, open: sOpen, pending: s.pending ?? 0, profile: p.profile, skill: s.name, type: 'skill' })
+
+      if (sOpen) {
+        ;(s.files ?? []).forEach(f => rows.push(fileRow(f, 3, s.name)))
+      }
+    }
+
+    group('staged', p.staged)
+    ;(p.staged ?? []).forEach(s =>
+      rows.push({ depth: 2, id: `st:${p.profile}:${s.review?.key ?? s.file}`, label: s.file, pending: s.pending ?? 0, profile: p.profile, review: s.review ?? null, type: 'staged' })
+    )
+  }
+
+  return rows
+}
+
+/** { profile, file } for a Library id in the tree, or null. */
+export function findLibraryFile(tree, id) {
+  if (!id || !tree?.profiles) {
+    return null
+  }
+
+  for (const p of tree.profiles) {
+    const files = [...(p.identity ?? []), ...(p.memory ?? []), ...(p.skills ?? []).flatMap(s => s.files ?? [])]
+    const file = files.find(f => libId(p.profile, f.key) === id)
+
+    if (file) {
+      return { file, profile: p.profile }
+    }
+  }
+
+  return null
+}
+
+/** { status, detail } of a failed ctx.rest call. The bridge folds the HTTP status into the message
+ *  ("...Error: 409: {"detail": "..."}"); statusCode is used when it survives. */
+export function restError(error) {
+  const message = String(error?.message ?? error ?? '')
+  const match = message.match(/^[\s\S]*?\b([1-5]\d\d): ([\s\S]*)$/)
+  let status = Number.isInteger(error?.statusCode) ? error.statusCode : null
+  let detail = message
+
+  if (match) {
+    status ??= Number(match[1])
+    detail = match[2]
+  }
+
+  try {
+    const body = JSON.parse(detail)
+
+    if (typeof body?.detail === 'string') {
+      detail = body.detail
+    } else if (body?.detail != null) {
+      detail = JSON.stringify(body.detail)
+    }
+  } catch {
+    // not JSON: the text as it came
+  }
+
+  return { detail, status }
+}
+
+function refreshAfterSave(queryClient) {
+  queryClient.invalidateQueries({ queryKey: [ID, 'library'] })
+  queryClient.invalidateQueries({ queryKey: [ID, 'files'] })
+  queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
+}
+
+/** Set the editor state only while it still holds `session`: a result that arrives after the user
+ *  discarded the text, opened another file, or reopened this one is not applied. */
+const setIfStill = (session, next) => {
+  const current = $libEditor.get()
+
+  if (current?.id === session.id && current.gen === session.gen) {
+    $libEditor.set(next)
+  }
+}
+
+/** PUT the text with the version it was opened at. Saved: the file is clean at the new version.
+ *  409: the text stays and the editor offers Reload. 422: the text stays with Hermes's reason. */
+export async function performLibrarySave({ session, rest, queryClient, t }) {
+  if (!session || session.saving) {
+    return null
+  }
+
+  $libEditor.set({ ...session, conflict: null, error: null, saving: true })
+  let result
+
+  try {
+    result = await rest(libraryFilePath(session.profile, session.key), { body: { text: session.text, version: session.version }, method: 'PUT' })
+  } catch (error) {
+    const { detail, status } = restError(error)
+
+    if (status === 409) {
+      setIfStill(session, { ...session, conflict: detail || t('libConflict'), error: null, saving: false })
+    } else if (status === 422) {
+      setIfStill(session, { ...session, conflict: null, error: detail, saving: false })
+    } else {
+      setIfStill(session, { ...session, conflict: null, error: detail || t('libSaveFailed'), saving: false })
+      host.notifyError(error, t('libSaveFailed'))
+    }
+
+    return null
+  }
+
+  setIfStill(session, { ...session, conflict: null, error: null, original: session.text, saving: false, version: result?.version ?? session.version })
+  host.notify({ kind: 'success', message: t('libSaved', session.name) })
+  refreshAfterSave(queryClient)
+
+  return result
+}
+
+/** Load the file as it is on disk now, replacing the editor text (after a 409). */
+export async function reloadLibraryFile({ session, rest, queryClient, t }) {
+  let data
+
+  try {
+    data = await rest(libraryFilePath(session.profile, session.key))
+  } catch (error) {
+    setIfStill(session, { ...session, error: restError(error).detail || t('libReloadFailed'), saving: false })
+    host.notifyError(error, t('libReloadFailed'))
+
+    return null
+  }
+
+  setIfStill(session, librarySession(null, session.id, data))
+  queryClient.invalidateQueries({ queryKey: [ID, 'library'] })
+
+  return data
+}
+
+export const LIB_STYLES = {
+  tree: { display: 'flex', flexDirection: 'column', minWidth: 0, paddingBottom: '0.5rem' },
+  row: {
+    alignItems: 'center',
+    background: 'none',
+    border: 0,
+    borderLeft: '2px solid transparent',
+    color: 'var(--ui-text-primary)',
+    cursor: 'pointer',
+    display: 'flex',
+    fontSize: '0.8125rem',
+    gap: '0.35rem',
+    minWidth: 0,
+    paddingBottom: '0.22rem',
+    paddingRight: PAD,
+    paddingTop: '0.22rem',
+    textAlign: 'left',
+    width: '100%'
+  },
+  rowSelected: { background: 'var(--ui-bg-tertiary)', borderLeft: '2px solid var(--ui-accent)' },
+  group: { color: 'var(--ui-text-tertiary)', fontSize: '0.7rem', fontWeight: 600, minWidth: 0, paddingBottom: '0.15rem', paddingTop: '0.35rem' },
+  label: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  fileLabel: { flex: '1 1 auto', fontFamily: mono, fontSize: '0.75rem', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  caret: { color: 'var(--ui-text-tertiary)', flex: 'none', width: '1rem' },
+  dot: { background: 'var(--ui-blue, var(--ui-accent))', borderRadius: '50%', display: 'inline-block', flex: 'none', height: '0.45rem', width: '0.45rem' },
+  search: { boxSizing: 'border-box', maxWidth: '100%', minWidth: 0, width: '100%' },
+  // Gutter and text share face, size, leading and top padding, so line numbers stay level with
+  // the lines. No soft wrap: one text line is one gutter line. The box scrolls, not the textarea.
+  editorBox: {
+    alignItems: 'flex-start',
+    background: 'var(--ui-editor-surface-background)',
+    border: '1px solid var(--ui-stroke-secondary)',
+    borderRadius: '6px',
+    display: 'flex',
+    flex: '1 1 auto',
+    minHeight: 0,
+    minWidth: 0,
+    overflowX: 'hidden',
+    overflowY: 'auto'
+  },
+  gutter: {
+    borderRight: '1px solid var(--ui-stroke-tertiary)',
+    color: 'var(--ui-text-quaternary)',
+    flex: 'none',
+    fontFamily: mono,
+    fontSize: '0.75rem',
+    lineHeight: 1.55,
+    margin: 0,
+    minWidth: '3ch',
+    padding: '0.4rem 0.5rem',
+    textAlign: 'right',
+    userSelect: 'none',
+    whiteSpace: 'pre'
+  },
+  textarea: {
+    background: 'transparent',
+    border: 0,
+    borderRadius: 0,
+    boxShadow: 'none',
+    boxSizing: 'border-box',
+    color: 'var(--ui-text-primary)',
+    fieldSizing: 'fixed',
+    flex: '1 1 auto',
+    fontFamily: mono,
+    fontSize: '0.75rem',
+    lineHeight: 1.55,
+    minHeight: 0,
+    minWidth: 0,
+    outline: 'none',
+    overflowX: 'auto',
+    overflowY: 'hidden',
+    padding: '0.4rem 0.5rem',
+    resize: 'none',
+    whiteSpace: 'pre',
+    width: '100%'
+  },
+  body: { display: 'flex', flex: '1 1 auto', flexDirection: 'column', gap: '0.5rem', minHeight: 0, minWidth: 0, padding: PAD },
+  footer: { alignItems: 'center', color: 'var(--ui-text-tertiary)', display: 'flex', flex: 'none', flexWrap: 'wrap', fontSize: '0.7rem', gap: '0.3rem 0.75rem', minWidth: 0 },
+  unsaved: { alignItems: 'center', color: 'var(--ui-text-secondary)', display: 'inline-flex', gap: '0.3rem' },
+  link: { alignSelf: 'flex-start', flexShrink: 0, maxWidth: '100%', minWidth: 0 },
+  alert: {
+    alignItems: 'flex-start',
+    color: 'var(--ui-red, var(--ui-diff-remove-foreground))',
+    display: 'flex',
+    flex: 'none',
+    flexWrap: 'wrap',
+    fontSize: '0.75rem',
+    gap: '0.4rem',
+    minWidth: 0,
+    overflowWrap: 'anywhere'
+  }
+}
+
+const indent = depth => ({ paddingLeft: `calc(${PAD} + ${depth * 0.85}rem)` })
+
+/** The Pending | Library switch as a pure view. */
+export function ModeSwitch({ mode, total, onChange, t }) {
+  return jsx(SegmentedControl, {
+    onChange,
+    options: [
+      { id: 'pending', label: t('modePending', total ?? 0) },
+      { id: 'library', label: t('modeLibrary') }
+    ],
+    sizing: 'content',
+    value: MODES.includes(mode) ? mode : 'pending'
+  })
+}
+
+export function ModeControl({ total }) {
+  const t = usePluginI18n(ID)
+  const mode = useValue($mode)
+
+  return jsx(ModeSwitch, { mode, onChange: setMode, t, total })
+}
+
+/** The search box: the SDK's SearchField where the host has it, else its Input. */
+export function LibrarySearch({ value, onChange, t }) {
+  if (typeof SDK.SearchField === 'function') {
+    return jsx(SDK.SearchField, { 'aria-label': t('libSearch'), onChange, onClear: () => onChange(''), placeholder: t('libSearch'), value, variant: 'box' })
+  }
+
+  const Field = typeof SDK.Input === 'function' ? SDK.Input : 'input'
+
+  return jsx(Field, { 'aria-label': t('libSearch'), onChange: event => onChange(event.target.value), placeholder: t('libSearch'), style: LIB_STYLES.search, type: 'search', value })
+}
+
+const countBadge = n => (n > 0 ? jsx(Badge, { size: 'xs', variant: 'warn', children: n }) : null)
+
+/** One tree row. A plain function, not a component, so the tree is one element list with keys. */
+function treeRow({ row, selected, dirty, onSelect, onToggle, t }) {
+  if (row.type === 'group') {
+    return jsx('div', { 'data-row': row.id, role: 'presentation', style: { ...LIB_STYLES.group, ...indent(row.depth) }, children: t(row.label) }, row.id)
+  }
+
+  const folder = row.type === 'profile' || row.type === 'skill'
+  const caret = folder ? jsx(Codicon, { name: row.open ? 'chevron-down' : 'chevron-right', style: LIB_STYLES.caret }) : jsx('span', { style: LIB_STYLES.caret })
+  const onClick = folder ? () => onToggle(row.id, row.open) : row.type === 'staged' ? () => openPendingFor(row.profile, row.review) : () => onSelect(row.id)
+  const style = { ...LIB_STYLES.row, ...indent(row.depth), ...(selected ? LIB_STYLES.rowSelected : null) }
+
+  return jsxs('button', {
+    'aria-current': row.type === 'file' ? selected : undefined,
+    'aria-expanded': folder ? row.open : undefined,
+    'data-row': row.id,
+    onClick,
+    style,
+    title: row.type === 'staged' ? t('libStagedTip', row.label) : row.error ? row.error : row.label,
+    type: 'button',
+    children: [
+      caret,
+      jsx('span', { style: row.type === 'file' || row.type === 'staged' ? LIB_STYLES.fileLabel : { ...LIB_STYLES.label, fontWeight: row.type === 'profile' ? 600 : 400 }, children: row.label }),
+      row.type === 'file' && row.file?.exists === false ? jsx('span', { style: STYLES.muted, children: t('libNotCreated') }) : null,
+      row.error ? jsx('span', { style: STYLES.muted, children: t('libProfileError') }) : null,
+      dirty ? jsx('span', { 'aria-label': t('libUnsaved'), 'data-dirty': true, role: 'img', style: LIB_STYLES.dot }) : null,
+      countBadge(row.pending)
+    ]
+  }, row.id)
+}
+
+/** The tree as a pure view over treeRows(). */
+export function LibraryTree({ rows, selection, dirtyId = null, onSelect, onToggle, t }) {
+  return jsx('div', {
+    role: 'tree',
+    style: LIB_STYLES.tree,
+    children: rows.map(row => treeRow({ dirty: row.type === 'file' && row.id === dirtyId, onSelect, onToggle, row, selected: row.id === selection, t }))
+  })
+}
+
+/** What the Library list shows when the tree did not load: the backend's own message on a system
+ *  without the file handles Library needs (501), the missing-backend hint on 404, else the error
+ *  with a Retry. */
+export function libraryErrorState(error, t) {
+  const { detail, status } = restError(error)
+
+  if (status === 501) {
+    return { description: detail, retry: false, title: t('libUnsupportedTitle') }
+  }
+
+  if (status === 404) {
+    return { description: t('backendMissing'), retry: false, title: t('libLoadError') }
+  }
+
+  return { description: detail, retry: true, title: t('libLoadError') }
+}
+
+/** The Pending total the switch shows: every block in /files, as the Pending list counts them. */
+const pendingTotal = files => (files ?? []).reduce((sum, f) => sum + (f.counts?.total ?? 0), 0)
+
+/** Changes whenever a file's pending blocks can have changed, so the tree refetches its counts
+ *  then, and not on every poll (it walks every skill folder). */
+const pendingSignature = files =>
+  (files ?? []).map(f => `${f.profile}/${f.subsystem}/${f.key}:${diffVersion(f)}`).sort().join('|')
+
+function useLibrary() {
+  const profile = useValue(host.state.profile)
+  const files = useFiles()
+
+  return useQuery({
+    placeholderData: previous => previous,
+    queryFn: () => CTX.rest(libraryPath()),
+    queryKey: [ID, 'library', 'tree', profile, pendingSignature(files.data?.files)],
+    retry: (count, error) => restError(error).status !== 501 && count < 3 // 501 does not change
+  })
+}
+
+export function LibraryListPane() {
+  const t = usePluginI18n(ID)
+  const library = useLibrary()
+  const files = useFiles()
+  const hidden = useValue($hidden)
+  const search = useValue($libSearch)
+  const open = useValue($libOpen)
+  const selection = useValue($libSelection)
+  const editing = useValue($libEditor)
+  const inline = useValue($inlineSettings)
+  const profiles = library.data?.profiles ?? []
+  const summary = profiles.map(p => ({ count: p.pending ?? 0, profile: p.profile }))
+  const rows = treeRows(filterLibrary(profiles, hidden, search), open, search)
+
+  const bar = jsxs('div', {
+    style: STYLES.bar,
+    children: [
+      jsx('div', { style: STYLES.barRow, children: jsx(ModeControl, { total: pendingTotal(files.data?.files) }) }),
+      jsxs('div', {
+        style: LIST_STYLES.controls,
+        children: [
+          jsx('span', { style: { ...STYLES.muted, ...STYLES.ellipsis }, children: profiles.length ? profileLabel(summary, hidden, t) : '' }),
+          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t })
+        ]
+      }),
+      jsx(LibrarySearch, { onChange: value => $libSearch.set(value), t, value: search }),
+      inline ? jsx(SettingsPage, {}) : null
+    ]
+  })
+
+  let body
+
+  if (library.isError) {
+    const failed = libraryErrorState(library.error, t)
+
+    body = jsx(ErrorState, {
+      children: failed.retry ? jsx(Button, { onClick: () => library.refetch(), size: 'sm', type: 'button', variant: 'outline', children: t('retry') }) : null,
+      description: failed.description,
+      title: failed.title
+    })
+  } else if (library.isLoading) {
+    body = jsx('div', { style: { ...STYLES.muted, padding: PAD }, children: t('loading') })
+  } else if (!rows.length) {
+    body = jsx(EmptyState, { description: search.trim() ? t('libSearchNone', search.trim()) : t('libEmptyBody'), title: t('libEmptyTitle') })
+  } else {
+    body = jsx(LibraryTree, { dirtyId: isDirty(editing) ? editing.id : null, onSelect: selectLibraryFile, onToggle: toggleNode, rows, selection, t })
+  }
+
+  return jsxs('div', { style: STYLES.paneRoot, children: [bar, jsx('div', { style: STYLES.listScroll, children: body })] })
+}
+
+const textLines = text => String(text ?? '').split('\n').length
+
+/** The file editor as a pure view: header, pending link, alerts, the editor and its footer. */
+export function LibraryEditorView({ meta, session, loading = false, error = null, onChange, onSave, onRevert, onReload, onReview, t }) {
+  const file = meta?.file ?? (session ? { kind: session.kind, name: session.name, pending: 0, skill: session.skill } : null)
+  const profile = meta?.profile ?? session?.profile ?? ''
+  const name = file?.name ?? ''
+  const title = file?.skill ? `${file.skill} / ${name}` : name
+  const dirty = isDirty(session)
+  const saving = Boolean(session?.saving)
+  const pending = file?.pending ?? 0
+
+  const header = jsxs('div', {
+    style: STYLES.headerWrap,
+    children: [
+      jsxs('div', {
+        style: STYLES.header,
+        children: [
+          jsx('span', { style: FILE_STYLES.fileTitle, title, children: title }),
+          file?.kind ? jsx(Badge, { size: 'xs', variant: file.kind === 'memory' ? 'default' : 'muted', children: t(`libKind_${file.kind}`) }) : null,
+          profile ? jsx(Badge, { size: 'xs', variant: 'outline', children: profile }) : null,
+          jsxs('span', {
+            style: STYLES.actions,
+            children: [
+              jsx(Button, { disabled: !dirty || saving, onClick: () => onRevert?.(), size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('libRevert') }),
+              jsx(Button, { disabled: !dirty || saving, onClick: () => onSave?.(), size: 'xs', style: STYLES.button, type: 'button', children: t('libSave') })
+            ]
+          })
+        ]
+      }),
+      pending > 0 && file?.review
+        ? jsx('div', {
+            style: STYLES.summary,
+            children: jsx(Button, { onClick: () => onReview?.(), size: 'xs', style: LIB_STYLES.link, type: 'button', variant: 'ghost', children: t('libPendingLink', pending) })
+          })
+        : null
+    ]
+  })
+
+  let body
+
+  if (error) {
+    body = jsx(ErrorState, { description: restError(error).detail, title: t('libOpenError') })
+  } else if (!session) {
+    body = loading ? jsx(DiffSkeleton, { t }) : null
+  } else {
+    const lines = textLines(session.text)
+
+    body = [
+      session.conflict
+        ? jsxs('div', {
+            role: 'alert',
+            style: LIB_STYLES.alert,
+            children: [
+              jsx('span', { style: { flex: '1 1 12rem', minWidth: 0 }, children: session.conflict }),
+              jsx(Button, { disabled: saving, onClick: () => onReload?.(), size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('libReload') })
+            ]
+          }, 'conflict')
+        : null,
+      session.error ? jsx('div', { role: 'alert', style: EDIT_STYLES.error, children: session.error }, 'error') : null,
+      jsxs('div', {
+        style: LIB_STYLES.editorBox,
+        children: [
+          jsx('pre', { 'aria-hidden': true, 'data-gutter': true, style: LIB_STYLES.gutter, children: Array.from({ length: lines }, (_, i) => i + 1).join('\n') }),
+          jsx(Textarea, {
+            'aria-invalid': Boolean(session.error),
+            'aria-label': t('libEditorLabel', name),
+            onChange: event => onChange?.(event.target.value),
+            readOnly: saving,
+            rows: lines,
+            spellCheck: false,
+            // Every line shows; room is left for a horizontal scrollbar under a long line.
+            style: { ...LIB_STYLES.textarea, height: `calc(${(lines * 1.55 * 0.75 + 0.8).toFixed(2)}rem + 14px)` },
+            value: session.text,
+            wrap: 'off'
+          })
+        ]
+      }, 'editor'),
+      jsxs('div', {
+        style: LIB_STYLES.footer,
+        children: [
+          dirty ? jsxs('span', { 'aria-live': 'polite', style: LIB_STYLES.unsaved, children: [jsx('span', { style: LIB_STYLES.dot }), t('libUnsaved')] }) : null,
+          jsx('span', { children: t('libStraightToFile') }),
+          jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: t('libLines', lines) })
+        ]
+      }, 'footer')
+    ]
+  }
+
+  return jsxs('div', { style: STYLES.paneRoot, children: [header, jsx('div', { style: LIB_STYLES.body, children: body })] })
+}
+
+export function LibraryDetailPane() {
+  const t = usePluginI18n(ID)
+  const queryClient = useQueryClient()
+  const selection = useValue($libSelection)
+  const editing = useValue($libEditor)
+  const discard = useValue($libDiscard)
+  const library = useLibrary()
+  const meta = findLibraryFile(library.data, selection)
+  const content = useQuery({
+    enabled: Boolean(selection),
+    queryFn: () => {
+      const { profile, key } = splitLibId(selection)
+
+      return CTX.rest(libraryFilePath(profile, key))
+    },
+    queryKey: libraryFileKey(selection),
+    refetchOnWindowFocus: false,
+    retry: false
+  })
+  const session = librarySession(editing, selection, content.data)
+  // A clean file that left the tree (deleted, or no longer inside its profile) closes; unsaved text stays.
+  const gone = Boolean(selection) && library.isSuccess && !meta && !isDirty(session)
+
+  useEffect(() => {
+    if (gone) {
+      $libEditor.set(null)
+      $libSelection.set(null)
+    }
+  }, [gone])
+
+  const dialog = jsx(ConfirmDialog, {
+    confirmLabel: t('libDiscard'),
+    description: t('libDiscardBody'),
+    destructive: true,
+    dismissOnConfirm: true,
+    onClose: cancelDiscard,
+    onConfirm: confirmDiscard,
+    open: Boolean(discard),
+    title: t('libDiscardTitle')
+  })
+
+  if (!selection) {
+    return jsxs('div', { style: STYLES.paneRoot, children: [jsx(EmptyState, { description: t('libSelectBody'), title: t('libSelectTitle') }), dialog] })
+  }
+
+  const rest = (path, opts) => CTX.rest(path, opts)
+  const current = () => librarySession($libEditor.get(), selection, content.data)
+
+  return jsxs('div', {
+    style: STYLES.paneRoot,
+    children: [
+      jsx(LibraryEditorView, {
+        error: !session && content.isError ? content.error : null,
+        loading: content.isLoading,
+        meta,
+        onChange: text => changeLibraryText(current(), text),
+        onReload: () => reloadLibraryFile({ queryClient, rest, session: current(), t }),
+        onRevert: () => revertLibrary(current()),
+        onReview: () => openPendingFor(meta?.profile, meta?.file?.review),
+        onSave: () => {
+          haptic('tap')
+
+          return performLibrarySave({ queryClient, rest, session: current(), t })
+        },
+        session,
+        t
+      }),
+      dialog
+    ]
+  })
+}
+
+const LIB_EN = {
+  modeLibrary: 'Library',
+  modePending: n => `Pending ${n}`,
+  libConflict: 'The file changed on disk since you opened it. Reload it to see the new text.',
+  libDiscard: 'Discard',
+  libDiscardBody: 'Your edits to this file are not saved. They are lost if you go on.',
+  libDiscardTitle: 'Discard unsaved changes?',
+  libEditorLabel: name => `Text of ${name}`,
+  libEmptyBody: 'No profile files to show.',
+  libEmptyTitle: 'Nothing here',
+  libGroup_identity: 'Identity',
+  libGroup_memory: 'Memory',
+  libGroup_skills: 'Skills',
+  libGroup_staged: 'Only in Pending',
+  libKind_identity: 'Identity',
+  libKind_memory: 'Memory',
+  libKind_skill: 'Skill',
+  libLines: n => `${n.toLocaleString('en-US')} line${n === 1 ? '' : 's'}`,
+  libLoadError: 'Could not load the library',
+  libNotCreated: 'not created yet',
+  libOpenError: 'Could not open this file',
+  libPendingLink: n => `${n} pending change${n === 1 ? '' : 's'}: review`,
+  libProfileError: 'could not be read',
+  libReload: 'Reload',
+  libReloadFailed: 'Could not reload the file',
+  libRevert: 'Revert',
+  libSave: 'Save',
+  libSaveFailed: 'Could not save the file',
+  libSaved: name => `Saved ${name}`,
+  libSearch: 'Search the library',
+  libSearchNone: query => `Nothing matches "${query}".`,
+  libSelectBody: 'Pick a file in the library to read or edit it.',
+  libSelectTitle: 'No file selected',
+  libStagedTip: name => `${name} is not in the library: a new file, or a skill outside this profile's folder. Open its changes in Pending.`,
+  libStraightToFile: 'Saves straight to the file',
+  libUnsaved: 'Unsaved changes',
+  libUnsupportedTitle: 'Library is not available on this system'
+}
+
+// ---------------------------------------------------------------------------------------------
 // The review tab: list and diff side by side in one pane, stacked when the pane is narrow
 // ---------------------------------------------------------------------------------------------
 
@@ -2246,23 +3050,25 @@ export const REVIEW_STYLES = {
 }
 
 /** Pure layout, so tests can drive both widths. The selection atom decides what narrow shows. */
-export function ReviewLayout({ narrow, selection, onBack, rootRef, t }) {
+export function ReviewLayout({ mode = 'pending', narrow, selection, onBack, rootRef, t }) {
   const open = Boolean(selection)
+  const List = mode === 'library' ? LibraryListPane : FilesListPane
+  const Detail = mode === 'library' ? LibraryDetailPane : FileDetailPane
 
   if (!narrow) {
     return jsxs('div', {
       ref: rootRef,
       style: REVIEW_STYLES.root,
       children: [
-        jsx('div', { style: REVIEW_STYLES.list, children: jsx(FilesListPane, {}) }, 'list'),
-        jsx('div', { style: REVIEW_STYLES.detail, children: jsx(FileDetailPane, {}) }, 'detail')
+        jsx('div', { style: REVIEW_STYLES.list, children: jsx(List, {}) }, 'list'),
+        jsx('div', { style: REVIEW_STYLES.detail, children: jsx(Detail, {}) }, 'detail')
       ]
     })
   }
 
   const list = open
-    ? jsx('div', { 'aria-hidden': true, style: { ...REVIEW_STYLES.list, ...REVIEW_STYLES.parked }, children: jsx(FilesListPane, {}) }, 'list')
-    : jsx('div', { style: { ...REVIEW_STYLES.list, ...REVIEW_STYLES.alone }, children: jsx(FilesListPane, {}) }, 'list')
+    ? jsx('div', { 'aria-hidden': true, style: { ...REVIEW_STYLES.list, ...REVIEW_STYLES.parked }, children: jsx(List, {}) }, 'list')
+    : jsx('div', { style: { ...REVIEW_STYLES.list, ...REVIEW_STYLES.alone }, children: jsx(List, {}) }, 'list')
 
   return jsxs('div', {
     ref: rootRef,
@@ -2285,7 +3091,7 @@ export function ReviewLayout({ narrow, selection, onBack, rootRef, t }) {
                   children: [jsx(Codicon, { name: 'arrow-left' }), t('backToList')]
                 })
               }),
-              jsx('div', { style: REVIEW_STYLES.body, children: jsx(FileDetailPane, {}) })
+              jsx('div', { style: REVIEW_STYLES.body, children: jsx(Detail, {}) })
             ]
           }, 'detail')
         : null
@@ -2296,13 +3102,24 @@ export function ReviewLayout({ narrow, selection, onBack, rootRef, t }) {
 /** The single review pane: measures its own width and picks side by side or stacked. */
 export function ReviewPane() {
   const t = usePluginI18n(ID)
-  const selection = useValue($selection)
+  const mode = useValue($mode)
+  const pendingSelection = useValue($selection)
+  const librarySelection = useValue($libSelection)
   const [node, setNode] = useState(null)
   const [narrow, setNarrow] = useState(false)
 
   useEffect(() => observeWidth(node, width => setNarrow(isNarrowWidth(width))), [node])
 
-  return jsx(ReviewLayout, { narrow, onBack: () => $selection.set(null), rootRef: setNode, selection, t })
+  const library = mode === 'library'
+  const onBack = library
+    ? () =>
+        requestLeave(() => {
+          $libEditor.set(null)
+          $libSelection.set(null)
+        })
+    : () => $selection.set(null)
+
+  return jsx(ReviewLayout, { mode, narrow, onBack, rootRef: setNode, selection: library ? librarySelection : pendingSelection, t })
 }
 
 const FILE_EN = {
@@ -3352,6 +4169,7 @@ messages.en = en
 Object.assign(en, NOTIFY_EN, LIST_EN, EDIT_EN, SETTINGS_EN)
 Object.assign(en, REMOVE_EN)
 Object.assign(en, EXPAND_EN)
+Object.assign(en, LIB_EN)
 
 export default {
   id: ID,

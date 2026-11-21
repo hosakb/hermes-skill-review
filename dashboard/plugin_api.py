@@ -15,6 +15,7 @@ a pending record; its dry-run scan writes only inside a temporary folder.
 from __future__ import annotations
 
 import base64
+import codecs
 import copy
 import difflib
 import hashlib
@@ -22,10 +23,12 @@ import json
 import os
 import posixpath
 import re
+import secrets
+import stat
 import tempfile
 import threading
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -806,6 +809,7 @@ def _evaluate(subsystem: str, entry: dict[str, Any], memo: dict) -> tuple[Option
             _cache.move_to_end(cache_key)
     if (hit is not None and hit["records"] == records and hit["state"] == state
             and _target_state(hit["target"]) == hit["target_state"]):
+        entry["_target"] = hit["target"]  # as an uncached evaluation leaves it (Library reads it)
         return copy.deepcopy(hit["cur"]), copy.deepcopy(hit["blocks"]), hit["version"]
     cur, blocks = _evaluate_uncached(subsystem, entry)
     target = entry.get("_target")
@@ -1125,13 +1129,21 @@ def _edit_scan(subsystem: str, entry: dict[str, Any], record: dict[str, Any], op
         if op.get("action") == "patch" and op.get("matched_entry"):
             checked.append(op["matched_entry"].replace(op.get("old_text") or "", text, 1))
         return next((error for error in map(mts._scan_memory_content, checked) if error), None)
-    from tools import skill_manager_tool as smt
-    from tools.skill_manager_scan import _replaying_background_write, _scan_baseline
     from tools.skill_provenance import BACKGROUND_REVIEW
     rel = "SKILL.md" if field == "content" else entry["rel"]
     after = _skill_after_text(entry, op, field, text)
     current = None if op.get("action") == "create" else _read_target(entry)
-    token = _replaying_background_write.set(record.get("origin") == BACKGROUND_REVIEW)
+    return _scan_skill_copy(rel, current, after if after is not None else text,
+                            background=record.get("origin") == BACKGROUND_REVIEW)
+
+
+def _scan_skill_copy(rel: str, current: Optional[str], after: str, *, background: bool) -> Optional[str]:
+    """Skills Guard's verdict on ``after`` as the skill file ``rel``, run on a copy in a temporary
+    folder: the current text first (the baseline for a background write), then the new text.
+    The real skill folder is never touched. None when the scan passes or is not required."""
+    from tools import skill_manager_tool as smt
+    from tools.skill_manager_scan import _replaying_background_write, _scan_baseline
+    token = _replaying_background_write.set(background)
     try:
         with tempfile.TemporaryDirectory(prefix="skill-review-scan-") as tmp:
             skill_dir = Path(tmp) / "skill"
@@ -1144,7 +1156,7 @@ def _edit_scan(subsystem: str, entry: dict[str, Any], record: dict[str, Any], op
             scope, baseline, error = _scan_baseline(skill_dir, target)
             if error:
                 return error
-            target.write_text(after if after is not None else text, encoding="utf-8")
+            target.write_text(after, encoding="utf-8")
             return smt._security_scan_skill(skill_dir, baseline, scope)
     finally:
         _replaying_background_write.reset(token)
@@ -1338,3 +1350,596 @@ def remove_entry_block(owner: str, subsystem: str, key: str, block_id: str) -> d
                         _forget_cached(subsystem)
             gone = key not in _file_entries(subsystem, owner)
     return {"status": outcome["status"], "error": outcome["error"], "file_gone": gone}
+
+
+# =================================================================================================
+# Library: browse and edit each profile's identity, memory and skill files.
+#
+#   GET /library
+#       One row per profile: identity files (SOUL.md, PROJECT.md, AGENTS.md when present), memory
+#       files (MEMORY.md, USER.md) and the skill folders in the profile's own skills folder (SKILL.md
+#       plus text files under Hermes's allowed subfolders), each with its count of pending blocks
+#       from the same aggregation as /files. A pending block whose file is not listed (a new skill,
+#       or a skill in an external skills folder) is in ``staged``.
+#   GET /library/{owner}/{key}
+#       The file's text and a version token ``<sha256 of the bytes>:<mtime_ns>`` ("absent" for a
+#       memory file that does not exist yet). Text only: at most 1 MB, strict UTF-8, no NUL bytes.
+#   PUT /library/{owner}/{key}   body {"text": str, "version": str}
+#       Writes the text straight to the file: 409 when the file changed since that version, 422
+#       when one of Hermes's checks refuses it (nothing is written), else an atomic replace.
+#
+# The key is opaque. Every request rebuilds the list of files this module may touch for that
+# profile, here on the server, and looks the key up in it, so a client never names a path. A file
+# is on the list only when it is inside the profile home and no component of its path below the
+# home is a symlink; a skill file must also be inside its own skill folder.
+#
+# The list is only the lookup. Every read and write then opens the file's folder from the profile
+# home one component at a time with O_NOFOLLOW, so a symlink swapped in anywhere on the path after
+# the lookup makes the open fail; the file itself is opened with O_NOFOLLOW and O_NONBLOCK and
+# must be a regular file with one hard link. A save does this under its locks, runs the checks,
+# then opens the folder the same way again and writes only if the folder is the same one (st_dev,
+# st_ino) and the file is the same inode it read (or still absent). The temp file and the rename
+# are relative to that folder fd, so the write lands in the folder that was checked. A process
+# that does not take these locks and rewrites the file in place between that last check and the
+# rename can still lose its write, as with any read-modify-write.
+# =================================================================================================
+
+LIBRARY_IDENTITY = ("SOUL.md", "PROJECT.md", "AGENTS.md")
+LIBRARY_READ_MAX = 1_048_576
+IDENTITY_MAX_CHARS = 200_000
+_SNIFF_BYTES = 8192
+_ABSENT = "absent"
+_LIBRARY_KINDS = {"identity": None, "memory": MEMORY, "skill": SKILLS}
+
+
+def _library_key(profile: str, path: Any) -> str:
+    """Opaque, URL-safe, 16 characters, from the profile and the listed path; never parsed back."""
+    digest = hashlib.sha256(f"library\0{profile}\0{path}".encode("utf-8", "surrogatepass")).digest()
+    return base64.urlsafe_b64encode(digest[:12]).decode("ascii")
+
+
+def _contained(path: Any, root: Any) -> bool:
+    """A regular file (or, for a memory file, nothing yet) whose real path is inside ``root``."""
+    if os.path.lexists(path) and not os.path.isfile(path):  # a folder, a dangling link, a device
+        return False
+    return _inside(path, root)
+
+
+def _plain_parts(home: Path, path: Path) -> Optional[tuple[str, ...]]:
+    """The components of ``path`` below ``home`` when none of them is a symlink, else None. The last
+    one may not exist yet (a memory file before its first write)."""
+    try:
+        parts = path.relative_to(home).parts
+    except ValueError:
+        return None
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return None
+    current = home
+    for part in parts:
+        current = current / part
+        if os.path.islink(current):
+            return None
+    return parts
+
+
+def _skill_file_allowed(path: Path, skill_dir: Path) -> bool:
+    """A skill file must resolve inside its own skill folder, never into a sibling skill."""
+    return _inside(path, skill_dir)
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_NOT_LISTED = "That file is not in the library. Reload the list."
+_UNSUPPORTED = ("Library needs Linux or macOS: it opens files through folder handles without following "
+                "symlinks, and this system cannot do that. Pending works as usual.")
+
+
+def _library_supported() -> bool:
+    """Whether this system has what the folder walk and the relative rename need (POSIX only).
+    Python lists ``os.rename`` in ``supports_dir_fd`` but never ``os.replace``, though both are the
+    same renameat call and take ``src_dir_fd``/``dst_dir_fd`` together; ``os.rename`` stands for both."""
+    return (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+            and all(fn in os.supports_dir_fd for fn in (os.open, os.rename, os.stat, os.unlink)))
+
+
+def _require_library() -> None:
+    if not _library_supported():
+        raise HTTPException(status_code=501, detail=_UNSUPPORTED)
+
+
+def _single_link(path: Path) -> bool:
+    """False for a file with a second hard link; it is not listed (and refused if one appears later)."""
+    try:
+        return os.lstat(path).st_nlink <= 1
+    except FileNotFoundError:
+        return True
+
+
+def _open_plain(path: Path) -> Optional[int]:
+    """fd of ``path`` opened with O_NOFOLLOW and O_NONBLOCK when it is a regular file, else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _looks_text(path: Path) -> bool:
+    """No NUL byte and valid UTF-8 in the first 8 KB. The tree lists only such supporting files.
+    Opened without following a symlink and without waiting on a FIFO."""
+    fd = _open_plain(path)
+    if fd is None:
+        return False
+    with os.fdopen(fd, "rb") as fh:
+        head = fh.read(_SNIFF_BYTES)
+    if b"\0" in head:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(head, final=False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _skill_files(skill_dir: Path) -> list[str]:
+    """SKILL.md, then every file under Hermes's allowed subfolders (the only places its write_file
+    reaches), sorted. Excluded folders are skipped and symlinked folders are not entered."""
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS
+    from tools.skill_manager_tool import ALLOWED_SUBDIRS
+    rels = ["SKILL.md"]
+    for sub in sorted(ALLOWED_SUBDIRS):
+        top = skill_dir / sub
+        if not top.is_dir() or top.is_symlink():
+            continue
+        found = []
+        for folder, dirs, names in os.walk(top):
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
+            found += [Path(folder, n).relative_to(skill_dir).as_posix() for n in names]
+        rels += sorted(found)
+    return rels
+
+
+def _library_candidates(profile: str) -> list[dict[str, Any]]:
+    """Every file Library may show or write for ``profile``, in the current profile scope. Skills
+    come only from the profile's own skills folder: external skill folders are outside the home."""
+    from agent.skill_utils import get_skills_dir
+    from hermes_constants import get_hermes_home
+    from tools import skill_manager_tool as smt
+    from tools.memory_tool_store import MemoryStore
+    home = Path(get_hermes_home())
+    out: list[dict[str, Any]] = []
+
+    def add(kind: str, name: str, path: Path, **extra: Any) -> bool:
+        parts = _plain_parts(home, path)
+        if not (parts and _contained(path, home) and _single_link(path)):
+            return False
+        out.append({"key": _library_key(profile, path), "kind": kind, "name": name, "path": path,
+                    "root": home, "parts": parts, "skill": None, **extra})
+        return True
+
+    for name in LIBRARY_IDENTITY:
+        if os.path.lexists(home / name):
+            add("identity", name, home / name)
+    for target in ("memory", "user"):
+        path = MemoryStore._path_for(target)
+        add("memory", path.name, path, target=target)
+    root = Path(get_skills_dir())
+    if _plain_parts(home, root) and root.is_dir():
+        for skill_dir in sorted(smt._iter_skill_dirs(root), key=lambda d: d.relative_to(root).as_posix()):
+            # A skill whose SKILL.md is left out (a link into another home, say) is left out whole.
+            for rel in _skill_files(skill_dir):
+                ok = _skill_file_allowed(skill_dir / rel, skill_dir) and add(
+                    "skill", rel, skill_dir / rel, skill=skill_dir.name, skill_dir=skill_dir)
+                if rel == "SKILL.md" and not ok:
+                    break
+    return out
+
+
+def _library_entry(profile: str, key: str) -> dict[str, Any]:
+    entry = next((c for c in _library_candidates(profile) if c["key"] == key), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=_NOT_LISTED)
+    return entry
+
+
+def _open_folder(entry: dict[str, Any]) -> int:
+    """fd of the file's folder, opened from the profile home one component at a time with
+    O_NOFOLLOW, so a symlink anywhere below the home fails the open (ELOOP)."""
+    fd = os.open(entry["root"], os.O_RDONLY | _O_DIRECTORY)
+    try:
+        for part in entry["parts"][:-1]:
+            nxt = os.open(part, os.O_RDONLY | _O_DIRECTORY | _NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return st.st_dev, st.st_ino
+
+
+def _read_at(entry: dict[str, Any], folder: int) -> tuple[Optional[bytes], Optional[os.stat_result]]:
+    """``(bytes, stat)`` of the file in the open ``folder``, ``(None, None)`` for a memory file that
+    does not exist yet. Refuses a symlink, a FIFO or other non-regular file, a second hard link and
+    anything past 1 MB, all judged on the opened fd."""
+    try:
+        fd = os.open(entry["parts"][-1], os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=folder)
+    except FileNotFoundError:
+        if entry["kind"] == "memory":
+            return None, None
+        raise HTTPException(status_code=404, detail="That file no longer exists. Reload the list.")
+    except OSError:  # ELOOP: the name is a symlink now
+        raise HTTPException(status_code=404, detail=_NOT_LISTED)
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise HTTPException(status_code=404, detail=_NOT_LISTED)
+        if st.st_nlink > 1:
+            raise HTTPException(status_code=403, detail=f"{entry['name']} has more than one hard link, so Library "
+                                                        f"does not open or save it.")
+        if st.st_size > LIBRARY_READ_MAX:
+            raise HTTPException(status_code=413, detail=f"{entry['name']} is larger than 1 MB, so Library does not open it.")
+        data = fh.read(LIBRARY_READ_MAX + 1)
+    if len(data) > LIBRARY_READ_MAX:
+        raise HTTPException(status_code=413, detail=f"{entry['name']} is larger than 1 MB, so Library does not open it.")
+    return data, st
+
+
+def _read_library_bytes(entry: dict[str, Any]) -> tuple[Optional[bytes], Optional[os.stat_result]]:
+    try:
+        folder = _open_folder(entry)
+    except FileNotFoundError:
+        if entry["kind"] == "memory":
+            return None, None
+        raise HTTPException(status_code=404, detail="That file no longer exists. Reload the list.")
+    except OSError:
+        raise HTTPException(status_code=404, detail=_NOT_LISTED)
+    try:
+        return _read_at(entry, folder)
+    finally:
+        os.close(folder)
+
+
+def _library_pending(profile: str) -> list[tuple[Optional[tuple[str, str]], dict[str, Any]]]:
+    """``(match, row)`` per pending file of the profile in scope: the same entries, evaluation and
+    cache as /files. ``match`` names the file the blocks change: ("memory", target), ("path", real
+    path) for a skill file Hermes's lookup located, or None."""
+    out = []
+    for subsystem in SUBSYSTEMS:
+        if not _queue_dir(subsystem).is_dir():
+            continue
+        with _queue_lock(subsystem):
+            entries = _file_entries(subsystem, profile)
+        memo: dict = {}
+        for entry in entries.values():
+            _cur, blocks, _version = _evaluate(subsystem, entry, memo)
+            if subsystem == MEMORY:
+                match = (MEMORY, _memory_target(entry))
+            else:
+                target = entry.get("_target")
+                match = ("path", os.path.realpath(target)) if target is not None else None
+            out.append((match, {"file": entry["file"], "subsystem": subsystem, "pending": len(blocks),
+                                "review": {"subsystem": subsystem, "key": entry["key"]}}))
+        _store(memo)
+    return out
+
+
+def _stat(path: Path) -> tuple[bool, int, float]:
+    try:
+        st = os.lstat(path)  # metadata only; never follows a link that appeared after the lookup
+    except FileNotFoundError:
+        return False, 0, 0
+    return True, st.st_size, st.st_mtime
+
+
+def _library_public(entry: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    exists, size, mtime = _stat(entry["path"])
+    return {"key": entry["key"], "kind": entry["kind"], "name": entry["name"], "skill": entry["skill"],
+            "exists": exists, "size": size, "mtime": mtime, **extra}
+
+
+def _library_profile(name: str) -> dict[str, Any]:
+    """One profile's tree with pending counts. Raises on a broken profile; the route reports it."""
+    with _profile_scope(Path(_profiles_mod().get_profile_dir(name))):
+        candidates = [c for c in _library_candidates(name)
+                      if c["kind"] != "skill" or c["name"] == "SKILL.md" or _looks_text(c["path"])]
+        pending = _library_pending(name)
+    by_match: dict[tuple[str, str], dict[str, Any]] = {}
+    for c in candidates:
+        match = (MEMORY, c["target"]) if c["kind"] == "memory" else (
+            ("path", os.path.realpath(c["path"])) if c["kind"] == "skill" else None)
+        if match is not None:
+            by_match[match] = {"pending": 0, "review": None}
+    staged = []
+    for match, row in pending:
+        slot = by_match.get(match) if match is not None else None
+        if slot is None or slot["review"] is not None:
+            staged.append(row)
+            continue
+        slot.update(pending=row["pending"], review=row["review"])
+
+    def public(c: dict[str, Any]) -> dict[str, Any]:
+        match = (MEMORY, c["target"]) if c["kind"] == "memory" else (
+            ("path", os.path.realpath(c["path"])) if c["kind"] == "skill" else None)
+        slot = by_match.get(match, {"pending": 0, "review": None}) if match is not None else {"pending": 0, "review": None}
+        return _library_public(c, pending=slot["pending"], review=slot["review"])
+
+    skills: dict[str, dict[str, Any]] = {}
+    for c in candidates:
+        if c["kind"] == "skill":
+            group = skills.setdefault(str(c["skill_dir"]), {"name": c["skill"], "pending": 0, "files": []})
+            group["files"].append(public(c))
+            group["pending"] += group["files"][-1]["pending"]
+    row = {"profile": name, "error": None,
+           "identity": [public(c) for c in candidates if c["kind"] == "identity"],
+           "memory": [public(c) for c in candidates if c["kind"] == "memory"],
+           "skills": list(skills.values()), "staged": staged}
+    row["pending"] = (sum(f["pending"] for f in row["identity"] + row["memory"])
+                      + sum(s["pending"] for s in row["skills"]) + sum(s["pending"] for s in staged))
+    return row
+
+
+def _library_text(entry: dict[str, Any], raw: Optional[bytes]) -> str:
+    if raw is None:
+        return ""
+    if len(raw) > LIBRARY_READ_MAX:
+        raise HTTPException(status_code=413, detail=f"{entry['name']} is larger than 1 MB, so Library does not open it.")
+    try:
+        if b"\0" in raw:
+            raise UnicodeDecodeError("utf-8", raw, 0, 1, "NUL byte")
+        return raw.decode("utf-8")  # strict, and a BOM stays in the text so a save writes it back
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=415, detail=f"{entry['name']} is not UTF-8 text, so Library cannot open it.")
+
+
+def _library_version(raw: Optional[bytes], st: Optional[os.stat_result]) -> str:
+    if raw is None:
+        return _ABSENT
+    return f"{hashlib.sha256(raw).hexdigest()}:{st.st_mtime_ns}"
+
+
+def _version_matches(token: str, raw: Optional[bytes]) -> bool:
+    """Only the content hash decides; a touch that changes nothing else is not a conflict."""
+    if raw is None:
+        return token == _ABSENT
+    return token.partition(":")[0] == hashlib.sha256(raw).hexdigest()
+
+
+def _library_limit(entry: dict[str, Any]) -> dict[str, Any]:
+    if entry["kind"] == "memory":
+        from tools.memory_tool import load_on_disk_store
+        return {"label": entry["name"], "max": load_on_disk_store()._char_limit(entry["target"])}
+    if entry["kind"] == "skill":
+        from tools.skill_manager_tool import MAX_SKILL_CONTENT_CHARS
+        return {"label": entry["name"], "max": MAX_SKILL_CONTENT_CHARS}
+    return {"label": entry["name"], "max": IDENTITY_MAX_CHARS}
+
+
+def _memory_save_refusal(entry: dict[str, Any], text: str, current: str) -> Optional[str]:
+    """The memory store's own rules for this text: its char limit and its threat scan. Like the
+    store, a write that only deletes entries may stay over the limit, and only entries that are new
+    or changed are scanned, so a file that already holds a blocked entry can still be cleaned up."""
+    from tools.hosted_tool_policy import host_feature_enabled
+    from tools.memory_tool import _memory_target_error, load_on_disk_store
+    from tools.memory_tool_store import ENTRY_DELIMITER, MemoryStore, _over_limit, _scan_memory_content
+    if not host_feature_enabled("builtin_memory"):
+        return "Memory is not available to a hosted agent."
+    target = entry["target"]
+    store = load_on_disk_store()
+    if disabled := _memory_target_error(store, target):  # memory.memory_enabled / user_profile_enabled
+        return str(disabled.get("error") or "Memory writes are disabled in memory config.")
+    limit = store._char_limit(target)
+    before = set(MemoryStore._parse_entries(current))
+    after = list(dict.fromkeys(MemoryStore._parse_entries(text)))
+    total = len(ENTRY_DELIMITER.join(after))
+    if total > limit and not set(after) <= before:
+        setting = "memory.user_char_limit" if target == "user" else "memory.memory_char_limit"
+        return f"{entry['name']}: this text {_over_limit(total, limit)} (the limit is {setting})."
+    return next((error for e in after if e not in before and (error := _scan_memory_content(e))), None)
+
+
+def _skill_save_refusal(entry: dict[str, Any], text: str, current: str) -> Optional[str]:
+    """Hermes's checks for a skill write: the size limit, for SKILL.md the frontmatter and the
+    description budget, then Skills Guard on a copy (as an edit of a proposed change runs it)."""
+    from tools import skill_manager_tool as smt
+    rel = entry["name"]
+    if error := smt._validate_content_size(text, label=rel):
+        return error
+    if rel == "SKILL.md" and (error := smt._validate_frontmatter(text) or smt._description_budget_error(text, before=current)):
+        return error
+    return _scan_skill_copy(rel, current, text, background=False)
+
+
+def _library_refusal(entry: dict[str, Any], text: str, current: str) -> Optional[str]:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return "The text is not valid UTF-8, so it was not saved."
+    if entry["kind"] == "memory":
+        return _memory_save_refusal(entry, text, current)
+    if entry["kind"] == "skill":
+        return _skill_save_refusal(entry, text, current)
+    if len(text) > IDENTITY_MAX_CHARS:
+        return f"{entry['name']} can be at most {IDENTITY_MAX_CHARS:,} characters. This text has {len(text):,}."
+    return None
+
+
+@contextmanager
+def _library_lock(entry: dict[str, Any]) -> Iterator[None]:
+    """One lock per profile for Library saves (three Hermes processes mount this plugin), then
+    Hermes's own lock for the file: the memory store's file lock, or the per-skill mutation lock."""
+    from hermes_constants import get_hermes_home
+    from tools.skill_usage import skill_file_lock
+    with skill_file_lock(Path(get_hermes_home()) / "pending" / ".skill-review-library.lock"):
+        if entry["kind"] == "memory":
+            from tools.memory_tool_store import MemoryStore
+            with MemoryStore._file_lock(entry["path"]):
+                yield
+        elif entry["kind"] == "skill":
+            from tools import skill_manager_tool as smt
+            with smt._skill_mutation_lock(entry["skill"]):
+                yield
+        else:
+            yield
+
+
+def _library_body(raw: Any) -> tuple[str, str]:
+    """``(text, version)`` from ``{"text": str, "version": str}``; nothing else is accepted (no paths)."""
+    if (not isinstance(raw, dict) or set(raw) != {"text", "version"} or not isinstance(raw["text"], str)
+            or not isinstance(raw["version"], str)):
+        raise HTTPException(status_code=400, detail='body must be {"text": string, "version": string}')
+    return raw["text"], raw["version"]
+
+
+@router.get("/library")
+def list_library() -> dict[str, Any]:
+    _require_library()
+    profiles = []
+    for name in _known_profiles():
+        try:
+            profiles.append(_library_profile(name))
+        except Exception as exc:  # one broken profile must not hide the others
+            profiles.append({"profile": name, "pending": 0, "error": str(exc), "identity": [], "memory": [],
+                             "skills": [], "staged": []})
+    return {"profiles": profiles, "total": sum(p["pending"] for p in profiles)}
+
+
+def _write_at(folder: int, name: str, data: bytes, mode: int, owner: Optional[tuple[int, int]] = None) -> None:
+    """Temp file in ``folder``, written and fsynced, then renamed over ``name``; both relative to the
+    folder fd. ``owner`` (uid, gid) is set on the temp file before the rename, so the file never
+    shows with another owner; a refusal (not root, not the owner) keeps the writer's ids. On any
+    failure the temp file is removed and ``name`` is untouched."""
+    tmp = f".skill-review-{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=folder)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fchmod(fd, mode)
+            if owner is not None and hasattr(os, "fchown"):
+                with suppress(PermissionError):  # EPERM / EACCES
+                    os.fchown(fd, *owner)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, name, src_dir_fd=folder, dst_dir_fd=folder)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp, dir_fd=folder)
+        raise
+    with suppress(OSError):  # the rename is done; this only makes it durable sooner
+        os.fsync(folder)
+
+
+def _library_write(entry: dict[str, Any], folder_id: tuple[int, int], before: Optional[os.stat_result],
+                   text: str) -> bytes:
+    """After the checks: open the folder again through the same O_NOFOLLOW walk and write only if it
+    is the folder the save checked and the file is the inode it read (or still absent). Returns the
+    bytes written."""
+    changed = HTTPException(status_code=409, detail=f"{entry['name']} or its folder changed on disk while saving. "
+                                                    f"Nothing was written. Reload it.")
+    try:
+        folder = _open_folder(entry)
+    except OSError:
+        raise changed
+    try:
+        if _identity(os.fstat(folder)) != folder_id:
+            raise changed
+        name = entry["parts"][-1]
+        try:
+            now = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        except FileNotFoundError:
+            now = None
+        if (now is None) != (before is None) or (now is not None and (
+                not stat.S_ISREG(now.st_mode) or now.st_nlink > 1 or _identity(now) != _identity(before))):
+            raise changed
+        mode = stat.S_IMODE(before.st_mode) if before is not None else (0o600 if entry["kind"] == "memory" else 0o644)
+        data = text.encode("utf-8")
+        try:
+            _write_at(folder, name, data, mode, None if before is None else (before.st_uid, before.st_gid))
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not write {entry['name']}: "
+                                                        f"{exc.strerror or exc}. The file on disk is unchanged.")
+    finally:
+        os.close(folder)
+    return data
+
+
+@contextmanager
+def _ledger_record(entry: dict[str, Any]) -> Iterator[None]:
+    """Hermes's skill audit ledger around a skill file save, as skill_manage records its writes:
+    the skill folder before, then the change, with actor "user". Best effort, like Hermes: a ledger
+    failure never blocks or undoes the save. Identity and memory files have no ledger."""
+    if entry["kind"] != "skill":
+        yield
+        return
+    from tools import skill_ledger
+    before = None
+    with suppress(Exception):
+        before = skill_ledger.capture_before(entry["skill_dir"], skill=entry["skill"])
+    yield
+    evidence = {"source": "skill-review library"}
+    if entry["name"] != "SKILL.md":
+        evidence["file_path"] = entry["name"]
+    with suppress(Exception):
+        skill_ledger.record_mutation("edit" if entry["name"] == "SKILL.md" else "write_file", entry["skill"],
+                                     before=before if before is not None else [], after_root=entry["skill_dir"],
+                                     actor="user", evidence=evidence)
+
+
+@router.get("/library/{owner}/{key}")
+def read_library_file(owner: str, key: str) -> dict[str, Any]:
+    _require_library()
+    _check_key(key)
+    home = _resolve_profile(owner)
+    with _profile_scope(home):
+        entry = _library_entry(owner, key)
+        raw, st = _read_library_bytes(entry)
+        text = _library_text(entry, raw)
+        return {"status": "ok", "file": _library_public(entry), "text": text,
+                "version": _library_version(raw, st), "limit": _library_limit(entry)}
+
+
+@router.put("/library/{owner}/{key}")
+def save_library_file(owner: str, key: str, raw: Any = Body(...)) -> dict[str, Any]:
+    _require_library()
+    text, version = _library_body(raw)
+    _check_key(key)
+    if len(text) > LIBRARY_READ_MAX:
+        raise HTTPException(status_code=413, detail="Library saves at most 1 MB of text.")
+    home = _resolve_profile(owner)
+    with _profile_scope(home):
+        entry = _library_entry(owner, key)
+        with _library_lock(entry):
+            entry = _library_entry(owner, key)  # again under the locks
+            try:
+                folder = _open_folder(entry)
+            except OSError:
+                raise HTTPException(status_code=404, detail=_NOT_LISTED)
+            try:
+                folder_id = _identity(os.fstat(folder))
+                current, before = _read_at(entry, folder)
+            finally:
+                os.close(folder)
+            if not _version_matches(version, current):
+                raise HTTPException(status_code=409, detail=f"{entry['name']} changed on disk since you opened it. "
+                                                            f"Reload it to see the new text.")
+            if refusal := _library_refusal(entry, text, _library_text(entry, current)):
+                raise HTTPException(status_code=422, detail=refusal)
+            with _ledger_record(entry):
+                written = _library_write(entry, folder_id, before, text)
+            if subsystem := _LIBRARY_KINDS[entry["kind"]]:
+                _forget_cached(subsystem)  # as accept and edit do: pending blocks are evaluated again
+            try:
+                saved, st = _read_library_bytes(entry)
+                version = _library_version(saved, st)
+            except HTTPException:  # written, but not readable back: the hash still matches what is on disk
+                version = f"{hashlib.sha256(written).hexdigest()}:0"
+            return {"status": "saved", "file": _library_public(entry), "version": version}

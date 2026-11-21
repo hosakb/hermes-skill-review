@@ -1,15 +1,18 @@
 name: skill-review
 label: Skill Review
 kind: standalone
-version: 0.1.2
+version: 0.2.0
 description: >
   Desktop review tab for staged skill and memory writes (skills.write_approval
   and memory.write_approval). Shows each pending change as a visual diff block
   per file, across the default profile and every named profile, and lets you
   accept or reject each block, or all blocks of a file. Reads and rewrites
   pending records under <HERMES_HOME>/pending/skills and /pending/memory;
-  Accept applies the change through Hermes's own approval code. No network
-  calls, no telemetry, no credentials, no tools or hooks.
+  Accept applies the change through Hermes's own approval code. Library mode
+  lists each profile's SOUL.md, PROJECT.md, AGENTS.md, MEMORY.md, USER.md and
+  skill files and, on Save, writes the edited file directly, after Hermes's
+  own size, frontmatter and content checks; Library needs Linux or macOS.
+  No network calls, no telemetry, no credentials, no tools or hooks.
 author: hosakb
 license: MIT
 homepage: https://github.com/hosakb/hermes-skill-review
