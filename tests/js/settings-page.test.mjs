@@ -102,7 +102,7 @@ test('openReview registers only the list pane: placement right, hideOnly', () =>
   assert.deepEqual(panesOf(ctx).map(p => p.id), ['list'])
   assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, 'register:list', `reveal:${LIST_PANE}`])
   const list = reviewPaneContribution()
-  assert.deepEqual(list.data, { placement: 'right', hideOnly: true, dock: { pane: 'workspace', pos: 'right' }, defaultCollapsed: true, width: '720px', minWidth: '240px' })
+  assert.deepEqual(list.data, { placement: 'right', hideOnly: true, dock: { pane: 'files', pos: 'center', enforce: true }, width: '720px', minWidth: '240px' })
   assert.equal(list.render().type, ReviewPane)
   assert.ok(!/SETTINGS_PANE|settingsPaneContribution|id: 'settings', \/\/ skill-review:settings/.test(src), 'no settings pane any more')
   dispose(ctx)

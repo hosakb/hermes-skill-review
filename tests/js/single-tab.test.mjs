@@ -76,7 +76,7 @@ test('Review registers one review tab, titled Pending writes, under the old list
   assert.equal(pane.title, messages.en.paneTitle)
   assert.equal(pane.data.placement, 'right')
   assert.equal(pane.data.hideOnly, true)
-  assert.deepEqual(pane.data.dock, { pane: 'workspace', pos: 'right' })
+  assert.deepEqual(pane.data.dock, { pane: 'files', pos: 'center', enforce: true })
   assert.equal(pane.data.width, '720px', 'wide enough for both columns by default')
   assert.ok(parseInt(pane.data.width, 10) >= REVIEW_NARROW_PX, 'the default width opens side by side')
   assert.equal(pane.render().type, ReviewPane)

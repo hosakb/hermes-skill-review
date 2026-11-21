@@ -2,7 +2,7 @@
  * Skill Review: Hermes Desktop half.
  *
  * Shows every skill and memory write that Hermes staged under skills.write_approval and
- * memory.write_approval. One pane on the workspace's right edge holds a list of every pending write
+ * memory.write_approval. One pane, a tab in the Files zone, holds a list of every pending write
  * and, beside it, the diff of the selected one with Accept and Reject. The pane opens only from the
  * status-bar Review chip, the palette or a toast, or by itself when a new change arrives and autoOpen
  * is on. Otherwise a new change shows as a toast or a lit chip. Nothing takes over the main view.
@@ -2777,10 +2777,9 @@ const EXPAND_EN = {
  * registers its Routines pane. Until then a saved layout entry for it stays hidden and its zone
  * collapses, because Desktop draws no unregistered pane.
  *
- * defaultCollapsed makes it arrive as the right edge's slim vertical tab when it first enters the
- * layout. Desktop applies it only on that first entry: a layout that already holds the pane keeps
- * its saved state. openReview reveals it right after registering, and revealPane expands a
- * collapsed zone, so in practice it opens straight away.
+ * Desktop adopts it as a background tab: the Files tab keeps the active slot until openReview
+ * reveals it, which happens right after registering. defaultCollapsed is not set. In a shared zone
+ * it does nothing for a background tab, and on an active one it would fold the Files tab too.
  *
  * Desktop cannot dismiss a pane for a plugin at startup. This is the plugin's only pane, and
  * Desktop turns a plugin off when its only pane is closed (closeTreePane in the tree store). So the
@@ -2795,13 +2794,16 @@ export function reviewPaneContribution() {
     id: 'list', // skill-review:list, the same id as before, so saved layouts still match it
     area: 'panes',
     title: en.listTitle,
-    // Its own tiling column on the workspace's right edge (the dock), with the right side's role:
-    // the right-sidebar toggle (cmd-J) can fold it with the other right columns.
+    // A tab in the Files zone, re-homed there on every boot (enforce), like Bot Mode's Bots tab in
+    // the sessions zone. That zone shows a tab strip, so the chevron and zone menu are there, and
+    // cmd-J folds it with the right side. A column of its own got neither: a lone side pane has no
+    // strip on auto, and cmd-J folds only the outermost right column. Without a Files pane Desktop
+    // stacks it with another 'right' pane, else in the chat zone. width and minWidth still apply:
+    // the zone takes the largest width of its shown tabs, so it is 720px while this tab is shown.
     data: {
       placement: 'right',
       hideOnly: true,
-      dock: { pane: 'workspace', pos: 'right' },
-      defaultCollapsed: true,
+      dock: { pane: 'files', pos: 'center', enforce: true },
       width: '720px',
       minWidth: '240px'
     },
