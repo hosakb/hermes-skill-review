@@ -77,7 +77,7 @@ test('default export has the contract fields', () => {
   assert.equal(typeof plugin.register, 'function')
 })
 
-test('register adds no pane at startup; Review registers one pane on the workspace right edge, no route', () => {
+test('register adds no pane at startup; Review registers one pane in the Files zone, no route', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
@@ -87,7 +87,7 @@ test('register adds no pane at startup; Review registers one pane on the workspa
   assert.deepEqual(panes.map(p => p.id), ['list'])
   assert.equal(LIST_PANE, 'skill-review:list')
   const [pane] = panes
-  assert.deepEqual(pane.data.dock, { pane: 'workspace', pos: 'right' }, 'the pane splits the workspace right edge')
+  assert.deepEqual(pane.data.dock, { pane: 'files', pos: 'center', enforce: true }, 'the pane stacks as a tab in the Files zone')
   assert.equal(pane.data.placement, 'right')
   assert.equal(pane.data.hideOnly, true)
   assert.equal(pane.data.width, '720px', 'wide enough for the list and the diff side by side')

@@ -105,17 +105,17 @@ test('startup registers no pane, so nothing appears on its own; the Review chip 
   dispose(ctx)
 })
 
-test('the review pane contribution: id list, collapsed on first arrival, docked right, 720px, no companion', () => {
+test('the review pane contribution: id list, a tab in the Files zone, 720px, no companion', () => {
   const pane = reviewPaneContribution()
   assert.equal(pane.id, 'list')
   assert.equal(LIST_PANE, 'skill-review:list')
   assert.equal(pane.area, 'panes')
   assert.equal(pane.title, messages.en.listTitle)
-  assert.equal(pane.data.defaultCollapsed, true)
+  assert.equal(pane.data.defaultCollapsed, undefined, 'a silent tab in a shared zone never collapses, so the flag would do nothing')
   assert.equal(pane.data.placement, 'right')
   assert.equal(pane.data.hideOnly, true)
   assert.notEqual(pane.data.placement, 'floating')
-  assert.deepEqual(pane.data.dock, { pane: 'workspace', pos: 'right' })
+  assert.deepEqual(pane.data.dock, { pane: 'files', pos: 'center', enforce: true })
   assert.equal(pane.data.width, '720px')
   assert.equal(pane.render().type, ReviewPane)
   const ctx = start()
