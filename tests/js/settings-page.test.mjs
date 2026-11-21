@@ -1,5 +1,5 @@
 // Tests for the review settings on Settings > Plugins > Skill Review (ctx.registerSettingsPage):
-// profile subset, sort order, notify mode, autoOpen and the VS Code link. The list header keeps a
+// profile subset, sort order, notify mode and autoOpen. The list header keeps a
 // summary and a gear that opens that page. The plugin registers one pane again.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -27,8 +27,7 @@ register(pathToFileURL(here + 'stub-loader.mjs'))
 const sdk = await import('@hermes/plugin-sdk')
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  $autoOpen, $editorTemplate, $hidden, $inlineSettings, $notifyMode, $sort, AutoOpenRow, AutoOpenToggle, DEFAULT_EDITOR_TEMPLATE,
-  EDITOR_PRESETS, EditorLinkControl, LIST_PANE, NotifyModeControl, NotifyModeSegments, ProfileControl, ReviewPane, SettingsGearButton,
+  $autoOpen, $hidden, $inlineSettings, $notifyMode, $sort, AutoOpenRow, AutoOpenToggle, LIST_PANE, NotifyModeControl, NotifyModeSegments, ProfileControl, ReviewPane, SettingsGearButton,
   SettingsPage, SettingsPageView, SettingsSummary, SortControl, messages, openReview, openSettings, reviewPaneContribution,
   setAutoOpen, settingsPageContribution
 } = mod
@@ -157,7 +156,7 @@ const header = () => {
 
 test('the list header has the summary and the gear, no settings controls, and keeps the kind filter', () => {
   const bar = header()
-  for (const name of ['ProfileControl', 'SortControl', 'NotifyModeControl', 'AutoOpenRow', 'EditorLinkControl']) {
+  for (const name of ['ProfileControl', 'SortControl', 'NotifyModeControl', 'AutoOpenRow']) {
     assert.doesNotMatch(bar, new RegExp(`jsx\\(${name}\\b`), `${name} lives on the settings page`)
   }
   assert.match(bar, /jsx\(SettingsGearButton, \{ onOpen: openSettings, t \}\)/)
@@ -185,8 +184,9 @@ test('the settings page is built from ListRow and ToggleRow and holds every cont
   const profiles = [{ profile: 'default', count: 2 }]
   const view = SettingsPageView({ focused: 'default', profiles, t })
   const rows = ofType(view, sdk.ListRow)
-  assert.deepEqual(rows.map(r => r.props.title), ['scopeGroup', 'sortLabel', 'notifyLabel', 'editorSettings'])
-  for (const type of [ProfileControl, SortControl, NotifyModeControl, AutoOpenRow, EditorLinkControl]) {
+  assert.deepEqual(rows.map(r => r.props.title), ['scopeGroup', 'sortLabel', 'notifyLabel'])
+  assert.equal(kids(view).length, 4, 'profiles, sort, notify mode and auto-open, nothing else')
+  for (const type of [ProfileControl, SortControl, NotifyModeControl, AutoOpenRow]) {
     assert.equal(ofType(view, type).length, 1, `${type.name} is on the page`)
   }
   assert.equal(ofType(view, ProfileControl)[0].props.profiles, profiles)
@@ -222,16 +222,6 @@ test('the notify control on the page is the bare segmented control', () => {
   assert.equal($notifyMode.get(), 'light')
   assert.equal(ctx.store.notifyMode, 'light')
   seg.props.onChange('popup')
-  dispose(ctx)
-})
-
-test('the VS Code link control writes the shared template', () => {
-  const ctx = start()
-  const editor = EditorLinkControl()
-  editor.props.onMode('local')
-  assert.equal($editorTemplate.get(), EDITOR_PRESETS.local)
-  editor.props.onMode('remote')
-  assert.equal($editorTemplate.get(), DEFAULT_EDITOR_TEMPLATE)
   dispose(ctx)
 })
 

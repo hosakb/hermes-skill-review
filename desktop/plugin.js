@@ -28,7 +28,6 @@ import {
   ErrorState,
   haptic,
   host,
-  Input,
   PALETTE_AREA,
   Popover,
   PopoverContent,
@@ -1436,7 +1435,7 @@ export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, r
   })
 }
 
-export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t, extra = null }) {
+export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t }) {
   const c = file.counts ?? {}
 
   const row = jsxs('header', {
@@ -1446,7 +1445,6 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
       jsxs('div', {
         style: STYLES.actions,
         children: [
-          extra,
           jsx(Button, { disabled: busy || !acceptable, onClick: onAcceptAll, size: 'sm', style: STYLES.button, type: 'button', children: t('acceptAll') }),
           jsx(Button, { disabled: busy, onClick: onRejectAll, size: 'sm', style: STYLES.button, type: 'button', variant: 'outline', children: t('rejectAll') })
         ]
@@ -1468,7 +1466,7 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
 }
 
 /** The whole detail pane for one file, as a pure view: data and callbacks in, tree out. */
-export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, expansion, onExpand, removal, t, edit = null, openButton = null }) {
+export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, expansion, onExpand, removal, t, edit = null }) {
   // A response for another file (a late answer after the user moved on) counts as not loaded yet.
   const own = data && diffMatches(data, file) ? data : undefined
   const shownFile = own?.status === 'ok' ? own.file : file
@@ -1499,7 +1497,6 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
       jsx(FileHeader, {
         acceptable: blockList.filter(canAcceptBlock).length,
         busy,
-        extra: openButton,
         file: shownFile,
         onAcceptAll: () => onAction({ verb: 'accept-all' }),
         onRejectAll: onAskRejectAll,
@@ -2172,7 +2169,6 @@ function FileDetail({ file }) {
     onCloseConfirm: () => $confirming.set(null),
     expansion,
     onExpand: (shown, gapId, dir) => setExpansion(prev => expandGap(prev, shown, gapId, dir)),
-    openButton: jsx(OpenInEditorControl, { file }),
     prior,
     removal,
     t
@@ -2336,19 +2332,16 @@ const FILE_EN = {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Edit a proposed change in place, and open the live file in VS Code. Routes beside contract v1:
+// Edit a proposed change in place. Routes beside contract v1:
 //   GET  /files/{profile}/{subsystem}/{key}/edits              editable blocks, their text and limit
 //   POST /files/{profile}/{subsystem}/{key}/blocks/{id}/edit   { text, apply }
-//   GET  /files/{profile}/{subsystem}/{key}/location           { path, exists, host, user }
 // The editor replaces a block's added lines; its removed lines stay above it as the reference.
 // ---------------------------------------------------------------------------------------------
 
 export const editsPath = file => `${fileBase(file)}/edits`
 export const editPath = (file, blockId) => `${fileBase(file)}/blocks/${encodeURIComponent(blockId)}/edit`
-export const locationPath = file => `${fileBase(file)}/location`
-// Under diffKey, so every refetch of the file after an action also refetches these.
+// Under diffKey, so every refetch of the file after an action also refetches it.
 const editsKey = file => [...diffKey(file), 'edits', diffVersion(file)]
-const locationKey = file => [...diffKey(file), 'location', diffVersion(file)]
 
 /** The one block being edited: { file, blockId, info, text, error, saving }. Kept outside the pane,
  *  so a refetch or a remount of the detail pane keeps what the user typed. */
@@ -2492,10 +2485,7 @@ export const EDIT_STYLES = {
     overflowWrap: 'anywhere',
     overflowY: 'auto',
     whiteSpace: 'pre-wrap'
-  },
-  tipWrap: { display: 'inline-flex', maxWidth: '100%', minWidth: 0 },
-  field: { fontFamily: mono, fontSize: '0.7rem', minWidth: 0, width: '100%' },
-  help: { color: 'var(--ui-text-tertiary)', fontSize: '0.7rem', minWidth: 0, overflowWrap: 'anywhere' }
+  }
 }
 
 const EDITOR_MIN_ROWS = 3
@@ -2585,258 +2575,6 @@ function useBlockEdit(file, queryClient, t) {
   }
 }
 
-// --- Open in VS Code -----------------------------------------------------------------------------
-
-export const EDITOR_PRESETS = {
-  remote: 'vscode://vscode-remote/ssh-remote+{host}{path}', // Desktop on another machine, over SSH
-  local: 'vscode://file{path}' // Desktop on the machine Hermes runs on
-}
-export const DEFAULT_EDITOR_TEMPLATE = EDITOR_PRESETS.remote
-export const $editorTemplate = atom(DEFAULT_EDITOR_TEMPLATE)
-const EDITOR_STORAGE_KEY = 'editorUrlTemplate'
-const SCRIPT_SCHEMES = /^(javascript|data|vbscript|blob):/i
-
-/** Each path segment percent-encoded (spaces, unicode, '#', '?', '%'); the slashes stay. */
-export const encodePath = path => String(path).split('/').map(encodeURIComponent).join('/')
-
-/** The message key for what is wrong with a link template, or null when it can be used. */
-export function templateProblem(template) {
-  const value = typeof template === 'string' ? template.trim() : ''
-
-  if (!value) {
-    return 'editorTemplateEmpty'
-  }
-
-  if (!value.includes('{path}')) {
-    return 'editorTemplateNoPath'
-  }
-
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(value)) {
-    return 'editorTemplateNoScheme'
-  }
-
-  return SCRIPT_SCHEMES.test(value) ? 'editorTemplateScheme' : null
-}
-
-/** The link for a location: {host}, {path} and {user} filled in, each encoded. */
-export function buildEditorUrl(template, location) {
-  const problem = templateProblem(template)
-
-  if (problem) {
-    throw new Error(problem)
-  }
-
-  const path = location?.path
-
-  if (typeof path !== 'string' || !path.startsWith('/')) {
-    throw new Error('editorNoPath')
-  }
-
-  const values = { host: encodeURIComponent(location.host || ''), path: encodePath(path), user: encodeURIComponent(location.user || '') }
-
-  return template.trim().replace(/\{(host|path|user)\}/g, (_, name) => values[name])
-}
-
-export const presetOf = template => Object.keys(EDITOR_PRESETS).find(id => EDITOR_PRESETS[id] === template) ?? 'custom'
-
-export function loadEditorSettings(ctx) {
-  const stored = readStored(ctx, EDITOR_STORAGE_KEY, DEFAULT_EDITOR_TEMPLATE)
-
-  $editorTemplate.set(templateProblem(stored) ? DEFAULT_EDITOR_TEMPLATE : stored.trim())
-}
-
-/** Use and store a template; an unusable one is refused and the previous one stays. */
-export function setEditorTemplate(template) {
-  if (templateProblem(template)) {
-    return false
-  }
-
-  $editorTemplate.set(template.trim())
-  writeStored(EDITOR_STORAGE_KEY, template.trim())
-
-  return true
-}
-
-async function copyLink(url, os, notify, message) {
-  let copied = false
-
-  if (typeof os?.writeClipboard === 'function') {
-    try {
-      copied = (await os.writeClipboard(url)) === true
-    } catch {
-      copied = false
-    }
-  }
-
-  notify(copied ? { detail: url, kind: 'info', message: message.copied } : { detail: url, kind: 'error', message: message.failed })
-
-  return copied ? 'copied' : 'failed'
-}
-
-/**
- * Hand the link to the OS. When Desktop cannot open it (no openExternal, or it answers false, as
- * Desktop does for any scheme besides http, https, mailto and file), the link is copied instead and
- * a toast says so. Returns 'opened' | 'copied' | 'failed' | 'bad-template'.
- */
-export async function openInEditor({ location, template, os, notify, t }) {
-  let url
-
-  try {
-    url = buildEditorUrl(template, location)
-  } catch (error) {
-    notify({ detail: t(error.message), kind: 'error', message: t('editorBadTemplate') })
-
-    return 'bad-template'
-  }
-
-  if (typeof os?.openExternal !== 'function') {
-    return copyLink(url, os, notify, { copied: t('editorNoOpenCopied'), failed: t('editorOpenFailed') })
-  }
-
-  let opened = false
-
-  try {
-    opened = (await os.openExternal(url)) === true
-  } catch {
-    opened = false
-  }
-
-  return opened ? 'opened' : copyLink(url, os, notify, { copied: t('editorRefusedCopied'), failed: t('editorOpenFailed') })
-}
-
-/** { disabled, state, tip, text? } for the button, from the /location answer. */
-export function editorButtonState(location, loading, error) {
-  if (loading) {
-    return { disabled: true, state: 'loading', tip: 'editorFinding' }
-  }
-
-  if (error || !location) {
-    return { disabled: true, state: 'error', tip: 'editorUnknown' }
-  }
-
-  if (location.status === 'refused') {
-    return { disabled: true, state: 'refused', text: location.error, tip: 'editorRefused' }
-  }
-
-  if (location.status !== 'ok') {
-    return { disabled: true, state: 'gone', tip: 'fileGone' }
-  }
-
-  if (!location.exists || !location.path) {
-    return { disabled: true, state: 'missing', tip: 'editorMissing' }
-  }
-
-  return { disabled: false, state: 'ready', tip: 'editorTip' }
-}
-
-/** One per file, in the file header. A disabled button sits in a focusable span so its tooltip
- *  still explains why. */
-export function OpenInEditorButton({ file, location, loading, error, onOpen, t }) {
-  const s = editorButtonState(location, loading, error)
-  const tip = s.text || t(s.tip, file.file)
-
-  const button = jsxs(Button, {
-    'aria-label': `${t('openInEditor')}. ${tip}`,
-    'data-editor-state': s.state,
-    disabled: s.disabled,
-    onClick: onOpen,
-    size: 'sm',
-    style: STYLES.button,
-    type: 'button',
-    variant: 'outline',
-    children: [jsx(Codicon, { name: 'link-external' }), jsx('span', { style: STYLES.ellipsis, children: t('openInEditor') })]
-  })
-
-  return jsx(Tip, { label: tip, children: s.disabled ? jsx('span', { style: EDIT_STYLES.tipWrap, tabIndex: 0, children: button }) : button })
-}
-
-function OpenInEditorControl({ file }) {
-  const t = usePluginI18n(ID)
-  const template = useValue($editorTemplate)
-  const location = useQuery({
-    queryFn: () => CTX.rest(locationPath(file)),
-    queryKey: locationKey(file),
-    refetchOnWindowFocus: false,
-    retry: false,
-    staleTime: Infinity
-  })
-
-  return jsx(OpenInEditorButton, {
-    error: location.isError,
-    file,
-    loading: location.isLoading,
-    location: location.data,
-    onOpen: () => openInEditor({ location: location.data, notify: toast => host.notify(toast), os: CTX?.os, t, template }),
-    t
-  })
-}
-
-/** The link settings as a pure view: the two presets, Custom, and a text field for Custom. */
-export function EditorLinkSettings({ mode, draft, onMode, onDraft, t }) {
-  const problem = mode === 'custom' ? templateProblem(draft) : null
-
-  return jsxs('div', {
-    'aria-label': t('editorSettings'),
-    role: 'group',
-    style: SETTINGS_STYLES.section,
-    children: [
-      jsxs(Select, {
-        onValueChange: onMode,
-        value: mode,
-        children: [
-          jsx(SelectTrigger, {
-            'aria-label': t('editorSettings'),
-            size: 'xs',
-            style: LIST_STYLES.trigger,
-            children: jsx(SelectValue, { children: jsx('span', { style: STYLES.ellipsis, children: t(`editorPreset_${mode}`) }) })
-          }),
-          jsx(SelectContent, {
-            children: ['remote', 'local', 'custom'].map(id => jsx(SelectItem, { value: id, children: t(`editorPreset_${id}`) }, id))
-          })
-        ]
-      }),
-      jsx('span', { style: EDIT_STYLES.help, children: t(`editorPresetHelp_${mode}`) }),
-      mode === 'custom'
-        ? jsx(Input, {
-            'aria-invalid': Boolean(problem),
-            'aria-label': t('editorCustomLabel'),
-            onChange: event => onDraft(event.target.value),
-            placeholder: DEFAULT_EDITOR_TEMPLATE,
-            spellCheck: false,
-            style: EDIT_STYLES.field,
-            value: draft
-          })
-        : null,
-      mode === 'custom' ? jsx('span', { style: problem ? { ...EDIT_STYLES.help, ...EDIT_STYLES.over } : EDIT_STYLES.help, children: t(problem || 'editorPlaceholders') }) : null
-    ]
-  })
-}
-
-export function EditorLinkControl() {
-  const t = usePluginI18n(ID)
-  const template = useValue($editorTemplate)
-  const [mode, setMode] = useState(presetOf(template))
-  const [draft, setDraft] = useState(template)
-
-  return jsx(EditorLinkSettings, {
-    draft,
-    mode,
-    onDraft: value => {
-      setDraft(value)
-      setEditorTemplate(value) // saved only once it is usable; the field shows why until then
-    },
-    onMode: next => {
-      setMode(next)
-
-      if (next !== 'custom') {
-        setDraft(EDITOR_PRESETS[next])
-        setEditorTemplate(EDITOR_PRESETS[next])
-      }
-    },
-    t
-  })
-}
-
 const EDIT_EN = {
   edit: 'Edit',
   editApplied: name => `Accepted your edited change to ${name}`,
@@ -2852,30 +2590,6 @@ const EDIT_EN = {
   editScope_span: 'The new text for the part this change replaces',
   editTotal: (label, total, max) => `${label} after this change: ${total} of ${max} characters`,
   editTotalOver: (label, total, max, over) => `${label} after this change: ${total} of ${max} characters, ${over} over the limit`,
-  editorBadTemplate: 'The VS Code link setting cannot be used',
-  editorCustomLabel: 'Custom link',
-  editorFinding: 'Finding the file',
-  editorMissing: name => `${name} does not exist yet. Accept the change to create it, then open it.`,
-  editorNoOpenCopied: 'This Desktop cannot open links, so the VS Code link was copied. Paste it into a browser address bar.',
-  editorNoPath: 'The file has no absolute path.',
-  editorOpenFailed: 'Could not open or copy the VS Code link',
-  editorPlaceholders: 'Use {host}, {path} and {user}. {path} is required.',
-  editorPresetHelp_custom: 'Any editor link. Hermes fills in the placeholders and encodes the path.',
-  editorPresetHelp_local: 'For a Desktop on the same computer as Hermes.',
-  editorPresetHelp_remote: 'For a Desktop on another computer that reaches the Hermes host over SSH. Needs the Remote SSH extension in VS Code.',
-  editorPreset_custom: 'Custom link',
-  editorPreset_local: 'VS Code on this computer',
-  editorPreset_remote: 'VS Code over SSH',
-  editorRefused: 'This file is outside the profile folder, so it is not opened.',
-  editorRefusedCopied: 'Desktop did not open the VS Code link, so it was copied. Paste it into a browser address bar.',
-  editorSettings: 'How Open in VS Code links',
-  editorTemplateEmpty: 'Enter a link.',
-  editorTemplateNoPath: 'The link needs {path}.',
-  editorTemplateNoScheme: 'The link needs a scheme, such as vscode://.',
-  editorTemplateScheme: 'Script and data links are not allowed.',
-  editorTip: name => `Opens the current ${name} in VS Code. The proposed changes are not in it until you accept them.`,
-  editorUnknown: 'Could not find where this file is.',
-  openInEditor: 'Open in VS Code'
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3445,8 +3159,7 @@ export function SettingsPageView({ profiles, focused, t }) {
       }),
       jsx(Row, { action: jsx(SortControl, {}), description: t('settingsSortHelp'), title: t('sortLabel') }),
       jsx(Row, { action: jsx(NotifyModeControl, { bare: true }), description: t('settingsNotifyHelp'), title: t('notifyLabel') }),
-      jsx(AutoOpenRow, {}),
-      jsx(Row, { below: jsx(EditorLinkControl, {}), description: t('settingsEditorHelp'), title: t('editorSettings') })
+      jsx(AutoOpenRow, {})
     ]
   })
 }
@@ -3469,7 +3182,6 @@ export const $inlineSettings = atom(false)
 const SETTINGS_EN = {
   autoOpenHelp: 'Off: a new change shows a popup or lights up the Review chip, as chosen above.',
   openSettings: 'Skill Review settings',
-  settingsEditorHelp: 'The link that Open in VS Code in each file header uses.',
   settingsNoProfiles: 'Profiles show up here once they have pending changes.',
   settingsNotifyHelp: 'Popup shows a notification. Light up icon marks the Review chip instead.',
   settingsProfilesHelp: 'Which profiles the review list shows. The Review chip counts every profile.',
@@ -3655,7 +3367,6 @@ export default {
 
     loadNotifySettings(ctx)
     loadListSettings(ctx)
-    loadEditorSettings(ctx)
     startWatcher(ctx)
 
     // Settings > Plugins > Skill Review. `?.`: older hosts have no settings pages; the gear then shows

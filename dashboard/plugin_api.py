@@ -22,7 +22,6 @@ import json
 import os
 import posixpath
 import re
-import socket
 import tempfile
 import threading
 from collections import OrderedDict
@@ -967,7 +966,7 @@ def reject_all(owner: str, subsystem: str, key: str) -> dict[str, Any]:
 
 
 # =================================================================================================
-# Editing a proposed change, and where a file lives. New routes; contract v1 above is unchanged.
+# Editing a proposed change. New routes; contract v1 above is unchanged.
 #
 #   GET  /files/{profile}/{subsystem}/{key}/edits
 #        {"status": "ok", "blocks": {block_id: {"field", "scope", "text", "limit"}}} for every block whose
@@ -978,9 +977,6 @@ def reject_all(owner: str, subsystem: str, key: str) -> dict[str, Any]:
 #        claim and single-op Hermes apply as accept, and on failure leaves the staged record exactly
 #        as it was. apply=false runs the scan Hermes would run and rewrites only that op's text.
 #        {"status", "error", "block_id" (the edited block's new id, when saved), "file_gone"}
-#   GET  /files/{profile}/{subsystem}/{key}/location
-#        {"status": "ok", "path", "exists", "host", "user"} for the live file, {"status": "refused"}
-#        when it resolves outside the profile's memories/ or skills/ folder, or {"status": "gone"}.
 #
 # Hermes stages a write without scanning it (skills) or scans only some shapes (a memory batch is
 # dry-run, a single memory op is not), so "Save as proposal" runs the scan that accepting would run:
@@ -1247,51 +1243,6 @@ def edit_block(owner: str, subsystem: str, key: str, block_id: str, raw: Any = B
                 _forget_cached(subsystem)  # as Remove entirely does: never answer an edited file from the cache
             gone = key not in _file_entries(subsystem, owner)
     return {**outcome, "file_gone": gone}
-
-
-def _live_target(subsystem: str, entry: dict[str, Any]) -> tuple[Path, Optional[Path], bool]:
-    """``(profile folder, live file or None, refused)`` as Hermes resolves the file."""
-    if subsystem == MEMORY:
-        from tools.memory_tool import get_memory_dir
-        from tools.memory_tool_store import MemoryStore
-        return Path(get_memory_dir()), MemoryStore._path_for(_memory_target(entry)), False
-    from hermes_constants import get_skills_dir
-    from tools import skill_manager_tool as smt
-    root, name = Path(get_skills_dir()), entry.get("name") or ""
-    if not name or smt._validate_name(Path(name).name):
-        return root, None, True
-    found = smt._find_skill(name)
-    if not found:
-        return root, None, False  # a new skill: nothing to open yet
-    if entry["rel"] == "SKILL.md":
-        return root, Path(found["path"]) / "SKILL.md", False
-    target, error = smt._resolve_supporting_file(Path(found["path"]), entry["rel"])
-    return root, target, error is not None
-
-
-def _login_name() -> str:
-    try:
-        import pwd
-        return pwd.getpwuid(os.getuid()).pw_name
-    except Exception:
-        return os.environ.get("USER") or os.environ.get("USERNAME") or ""
-
-
-@router.get("/files/{owner}/{subsystem}/{key}/location")
-def file_location(owner: str, subsystem: str, key: str) -> dict[str, Any]:
-    _check_subsystem(subsystem)
-    _check_key(key)
-    home = _resolve_profile(owner)
-    with _profile_scope(home):
-        entry = _find_entry(subsystem, owner, key)
-        if entry is None:
-            return {"status": "gone"}
-        root, target, refused = _live_target(subsystem, entry)
-    folder = "memories" if subsystem == MEMORY else "skills"
-    if refused or (target is not None and not _inside(target, root)):
-        return {"status": "refused", "error": f"This file is not inside the profile's {folder} folder, so it is not opened."}
-    return {"status": "ok", "path": str(target) if target is not None else None,
-            "exists": target is not None and os.path.isfile(target), "host": socket.gethostname(), "user": _login_name()}
 
 
 # =================================================================================================
