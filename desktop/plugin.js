@@ -52,6 +52,9 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
+// Newer SDK members, read through the namespace: a named import of a member an older host does not
+// export stops the whole plugin from loading (the runtime shim re-exports only what the host has).
+import * as SDK from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -60,12 +63,11 @@ const ROUTE = '/skill-review'
 const POLL_MS = 3000
 
 export const LIST_PANE = `${ID}:list`
-/** The second pane. Desktop turns a plugin off when its only pane is closed (closeTreePane in the
- *  tree store), so with two registered panes every Close only dismisses the pane it was used on. */
-export const SETTINGS_PANE = `${ID}:settings`
 
 let CTX = null
 let useRouteFallback = false
+// True once Settings > Plugins holds this plugin's page (hosts with ctx.registerSettingsPage).
+let hasSettingsPage = false
 
 /** UI state shared by both panes. Module-level atoms, so a pane remount (drag, tab switch, reload of
  *  the layout) keeps the selection and filters. */
@@ -1115,7 +1117,7 @@ function DetailPane() {
 /** Route page for desktops without the pane APIs: the same list and diff as the pane. */
 /** Desktops without the pane APIs: one route page with the settings above the review. */
 function FallbackPage() {
-  return jsxs('div', { style: STYLES.paneRoot, children: [jsx(SettingsPane, {}), jsx(ReviewPane, {})] })
+  return jsxs('div', { style: STYLES.paneRoot, children: [jsx(SettingsPage, {}), jsx(ReviewPane, {})] })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2019,6 +2021,7 @@ function FilesListPane() {
   const gateOn = (usePending().data?.profiles ?? []).some(p => Object.values(p.gates ?? {}).some(Boolean))
   const missing = v.isError && /404/.test(String(v.error?.message || ''))
   const total = v.files.reduce((sum, f) => sum + (f.counts?.total ?? 0), 0)
+  const inline = useValue($inlineSettings)
 
   // Desktops without paneVisibility: the list mounting is the best sign the user opened it.
   useEffect(() => {
@@ -2055,7 +2058,9 @@ function FilesListPane() {
       }),
       v.profileErrors.length
         ? jsx('div', { style: { ...STYLES.muted, overflowWrap: 'anywhere' }, children: t('profileErrors', v.profileErrors.map(e => e.profile).join(', ')) })
-        : null
+        : null,
+      // Hosts without Settings > Plugins pages: the gear shows the settings here instead.
+      inline ? jsx(SettingsPage, {}) : null
     ]
   })
 
@@ -2775,7 +2780,6 @@ export function EditorLinkSettings({ mode, draft, onMode, onDraft, t }) {
     role: 'group',
     style: SETTINGS_STYLES.section,
     children: [
-      jsx('span', { style: SETTINGS_STYLES.label, children: t('editorSettings') }),
       jsxs(Select, {
         onValueChange: onMode,
         value: mode,
@@ -3064,35 +3068,30 @@ const EXPAND_EN = {
  * its saved state. openReview reveals it right after registering, and revealPane expands a
  * collapsed zone, so in practice it opens straight away.
  *
- * Desktop cannot dismiss a pane for a plugin at startup. Closing a plugin's ONLY pane turns the
- * plugin off (closeTreePane in the Desktop tree store counts the plugin's registered panes), so the
- * settings pane is always registered with this one: Close (X, cmd-W, any menu) then only dismisses.
+ * Desktop cannot dismiss a pane for a plugin at startup. This is the plugin's only pane, and
+ * Desktop turns a plugin off when its only pane is closed (closeTreePane in the tree store). So the
+ * pane is hideOnly: no X, no middle or cmd-click close, no Close menu rows; the zone menu's Show/Hide
+ * rows and the palette's "Toggle Pending writes tab" replace them, and collapsing still works.
+ * placement 'right' keeps cmd-W away from it too: cmd-W closes the active tab of a zone that holds a
+ * 'main' pane and does not check hideOnly. Known gap: if the user drags this tab into the chat zone,
+ * cmd-W there still closes it and turns the plugin off.
  */
 export function reviewPaneContribution() {
   return {
     id: 'list', // skill-review:list, the same id as before, so saved layouts still match it
     area: 'panes',
     title: en.listTitle,
-    // Its own tiling column on the workspace's right edge, like Bots' Routines pane. 'right'
-    // placement is the collapsible right sidebar's role, so this docks explicitly instead.
-    data: { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, defaultCollapsed: true, width: '720px', minWidth: '240px' },
+    // Its own tiling column on the workspace's right edge (the dock), with the right side's role:
+    // the right-sidebar toggle (cmd-J) can fold it with the other right columns.
+    data: {
+      placement: 'right',
+      hideOnly: true,
+      dock: { pane: 'workspace', pos: 'right' },
+      defaultCollapsed: true,
+      width: '720px',
+      minWidth: '240px'
+    },
     render: () => jsx(ReviewPane, {})
-  }
-}
-
-/**
- * The second pane: the review settings, a tab in the list's zone. Registered and unregistered
- * together with the list, so the plugin always has two panes. It is adopted after the list (its dock
- * names the list) as an inactive tab, so it never takes the zone from the list; defaultCollapsed only
- * matters if it ever lands in a zone of its own.
- */
-export function settingsPaneContribution() {
-  return {
-    id: 'settings', // skill-review:settings
-    area: 'panes',
-    title: en.settingsTitle,
-    data: { placement: 'main', dock: { pane: LIST_PANE, pos: 'center' }, defaultCollapsed: true, minWidth: '240px' },
-    render: () => jsx(SettingsPane, {})
   }
 }
 
@@ -3103,24 +3102,9 @@ function ensureReviewPane() {
     return
   }
 
-  const disposers = [CTX.register(reviewPaneContribution()), CTX.register(settingsPaneContribution())]
+  const dispose = CTX.register(reviewPaneContribution())
 
-  unregisterPane = () => disposers.forEach(dispose => typeof dispose === 'function' && dispose())
-}
-
-/** Bring one of the two panes on screen: forget a Close, register both panes, then reveal (which
- *  expands a collapsed zone). The undismiss runs first so a closed list is back in the layout before
- *  the settings pane, which docks next to it, is adopted. */
-function showPane(id) {
-  if (typeof host.undismissPane === 'function') {
-    host.undismissPane(id)
-  }
-
-  ensureReviewPane()
-
-  if (typeof host.revealPane === 'function') {
-    host.revealPane(id)
-  }
+  unregisterPane = typeof dispose === 'function' ? dispose : () => {}
 }
 
 /** Show the review pane (registering it, bringing it back if closed, expanding it if collapsed) and
@@ -3139,18 +3123,32 @@ export function openReview(key) {
     return
   }
 
-  showPane(LIST_PANE)
-}
-
-/** The list header's gear: show the settings pane the same way. */
-export function openSettings() {
-  if (useRouteFallback || typeof host.openWorkspace !== 'function') {
-    host.navigate(ROUTE)
-
-    return
+  // Forget a Close first, then register, then reveal (which expands a collapsed zone).
+  if (typeof host.undismissPane === 'function') {
+    host.undismissPane(LIST_PANE)
   }
 
-  showPane(SETTINGS_PANE)
+  ensureReviewPane()
+
+  if (typeof host.revealPane === 'function') {
+    host.revealPane(LIST_PANE)
+  }
+}
+
+/** Settings > Plugins > Skill Review, as the host spells the link. */
+export const settingsHref = () =>
+  typeof SDK.pluginSettingsHref === 'function' ? SDK.pluginSettingsHref(ID) : `/settings?tab=plugins&plugin=${ID}`
+
+/** The list header's gear: open this plugin's settings page. Hosts without settings pages show the
+ *  settings inside the list (or on the route page, which already shows them). */
+export function openSettings() {
+  if (hasSettingsPage) {
+    host.navigate(settingsHref())
+  } else if (useRouteFallback) {
+    host.navigate(ROUTE)
+  } else {
+    $inlineSettings.set(!$inlineSettings.get())
+  }
 }
 
 /**
@@ -3335,22 +3333,26 @@ export function NotifyModeSwitch({ mode, onChange, t }) {
     style: STYLES.barRow,
     children: [
       jsx('span', { style: STYLES.muted, children: t('notifyLabel') }),
-      jsx(SegmentedControl, {
-        onChange,
-        options: NOTIFY_MODES.map(id => ({ id, label: t(id === 'popup' ? 'notifyPopup' : 'notifyLight') })),
-        sizing: 'content',
-        value: mode
-      })
+      NotifyModeSegments({ mode, onChange, t })
     ]
   })
 }
 
-/** The settings pane's notify control. */
-export function NotifyModeControl() {
+export function NotifyModeSegments({ mode, onChange, t }) {
+  return jsx(SegmentedControl, {
+    onChange,
+    options: NOTIFY_MODES.map(id => ({ id, label: t(id === 'popup' ? 'notifyPopup' : 'notifyLight') })),
+    sizing: 'content',
+    value: mode
+  })
+}
+
+/** The notify control. `bare` drops its label for a settings row that has its own title. */
+export function NotifyModeControl({ bare = false } = {}) {
   const t = usePluginI18n(ID)
   const mode = useValue($notifyMode)
 
-  return jsx(NotifyModeSwitch, { mode, onChange: setNotifyMode, t })
+  return jsx(bare ? NotifyModeSegments : NotifyModeSwitch, { mode, onChange: setNotifyMode, t })
 }
 
 export const AUTO_OPEN_STYLES = {
@@ -3366,14 +3368,6 @@ export function AutoOpenSwitch({ on, onChange, t }) {
       jsx('span', { style: AUTO_OPEN_STYLES.text, children: t('autoOpenLabel') })
     ]
   })
-}
-
-/** The settings pane's autoOpen checkbox, below the notify control. */
-export function AutoOpenControl() {
-  const t = usePluginI18n(ID)
-  const on = useValue($autoOpen)
-
-  return jsx(AutoOpenSwitch, { on, onChange: setAutoOpen, t })
 }
 
 export const SETTINGS_STYLES = {
@@ -3406,48 +3400,82 @@ export function SettingsGearButton({ onOpen, t }) {
   })
 }
 
-function SettingsSection({ label, children }) {
-  return jsxs('div', { style: SETTINGS_STYLES.section, children: [jsx('span', { style: SETTINGS_STYLES.label, children: label }), children] })
+/** autoOpen as a settings row: the SDK's ToggleRow, or the plain checkbox on older hosts. */
+export function AutoOpenRow() {
+  const t = usePluginI18n(ID)
+  const on = useValue($autoOpen)
+
+  return jsx(AutoOpenToggle, { on, onChange: setAutoOpen, t })
 }
 
-/** The settings pane's content. Every control reads and writes the same persisted atoms the list
- *  reads, so the two panes always agree. */
-export function SettingsView({ profiles, focused, t }) {
+export function AutoOpenToggle({ on, onChange, t }) {
+  if (typeof SDK.ToggleRow !== 'function') {
+    return AutoOpenSwitch({ on, onChange, t })
+  }
+
+  return jsx(SDK.ToggleRow, { checked: on === true, description: t('autoOpenHelp'), label: t('autoOpenLabel'), onChange })
+}
+
+/** Stand-in for the SDK's ListRow on hosts that do not export it: title, description, control. */
+function PlainRow({ title, description, action, below }) {
   return jsxs('div', {
-    style: STYLES.paneRoot,
+    style: SETTINGS_STYLES.section,
     children: [
-      jsx('div', { style: STYLES.bar, children: jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600, minWidth: 0 }, children: t('settingsTitle') }) }),
-      jsxs('div', {
-        style: { ...STYLES.listScroll, ...SETTINGS_STYLES.body },
-        children: [
-          jsxs(SettingsSection, {
-            label: t('scopeGroup'),
-            children: [
-              jsx('div', { style: STYLES.barRow, children: jsx(ProfileControl, { focused, profiles }) }),
-              profiles.length ? null : jsx('span', { style: STYLES.muted, children: t('settingsNoProfiles') })
-            ]
-          }),
-          jsx(SettingsSection, { label: t('sortLabel'), children: jsx('div', { style: STYLES.barRow, children: jsx(SortControl, {}) }) }),
-          jsxs('div', { style: SETTINGS_STYLES.section, children: [jsx(NotifyModeControl, {}), jsx(AutoOpenControl, {})] }),
-          jsx(EditorLinkControl, {})
-        ]
-      })
+      jsx('span', { style: SETTINGS_STYLES.label, children: title }),
+      description ? jsx('span', { style: STYLES.muted, children: description }) : null,
+      action ? jsx('div', { style: STYLES.barRow, children: action }) : null,
+      below ?? null
     ]
   })
 }
 
-export function SettingsPane() {
+/** The settings page's content. Every control reads and writes the same persisted atoms the list
+ *  reads (saved through ctx.storage), so the page and the list always agree. */
+export function SettingsPageView({ profiles, focused, t }) {
+  const Row = typeof SDK.ListRow === 'function' ? SDK.ListRow : PlainRow
+
+  return jsxs('div', {
+    style: SETTINGS_STYLES.body,
+    children: [
+      jsx(Row, {
+        action: jsx(ProfileControl, { focused, profiles }),
+        below: profiles.length ? undefined : jsx('span', { style: STYLES.muted, children: t('settingsNoProfiles') }),
+        description: t('settingsProfilesHelp'),
+        title: t('scopeGroup')
+      }),
+      jsx(Row, { action: jsx(SortControl, {}), description: t('settingsSortHelp'), title: t('sortLabel') }),
+      jsx(Row, { action: jsx(NotifyModeControl, { bare: true }), description: t('settingsNotifyHelp'), title: t('notifyLabel') }),
+      jsx(AutoOpenRow, {}),
+      jsx(Row, { below: jsx(EditorLinkControl, {}), description: t('settingsEditorHelp'), title: t('editorSettings') })
+    ]
+  })
+}
+
+export function SettingsPage() {
   const t = usePluginI18n(ID)
   const v = useVisibleFiles()
 
-  return jsx(SettingsView, { focused: v.focused, profiles: v.profiles, t })
+  return jsx(SettingsPageView, { focused: v.focused, profiles: v.profiles, t })
 }
 
+/** Settings > Plugins > Skill Review. */
+export function settingsPageContribution() {
+  return { id: 'settings', title: en.settingsTitle, icon: 'git-pull-request', render: () => jsx(SettingsPage, {}) }
+}
+
+/** Hosts without settings pages: the gear opens the settings inside the list pane. */
+export const $inlineSettings = atom(false)
+
 const SETTINGS_EN = {
-  openSettings: 'Review settings',
+  autoOpenHelp: 'Off: a new change shows a popup or lights up the Review chip, as chosen above.',
+  openSettings: 'Skill Review settings',
+  settingsEditorHelp: 'The link that Open in VS Code in each file header uses.',
   settingsNoProfiles: 'Profiles show up here once they have pending changes.',
+  settingsNotifyHelp: 'Popup shows a notification. Light up icon marks the Review chip instead.',
+  settingsProfilesHelp: 'Which profiles the review list shows. The Review chip counts every profile.',
+  settingsSortHelp: 'The order of the files in the review list.',
   settingsSummary: (profiles, sort) => `${profiles}, ${sort}`,
-  settingsTitle: 'Review settings'
+  settingsTitle: 'Skill Review'
 }
 
 export const CHIP_STYLES = {
@@ -3620,6 +3648,7 @@ export default {
     ctx.i18n.register({ en })
     ctx.onDispose(() => {
       CTX = null
+      hasSettingsPage = false
       unregisterPane?.()
       unregisterPane = null
     })
@@ -3629,7 +3658,11 @@ export default {
     loadEditorSettings(ctx)
     startWatcher(ctx)
 
-    // No panes here: openReview registers both on demand (see reviewPaneContribution). A saved entry
+    // Settings > Plugins > Skill Review. `?.`: older hosts have no settings pages; the gear then shows
+    // the settings inside the list.
+    hasSettingsPage = Boolean(ctx.registerSettingsPage?.(settingsPageContribution()))
+
+    // No pane here: openReview registers it on demand (see reviewPaneContribution). A saved entry
     // for the old detail pane is never registered again, so Desktop collapses its zone.
     const contributions = [
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 110, render: () => jsx(StatusChip, {}) },

@@ -77,18 +77,19 @@ test('default export has the contract fields', () => {
   assert.equal(typeof plugin.register, 'function')
 })
 
-test('register adds no pane at startup; Review registers the list on the workspace right edge and its settings pane, no route', () => {
+test('register adds no pane at startup; Review registers one pane on the workspace right edge, no route', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
   assert.deepEqual(ctx.registered.filter(c => c.area === 'panes'), [], 'nothing docks itself at launch')
   openReview()
   const panes = ctx.registered.filter(c => c.area === 'panes')
-  assert.deepEqual(panes.map(p => p.id), ['list', 'settings'])
+  assert.deepEqual(panes.map(p => p.id), ['list'])
   assert.equal(LIST_PANE, 'skill-review:list')
   const [pane] = panes
   assert.deepEqual(pane.data.dock, { pane: 'workspace', pos: 'right' }, 'the pane splits the workspace right edge')
-  assert.equal(pane.data.placement, 'main')
+  assert.equal(pane.data.placement, 'right')
+  assert.equal(pane.data.hideOnly, true)
   assert.equal(pane.data.width, '720px', 'wide enough for the list and the diff side by side')
   assert.equal(pane.render().type, ReviewPane)
   assert.ok(!ctx.registered.some(c => c.area === 'routes'), 'no route when the desktop has the pane APIs')

@@ -105,35 +105,36 @@ test('startup registers no pane, so nothing appears on its own; the Review chip 
   dispose(ctx)
 })
 
-test('the review pane contribution: id list, collapsed on first arrival, docked right, 720px, plus the settings pane', () => {
+test('the review pane contribution: id list, collapsed on first arrival, docked right, 720px, no companion', () => {
   const pane = reviewPaneContribution()
   assert.equal(pane.id, 'list')
   assert.equal(LIST_PANE, 'skill-review:list')
   assert.equal(pane.area, 'panes')
   assert.equal(pane.title, messages.en.listTitle)
   assert.equal(pane.data.defaultCollapsed, true)
-  assert.equal(pane.data.placement, 'main')
+  assert.equal(pane.data.placement, 'right')
+  assert.equal(pane.data.hideOnly, true)
   assert.notEqual(pane.data.placement, 'floating')
   assert.deepEqual(pane.data.dock, { pane: 'workspace', pos: 'right' })
   assert.equal(pane.data.width, '720px')
   assert.equal(pane.render().type, ReviewPane)
   const ctx = start()
   openReview()
-  assert.deepEqual(paneRegs(ctx).map(p => p.id), ['list', 'settings'], 'the list and the settings pane, so a Close never turns the plugin off')
+  assert.deepEqual(paneRegs(ctx).map(p => p.id), ['list'], 'exactly one pane, no companion')
   dispose(ctx)
 })
 
-test('openReview undismisses, registers both panes once, then reveals the list (reveal also expands a collapsed zone)', () => {
+test('openReview undismisses, registers the pane once, then reveals it (reveal also expands a collapsed zone)', () => {
   const ctx = start()
   openReview()
-  assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, 'register:list', 'register:settings', `reveal:${LIST_PANE}`])
+  assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, 'register:list', `reveal:${LIST_PANE}`])
   host.calls = []
   openReview()
   assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, `reveal:${LIST_PANE}`], 'never registered twice')
-  assert.equal(paneRegs(ctx).length, 2)
+  assert.equal(paneRegs(ctx).length, 1)
   assert.equal(host.workspaceOpens, 0, 'never the centre zone')
   dispose(ctx)
-  assert.equal(ctx.unregistered, 2, 'both lazily registered panes are unregistered with the plugin')
+  assert.equal(ctx.unregistered, 1, 'the lazily registered pane is unregistered with the plugin')
 })
 
 test('chip, palette command and toast action all open the pane', async () => {
@@ -218,7 +219,7 @@ test('autoOpen on (default): a change that arrives after the first poll opens th
   assert.equal($autoOpen.get(), true)
   await poll(ctx, [item('old')])
   await poll(ctx, [item('old'), item('new1')])
-  assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, 'register:list', 'register:settings', `reveal:${LIST_PANE}`])
+  assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, 'register:list', `reveal:${LIST_PANE}`])
   assert.equal(host.toasts.length, 0, 'the pane is the signal')
   assert.equal($selection.get(), 'skills/default/new1', 'nothing was selected, so the new change is')
   dispose(ctx)
@@ -344,7 +345,7 @@ test('AutoOpenSwitch styles: shrinkable, wraps long text, theme variables only',
   assert.doesNotMatch(json, /\b(?:rgb|rgba|hsl|hsla|oklch)\(/)
 })
 
-test('the settings pane carries the autoOpen control next to the notify control', () => {
-  const view = src.slice(src.indexOf('export function SettingsView('), src.indexOf('export function SettingsPane('))
-  assert.match(view, /jsx\(NotifyModeControl, \{\}\),\s*jsx\(AutoOpenControl, \{\}\)/)
+test('the settings page carries the autoOpen row right after the notify row', () => {
+  const view = src.slice(src.indexOf('export function SettingsPageView('), src.indexOf('export function SettingsPage('))
+  assert.match(view, /jsx\(NotifyModeControl, \{ bare: true \}\)[^\n]*\n\s*jsx\(AutoOpenRow, \{\}\)/)
 })

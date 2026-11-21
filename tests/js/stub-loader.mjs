@@ -4,7 +4,7 @@ const SDK_NAMES = ['Badge', 'Button', 'Codicon', 'ConfirmDialog', 'EmptyState', 
   'usePluginI18n', 'useQuery', 'useQueryClient', 'useValue', 'queryClient', 'atom',
   'SegmentedControl', 'ContextMenu', 'ContextMenuCheckboxItem', 'ContextMenuContent', 'ContextMenuTrigger',
   'Checkbox', 'Popover', 'PopoverContent', 'PopoverTrigger', 'Select', 'SelectContent', 'SelectItem', 'SelectTrigger',
-  'SelectValue', 'Skeleton', 'Input', 'Textarea']
+  'SelectValue', 'Skeleton', 'Input', 'Textarea', 'ListRow', 'ToggleRow']
 
 const sdk = `
 ${SDK_NAMES.filter(n => !['PALETTE_AREA', 'ROUTES_AREA', 'STATUSBAR_AREAS', 'host', 'haptic', 'relativeTime', 'queryClient', 'atom'].includes(n))
@@ -13,6 +13,12 @@ export const PALETTE_AREA = 'palette'
 export const ROUTES_AREA = 'routes'
 export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' }
 export const haptic = () => {}
+// Same output as pluginSettingsHref in apps/desktop/src/contrib/settings-pages.ts.
+export const pluginSettingsHref = (plugin, page) => {
+  const params = new URLSearchParams({ tab: 'plugins' })
+  if (plugin) { params.set('plugin', plugin); if (page) params.set('ppage', page) }
+  return "/settings?" + params
+}
 export const relativeTime = () => 'now'
 export const host = globalThis.__host
 export const queryClient = globalThis.__queryClient
