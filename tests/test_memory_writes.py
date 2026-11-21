@@ -51,11 +51,11 @@ def test_diff_add_is_all_added(client, stage, root):
 def test_diff_patch_is_unified_diff_of_the_pinned_entry(client, stage, root):
     entry = "Likes dark mode in all editors"
     write_memory(root, "dev", ["other", entry])
-    rec = stage("dev", patch_payload(entry, "dark mode in all editors", "light mode in VS Code"))
+    rec = stage("dev", patch_payload(entry, "dark mode in all editors", "light mode in the terminal"))
     sec = client.get(f"{BASE}/memory/dev/{rec['id']}/diff").json()["sections"][0]
     assert sec["kind"] == "diff" and sec["title"] == "patch in MEMORY.md"
     assert "--- a/MEMORY.md" in sec["text"] and "+++ b/MEMORY.md" in sec["text"]
-    assert f"-{entry}" in sec["text"] and "+Likes light mode in VS Code" in sec["text"]
+    assert f"-{entry}" in sec["text"] and "+Likes light mode in the terminal" in sec["text"]
 
 
 def test_diff_replace_legacy_shows_whole_entry_swap(client, stage, root):

@@ -70,7 +70,6 @@ def test_hermes_dependency_never_sees_the_file_owner_as_its_profile(hermes_like,
 
     calls = [
         ("get", f"{base}/edits"),
-        ("get", f"{base}/location"),
         ("get", f"{BASE}/pending/memory/dev/{pid}/diff"),
         ("post", f"{base}/blocks/{blocks[0]['id']}/accept"),
         ("post", f"{base}/accept-all"),
@@ -88,3 +87,14 @@ def test_an_explicit_query_profile_still_reaches_the_dependency(hermes_like):
     client, seen = hermes_like
     client.get(f"{BASE}/files", params={"kind": "all", "profile": "ops"})
     assert seen == ["ops"]
+
+
+def test_the_location_route_is_gone(hermes_like, stage, root):
+    """The external editor link was the only reader of /location; the route no longer exists."""
+    client, _ = hermes_like
+    write_memory(root, "dev", ["alpha fact"])
+    stage("dev", {"action": "add", "target": "memory", "content": "beta fact"})
+    [f] = _dev_files(client)
+    base = f"{BASE}/files/{f['profile']}/{f['subsystem']}/{f['key']}"
+    assert client.get(f"{base}/location").status_code == 404
+    assert client.get(f"{base}/edits").status_code == 200
