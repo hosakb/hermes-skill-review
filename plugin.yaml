@@ -11,8 +11,8 @@ description: >
   Accept applies the change through Hermes's own approval code. Library mode
   lists each profile's SOUL.md, PROJECT.md, AGENTS.md, MEMORY.md, USER.md and
   skill files and, on Save, writes the edited file directly, after Hermes's
-  own size, frontmatter and content checks. No network calls, no telemetry,
-  no credentials, no tools or hooks.
+  own size, frontmatter and content checks; Library needs Linux or macOS.
+  No network calls, no telemetry, no credentials, no tools or hooks.
 author: hosakb
 license: MIT
 homepage: https://github.com/hosakb/hermes-skill-review

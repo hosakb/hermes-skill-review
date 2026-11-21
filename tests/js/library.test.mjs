@@ -27,7 +27,7 @@ const {
   $hidden, $kind, $libDiscard, $libEditor, $libOpen, $libSelection, $mode, $selection, FilesListPane, LibraryDetailPane,
   LibraryEditorView, LibraryListPane, LibraryTree, ModeSwitch, ReviewLayout, cancelDiscard, changeLibraryText,
   confirmDiscard, librarySession, filterLibrary, findLibraryFile, isDirty, libId, libraryFilePath, libraryPath, messages,
-  openPendingFor, performLibrarySave, reloadLibraryFile, requestLeave, restError, revertLibrary, selectLibraryFile,
+  libraryErrorState, openPendingFor, performLibrarySave, reloadLibraryFile, requestLeave, restError, revertLibrary, selectLibraryFile,
   setMode, toggleNode, treeRows
 } = mod
 const { SegmentedControl, Textarea } = await import('@hermes/plugin-sdk')
@@ -542,4 +542,50 @@ test('a reload that finishes after the user moved on is not applied', async () =
   settle.resolve({ ...SOUL, text: 'disk' })
   await run
   assert.deepEqual($libEditor.get(), other)
+})
+
+// --- review cycle 2: POSIX only, one counter per editing session -----------------------------------
+
+test('on a system without folder handles Library shows the backend message, not an empty tree', async () => {
+  const detail = 'Library needs Linux or macOS: it opens files through folder handles without following symlinks, and this system cannot do that. Pending works as usual.'
+  assert.deepEqual(libraryErrorState(httpError(501, detail), t), { description: detail, retry: false, title: 'libUnsupportedTitle' })
+  assert.deepEqual(libraryErrorState(httpError(404, 'Not Found'), t), { description: 'backendMissing', retry: false, title: 'libLoadError' })
+  assert.deepEqual(libraryErrorState(new Error('socket hang up'), t), { description: 'socket hang up', retry: true, title: 'libLoadError' })
+  assert.equal(messages.en.libUnsupportedTitle, 'Library is not available on this system')
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(pluginPath, 'utf8')
+  const pane = src.slice(src.indexOf('function LibraryListPane()'), src.indexOf('\nconst textLines'))
+  assert.match(pane, /libraryErrorState\(library\.error, t\)/)
+})
+
+test('every opened or reopened file gets its own session number', () => {
+  const a = librarySession(null, soulId, SOUL)
+  const b = librarySession(null, soulId, SOUL)
+  assert.equal(typeof a.gen, 'number')
+  assert.notEqual(a.gen, b.gen)
+  reset()
+  changeLibraryText(a, 'typed')
+  assert.equal($libEditor.get().gen, a.gen, 'typing keeps the session')
+})
+
+test('a late 409 after discarding and reopening the same file does not bring the discarded text back', async () => {
+  reset()
+  for (const failure of [httpError(409, 'stale'), httpError(422, 'bad'), new Error('socket hang up')]) {
+    const { promise, settle } = later()
+    const run = performLibrarySave({ queryClient: fakeQueryClient(), rest: () => promise, session: dirty(), t })
+    confirmDiscard()
+    const reopened = { ...librarySession(null, soulId, SOUL), text: 'typed after reopening' }
+    $libEditor.set(reopened)
+    settle.reject(failure)
+    await run
+    assert.deepEqual($libEditor.get(), reopened)
+  }
+  const { promise, settle } = later()
+  const run = performLibrarySave({ queryClient: fakeQueryClient(), rest: () => promise, session: dirty(), t })
+  confirmDiscard()
+  const reopened = { ...librarySession(null, soulId, SOUL), text: 'typed after reopening' }
+  $libEditor.set(reopened)
+  settle.resolve({ status: 'saved', version: 'def:2' })
+  await run
+  assert.deepEqual($libEditor.get(), reopened, 'a late success does not mark the new text saved either')
 })

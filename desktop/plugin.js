@@ -2228,6 +2228,10 @@ const libraryFileKey = id => [ID, 'library', 'file', id]
 
 export const isDirty = session => Boolean(session) && session.text !== session.original
 
+// Every session built from a loaded file gets the next number: opening, reopening after a discard
+// and reloading each start a new one, so a late answer is matched to its session, not its file.
+let sessionSerial = 0
+
 /** The editing session for `id`: the one in $libEditor when it is for this file, else a clean one
  *  built from the loaded file, else null while it loads. */
 export function librarySession(current, id, data) {
@@ -2240,9 +2244,12 @@ export function librarySession(current, id, data) {
     return null
   }
 
+  sessionSerial += 1
+
   return {
     conflict: null,
     error: null,
+    gen: sessionSerial,
     id,
     key: data.file.key,
     kind: data.file.kind,
@@ -2477,10 +2484,12 @@ function refreshAfterSave(queryClient) {
   queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
 }
 
-/** Set the editor state only while it still holds `session`'s file: a result that arrives after
- *  the user discarded the text or opened another file is not applied to that file. */
+/** Set the editor state only while it still holds `session`: a result that arrives after the user
+ *  discarded the text, opened another file, or reopened this one is not applied. */
 const setIfStill = (session, next) => {
-  if ($libEditor.get()?.id === session.id) {
+  const current = $libEditor.get()
+
+  if (current?.id === session.id && current.gen === session.gen) {
     $libEditor.set(next)
   }
 }
@@ -2705,6 +2714,23 @@ export function LibraryTree({ rows, selection, dirtyId = null, onSelect, onToggl
   })
 }
 
+/** What the Library list shows when the tree did not load: the backend's own message on a system
+ *  without the file handles Library needs (501), the missing-backend hint on 404, else the error
+ *  with a Retry. */
+export function libraryErrorState(error, t) {
+  const { detail, status } = restError(error)
+
+  if (status === 501) {
+    return { description: detail, retry: false, title: t('libUnsupportedTitle') }
+  }
+
+  if (status === 404) {
+    return { description: t('backendMissing'), retry: false, title: t('libLoadError') }
+  }
+
+  return { description: detail, retry: true, title: t('libLoadError') }
+}
+
 /** The Pending total the switch shows: every block in /files, as the Pending list counts them. */
 const pendingTotal = files => (files ?? []).reduce((sum, f) => sum + (f.counts?.total ?? 0), 0)
 
@@ -2720,7 +2746,8 @@ function useLibrary() {
   return useQuery({
     placeholderData: previous => previous,
     queryFn: () => CTX.rest(libraryPath()),
-    queryKey: [ID, 'library', 'tree', profile, pendingSignature(files.data?.files)]
+    queryKey: [ID, 'library', 'tree', profile, pendingSignature(files.data?.files)],
+    retry: (count, error) => restError(error).status !== 501 && count < 3 // 501 does not change
   })
 }
 
@@ -2737,7 +2764,6 @@ export function LibraryListPane() {
   const profiles = library.data?.profiles ?? []
   const summary = profiles.map(p => ({ count: p.pending ?? 0, profile: p.profile }))
   const rows = treeRows(filterLibrary(profiles, hidden, search), open, search)
-  const missing = library.isError && /404/.test(String(library.error?.message || ''))
 
   const bar = jsxs('div', {
     style: STYLES.bar,
@@ -2757,13 +2783,13 @@ export function LibraryListPane() {
 
   let body
 
-  if (missing) {
-    body = jsx(ErrorState, { description: t('backendMissing'), title: t('libLoadError') })
-  } else if (library.isError) {
+  if (library.isError) {
+    const failed = libraryErrorState(library.error, t)
+
     body = jsx(ErrorState, {
-      children: jsx(Button, { onClick: () => library.refetch(), size: 'sm', type: 'button', variant: 'outline', children: t('retry') }),
-      description: restError(library.error).detail,
-      title: t('libLoadError')
+      children: failed.retry ? jsx(Button, { onClick: () => library.refetch(), size: 'sm', type: 'button', variant: 'outline', children: t('retry') }) : null,
+      description: failed.description,
+      title: failed.title
     })
   } else if (library.isLoading) {
     body = jsx('div', { style: { ...STYLES.muted, padding: PAD }, children: t('loading') })
@@ -2975,7 +3001,8 @@ const LIB_EN = {
   libSelectTitle: 'No file selected',
   libStagedTip: name => `${name} is not in the library: a new file, or a skill outside this profile's folder. Open its changes in Pending.`,
   libStraightToFile: 'Saves straight to the file',
-  libUnsaved: 'Unsaved changes'
+  libUnsaved: 'Unsaved changes',
+  libUnsupportedTitle: 'Library is not available on this system'
 }
 
 // ---------------------------------------------------------------------------------------------
