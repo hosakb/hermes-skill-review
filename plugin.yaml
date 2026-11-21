@@ -1,7 +1,7 @@
 name: skill-review
 label: Skill Review
 kind: standalone
-version: 0.2.0
+version: 0.2.1
 description: >
   Desktop review tab for staged skill and memory writes (skills.write_approval
   and memory.write_approval). Shows each pending change as a visual diff block

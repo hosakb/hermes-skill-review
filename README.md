@@ -104,7 +104,7 @@ The diff marks a block stale when its file changed so that the change no longer 
 
 ## Known limits
 
-- The review tab cannot be closed, because Desktop turns a plugin off when its only pane closes. Collapse it, or hide it from the zone menu or with "Toggle Pending writes tab" in the command palette.
+- The review tab cannot be closed, because Desktop turns a plugin off when its only pane closes. Collapse it, or hide it from the zone menu or with "Toggle Pending writes tab" in the command palette. Desktop will not hide the last visible tab of a zone, so if Files is hidden, press Hide in the pane header (or Ctrl+J / Cmd+J) to collapse the whole right sidebar. Hide needs a Desktop that gives plugins `ctx.runAction`; on older ones the button is not shown.
 - The tab lives in the Files zone, where cmd-W does not reach it. If you drag it into the chat zone, or your layout has no Files pane or other right-side pane so Desktop puts it there, cmd-W there still closes it and switches the plugin off. This is a Desktop limitation.
 - After an update, reload Desktop and restart the backend before the new version runs.
 - Word highlights stop at 2,500 tokens per line and 4,000,000 comparison cells per line pair (16,000,000 per block). Longer lines are tinted without word marks. Diffs themselves are not truncated.
