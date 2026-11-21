@@ -1,5 +1,7 @@
 # Skill Review
 
+![Skill Review: a review tab with the pending file list and per-change diff blocks](docs/banner.png)
+
 Skill Review is a Hermes Desktop plugin with a Python backend that shows staged skill and memory writes as visual diffs in one review tab, where you accept or reject each proposed change.
 
 ## What it does
