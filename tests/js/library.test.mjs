@@ -68,7 +68,7 @@ const TREE = {
       ],
       skills: [
         {
-          name: 'council', external: false, pending: 2,
+          name: 'council', pending: 2,
           files: [
             file('council000000skl', 'skill', 'SKILL.md', 1, { skill: 'council', review: { subsystem: 'skills', key: 'reviewSkillKey00' } }),
             file('council00000refa', 'skill', 'references/a.md', 1, { skill: 'council', review: { subsystem: 'skills', key: 'reviewRefKey0000' } })
