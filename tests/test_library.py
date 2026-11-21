@@ -2,7 +2,7 @@
 
 GET /library
     {"profiles": [{"profile", "pending", "error", "identity": [F], "memory": [F],
-                   "skills": [{"name", "external", "pending", "files": [F]}],
+                   "skills": [{"name", "pending", "files": [F]}],
                    "staged": [{"file", "subsystem", "pending", "review"}]}],
      "total": int}
     F = {"key", "kind", "name", "skill", "exists", "size", "mtime", "pending", "review"}
@@ -13,6 +13,11 @@ PUT /library/{owner}/{key}   body {"text": str, "version": str}
     404 unknown key, 413 too large, 415 not UTF-8 text.
 """
 
+import json
+import os
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -134,7 +139,7 @@ def test_skill_folders_with_skill_md_and_supporting_text_files(client, root):
         "notes.txt": "not under an allowed folder\n",
     })
     [demo] = prof(tree(client), "dev")["skills"]
-    assert demo["name"] == "demo" and demo["external"] is False
+    assert demo["name"] == "demo"
     assert [f["name"] for f in demo["files"]] == ["SKILL.md", "references/a.md", "scripts/run.sh"]
     assert all(f["kind"] == "skill" and f["skill"] == "demo" for f in demo["files"])
 
@@ -145,16 +150,26 @@ def test_skill_folders_nested_in_a_category(client, root):
     assert skill["name"] == "axolotl"
 
 
-def test_external_skill_dirs_are_listed(client, root, tmp_path):
+def test_external_skill_dirs_are_not_in_the_library(client, api, stage, root, tmp_path):
+    """Only files inside a profile's home are listed or written (issue #18). Pending still shows
+    changes to an external skill; Library lists them under the pending-only group."""
     ext = tmp_path / "shared-skills"
     (ext / "shared").mkdir(parents=True)
     (ext / "shared" / "SKILL.md").write_text(skill_content("shared"))
     config(root, "dev", f"skills:\n  external_dirs:\n    - {ext}\n")
     make_skill(root, "dev", "demo")
-    skills = prof(tree(client), "dev")["skills"]
-    assert [(s["name"], s["external"]) for s in skills] == [("demo", False), ("shared", True)]
-    assert prof(tree(client), "ops")["skills"] == []
-
+    stage("dev", {"action": "patch", "name": "shared", "old_string": "line one", "new_string": "line 1"})
+    t = tree(client)
+    dev = prof(t, "dev")
+    assert [s["name"] for s in dev["skills"]] == ["demo"]
+    assert "external" not in dev["skills"][0]
+    assert [(s["file"], s["pending"]) for s in dev["staged"]] == [("shared/SKILL.md", 1)]
+    assert tree_sum(t) == files_total(client) == 1
+    with api._profile_scope(home_of(root, "dev")):
+        key = api._library_key("dev", ext / "shared" / "SKILL.md")
+    assert read(client, "dev", key).status_code == 404
+    assert save(client, "dev", key, skill_content("shared", "x"), "absent").status_code == 404
+    assert (ext / "shared" / "SKILL.md").read_text() == skill_content("shared")
 
 def test_keys_are_opaque_and_unique(client, root):
     for profile in ("dev", "ops"):
@@ -324,16 +339,30 @@ def test_save_identity_file(client, root):
     assert out["file"]["size"] == len("new soul\n")
 
 
-def test_save_through_a_symlink_inside_the_home_keeps_the_link(client, root):
+def test_a_symlink_is_not_listed_even_inside_the_home(client, api, root):
+    """No path component may be a symlink, so a read or write can be done with O_NOFOLLOW."""
     home = home_of(root, "dev")
     (home / "identity").mkdir()
     real = home / "identity" / "soul.md"
     real.write_text("old\n")
     (home / "SOUL.md").symlink_to(real)
-    f, body = opened(client, "dev", "SOUL.md")
-    assert save(client, "dev", f["key"], "new\n", body["version"]).status_code == 200
-    assert (home / "SOUL.md").is_symlink() and real.read_text() == "new\n"
+    assert prof(tree(client), "dev")["identity"] == []
+    with api._profile_scope(home):
+        key = api._library_key("dev", home / "SOUL.md")
+    assert read(client, "dev", key).status_code == 404
+    assert save(client, "dev", key, "new\n", "absent").status_code == 404
+    assert real.read_text() == "old\n" and (home / "SOUL.md").is_symlink()
 
+
+def test_a_symlinked_folder_on_the_way_is_not_listed(client, root):
+    home = home_of(root, "dev")
+    (home / "skill-store").mkdir()
+    folder = make_skill(root, "dev", "demo")
+    (home / "skill-store" / "demo").mkdir()
+    (folder / "SKILL.md").rename(home / "skill-store" / "demo" / "SKILL.md")
+    folder.rmdir()
+    folder.symlink_to(home / "skill-store" / "demo")
+    assert prof(tree(client), "dev")["skills"] == []
 
 def test_save_memory_file(client, root):
     write_memory(root, "dev", ["alpha fact"])
@@ -359,17 +388,6 @@ def test_save_skill_md_and_supporting_file(client, root):
     f, body = opened(client, "dev", "references/a.md", "demo")
     assert save(client, "dev", f["key"], "no frontmatter needed\n", body["version"]).status_code == 200
     assert (skill_file(root, "dev", "demo").parent / "references" / "a.md").read_text() == "no frontmatter needed\n"
-
-
-def test_save_external_skill_file(client, root, tmp_path):
-    ext = tmp_path / "shared-skills"
-    (ext / "shared").mkdir(parents=True)
-    (ext / "shared" / "SKILL.md").write_text(skill_content("shared"))
-    config(root, "dev", f"skills:\n  external_dirs:\n    - {ext}\n")
-    f, body = opened(client, "dev", "SKILL.md", "shared")
-    text = skill_content("shared", "a shared skill")
-    assert save(client, "dev", f["key"], text, body["version"]).status_code == 200
-    assert (ext / "shared" / "SKILL.md").read_text() == text
 
 
 def test_save_takes_hermes_own_locks(client, api, root, monkeypatch):
@@ -592,15 +610,14 @@ def test_symlinked_skill_file_swapped_after_listing_is_refused(client, root, tmp
 # --- atomicity ----------------------------------------------------------------------------------
 
 def test_failed_write_leaves_the_file_whole_and_no_temp_file(client, root, monkeypatch):
-    import utils.files as files
     path = home_of(root, "dev") / "SOUL.md"
     path.write_text("original\n")
     f, body = opened(client, "dev", "SOUL.md")
 
-    def boom(tmp, target):
+    def boom(tmp, target, **_kw):
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(files, "atomic_replace", boom)
+    monkeypatch.setattr(os, "replace", boom)
     response = save(client, "dev", f["key"], "new text\n" * 1000, body["version"])
     assert response.status_code == 500 and "No space left" in response.json()["detail"]
     assert path.read_text() == "original\n"
@@ -608,10 +625,9 @@ def test_failed_write_leaves_the_file_whole_and_no_temp_file(client, root, monke
 
 
 def test_failed_memory_write_leaves_the_file_whole(client, root, monkeypatch):
-    import utils.files as files
     write_memory(root, "dev", ["alpha fact"])
     f, body = opened(client, "dev", "MEMORY.md")
-    monkeypatch.setattr(files, "atomic_replace", lambda tmp, target: (_ for _ in ()).throw(OSError(5, "I/O error")))
+    monkeypatch.setattr(os, "fsync", lambda fd: (_ for _ in ()).throw(OSError(5, "I/O error")))
     assert save(client, "dev", f["key"], "alpha fact\n§\nbeta", body["version"]).status_code == 500
     assert read_memory(root, "dev") == ["alpha fact"]
     assert leftovers(memory_file(root, "dev").parent) == []
@@ -658,3 +674,290 @@ def test_save_drops_the_cached_evaluations(client, api, stage, root, monkeypatch
     f, body = opened(client, "dev", "SKILL.md", "demo")
     assert save(client, "dev", f["key"], skill_content("demo", "b"), body["version"]).status_code == 200
     assert forgotten == ["memory", "skills"]
+
+
+# --- review cycle 1: swaps after the lookup, FIFOs, links -----------------------------------------
+
+def _swap_during_check(api, monkeypatch, swap):
+    """Run ``swap`` once while the save runs its checks (Skills Guard widens that window)."""
+    real = api._library_refusal
+
+    def checking(entry, text, current):
+        swap()
+        return real(entry, text, current)
+
+    monkeypatch.setattr(api, "_library_refusal", checking)
+
+
+def _swap_after_lookup(api, monkeypatch, swap):
+    """Run ``swap`` once, right after the first key lookup of a request."""
+    real, done = api._library_entry, []
+
+    def looking(profile, key):
+        entry = real(profile, key)
+        if not done:
+            done.append(True)
+            swap()
+        return entry
+
+    monkeypatch.setattr(api, "_library_entry", looking)
+
+
+def test_file_swapped_for_a_symlink_during_the_checks_is_not_written_through(client, api, root, tmp_path, monkeypatch):
+    outside = tmp_path / "outside.md"
+    outside.write_text("keep\n")
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    f, body = opened(client, "dev", "SOUL.md")
+
+    def swap():
+        path.unlink()
+        path.symlink_to(outside)
+
+    _swap_during_check(api, monkeypatch, swap)
+    response = save(client, "dev", f["key"], "pwned\n", body["version"])
+    assert response.status_code in (404, 409), response.text
+    assert outside.read_text() == "keep\n"
+    assert path.is_symlink(), "the swapped-in link is left alone, not replaced by our text"
+
+
+def test_parent_folder_swapped_for_a_symlink_during_the_checks_is_refused(client, api, root, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.md").write_text("keep\n")
+    folder = make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    f, body = opened(client, "dev", "references/a.md", "demo")
+
+    def swap():
+        (folder / "references").rename(folder / "references.old")
+        (folder / "references").symlink_to(outside)
+
+    _swap_during_check(api, monkeypatch, swap)
+    response = save(client, "dev", f["key"], "pwned\n", body["version"])
+    assert response.status_code in (404, 409), response.text
+    assert (outside / "a.md").read_text() == "keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["a.md"], "no temp file left outside either"
+
+
+def test_parent_folder_swapped_for_another_real_folder_during_the_checks_is_refused(client, api, root, monkeypatch):
+    folder = make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    f, body = opened(client, "dev", "references/a.md", "demo")
+
+    def swap():
+        (folder / "references").rename(folder / "references.old")
+        (folder / "references").mkdir()
+        (folder / "references" / "a.md").write_text("ref\n")
+
+    _swap_during_check(api, monkeypatch, swap)
+    response = save(client, "dev", f["key"], "mine\n", body["version"])
+    assert response.status_code == 409, response.text
+    assert (folder / "references" / "a.md").read_text() == "ref\n"
+    assert (folder / "references.old" / "a.md").read_text() == "ref\n"
+
+
+def test_memory_folder_swapped_for_a_symlink_during_the_checks_is_refused(client, api, root, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "MEMORY.md").write_text("keep")
+    write_memory(root, "dev", ["alpha fact"])
+    f, body = opened(client, "dev", "MEMORY.md")
+    memories = memory_file(root, "dev").parent
+
+    def swap():
+        memories.rename(memories.with_name("memories.old"))
+        memories.symlink_to(outside)
+
+    _swap_during_check(api, monkeypatch, swap)
+    response = save(client, "dev", f["key"], "alpha fact\n§\nbeta", body["version"])
+    assert response.status_code in (404, 409), response.text
+    assert (outside / "MEMORY.md").read_text() == "keep"
+
+
+def test_read_swapped_to_a_fifo_after_the_lookup_does_not_block(client, api, root, monkeypatch):
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    f = find(client, "dev", "SOUL.md")
+
+    def swap():
+        path.unlink()
+        os.mkfifo(path)
+
+    def unblock():  # so an old blocking open() returns instead of hanging the suite
+        time.sleep(3)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(fd)
+        except OSError:
+            pass
+
+    threading.Thread(target=unblock, daemon=True).start()
+    _swap_after_lookup(api, monkeypatch, swap)
+    started = time.monotonic()
+    response = read(client, "dev", f["key"])
+    assert time.monotonic() - started < 2, "the read waited on the FIFO"
+    assert response.status_code == 404, response.text
+
+
+def test_read_swapped_to_an_outside_file_after_the_lookup_is_refused(client, api, root, tmp_path, monkeypatch):
+    secret = tmp_path / "secret.md"
+    secret.write_text("TOP SECRET\n")
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    f = find(client, "dev", "SOUL.md")
+
+    def swap():
+        path.unlink()
+        path.symlink_to(secret)
+
+    _swap_after_lookup(api, monkeypatch, swap)
+    response = read(client, "dev", f["key"])
+    assert response.status_code == 404
+    assert "TOP SECRET" not in response.text
+
+
+def test_a_link_between_two_skills_is_not_listed_read_or_written(client, api, root):
+    other = make_skill(root, "dev", "other")
+    folder = make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    (folder / "references" / "b.md").symlink_to(other / "SKILL.md")
+    demo = next(s for s in prof(tree(client), "dev")["skills"] if s["name"] == "demo")
+    assert [f["name"] for f in demo["files"]] == ["SKILL.md", "references/a.md"]
+    with api._profile_scope(home_of(root, "dev")):
+        key = api._library_key("dev", folder / "references" / "b.md")
+    assert read(client, "dev", key).status_code == 404
+    assert save(client, "dev", key, "pwned\n", "absent").status_code == 404
+    assert (other / "SKILL.md").read_text() == skill_content("other")
+
+
+def test_a_skill_file_outside_its_own_skill_folder_is_refused(api, root):
+    """The own-folder rule on its own, apart from the no-symlink rule."""
+    make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    make_skill(root, "dev", "other")
+    with api._profile_scope(home_of(root, "dev")):
+        skills = home_of(root, "dev") / "skills"
+        assert api._skill_file_allowed(skills / "demo" / "references" / "a.md", skills / "demo")
+        assert not api._skill_file_allowed(skills / "other" / "SKILL.md", skills / "demo")
+
+
+@pytest.mark.parametrize("where", ["inside", "outside"])
+def test_a_file_with_a_second_hard_link_is_refused(client, root, tmp_path, where):
+    path = home_of(root, "dev") / "SOUL.md"
+    path.write_text("one\n")
+    twin = (home_of(root, "dev") if where == "inside" else tmp_path) / "twin.md"
+    os.link(path, twin)
+    f = find(client, "dev", "SOUL.md")
+    response = read(client, "dev", f["key"])
+    assert response.status_code == 403 and "hard link" in response.json()["detail"]
+    response = save(client, "dev", f["key"], "pwned\n", "absent")
+    assert response.status_code == 403 and "hard link" in response.json()["detail"]
+    assert twin.read_text() == "one\n"
+
+
+# --- review cycle 1: audit ledger and memory flags --------------------------------------------------
+
+def _ledger(root):
+    path = home_of(root, "dev") / "skills" / ".curator_ledger.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_skill_saves_land_in_hermes_audit_ledger(client, root):
+    make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    f, body = opened(client, "dev", "SKILL.md", "demo")
+    assert save(client, "dev", f["key"], skill_content("demo", "b"), body["version"]).status_code == 200
+    f, body = opened(client, "dev", "references/a.md", "demo")
+    assert save(client, "dev", f["key"], "new ref\n", body["version"]).status_code == 200
+    entries = _ledger(root)
+    assert [(e["action"], e["skill"], e["actor"]) for e in entries] == [("edit", "demo", "user"), ("write_file", "demo", "user")]
+    assert entries[1]["evidence"] == {"source": "skill-review library", "file_path": "references/a.md"}
+    assert [Path(p["path"]).name for p in entries[0]["after"]] == ["SKILL.md"]
+
+
+def test_identity_and_memory_saves_do_not_touch_the_skill_ledger(client, root):
+    (home_of(root, "dev") / "SOUL.md").write_text("one\n")
+    f, body = opened(client, "dev", "SOUL.md")
+    assert save(client, "dev", f["key"], "two\n", body["version"]).status_code == 200
+    assert _ledger(root) == []
+
+
+def test_memory_save_refused_when_memory_is_disabled(client, root):
+    config(root, "dev", "memory:\n  memory_enabled: false\n")
+    write_memory(root, "dev", ["alpha fact"])
+    f, body = opened(client, "dev", "MEMORY.md")
+    response = save(client, "dev", f["key"], "alpha fact\n§\nbeta", body["version"])
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Built-in MEMORY.md writes are disabled in memory config."
+    assert read_memory(root, "dev") == ["alpha fact"]
+    f, _body = opened(client, "dev", "USER.md")
+    assert save(client, "dev", f["key"], "Name is Ben", "absent").status_code == 200, "USER.md has its own flag"
+
+
+def test_user_save_refused_when_the_user_profile_is_disabled(client, root):
+    config(root, "dev", "memory:\n  user_profile_enabled: false\n")
+    f, _body = opened(client, "dev", "USER.md")
+    response = save(client, "dev", f["key"], "Name is Ben", "absent")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Built-in USER.md writes are disabled in memory config."
+    assert not memory_file(root, "dev", "user").exists()
+
+
+# --- review cycle 1: one test per defence layer, so each is checked on its own ----------------------
+
+def test_read_with_the_parent_folder_swapped_to_an_outside_folder_is_refused(client, api, root, tmp_path, monkeypatch):
+    """The O_NOFOLLOW folder walk alone guards a read: there is no identity check on GET."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.md").write_text("TOP SECRET\n")
+    folder = make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    f = find(client, "dev", "references/a.md", "demo")
+
+    def swap():
+        (folder / "references").rename(folder / "references.old")
+        (folder / "references").symlink_to(outside)
+
+    _swap_after_lookup(api, monkeypatch, swap)
+    response = read(client, "dev", f["key"])
+    assert response.status_code == 404
+    assert "TOP SECRET" not in response.text
+
+
+def test_memory_folder_swapped_for_another_real_folder_with_no_file_is_refused(client, api, root, monkeypatch):
+    """With no file to compare (USER.md not created yet), only the folder identity check sees the swap."""
+    f, body = opened(client, "dev", "USER.md")
+    assert body["version"] == "absent"
+    memories = memory_file(root, "dev", "user").parent
+
+    def swap():
+        memories.rename(memories.with_name("memories.old"))
+        memories.mkdir()
+
+    _swap_during_check(api, monkeypatch, swap)
+    response = save(client, "dev", f["key"], "Name is Ben", "absent")
+    assert response.status_code == 409, response.text
+    assert not (memories / "USER.md").exists()
+    assert not memories.with_name("memories.old").joinpath("USER.md").exists()
+
+
+def test_a_swap_after_the_last_check_still_writes_into_the_checked_folder(client, api, root, tmp_path, monkeypatch):
+    """The temp file and the rename are relative to the folder fd, so a parent swapped for a
+    symlink after the final identity check cannot redirect the write."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.md").write_text("keep\n")
+    folder = make_skill(root, "dev", "demo", {"references/a.md": "ref\n"})
+    f, body = opened(client, "dev", "references/a.md", "demo")
+    real, calls = api._identity, []
+
+    def counting(st):
+        calls.append(1)
+        out = real(st)
+        if len(calls) == 4:  # read: folder; write: folder, file now, file before -> then the write
+            (folder / "references").rename(folder / "references.old")
+            (folder / "references").symlink_to(outside)
+        return out
+
+    monkeypatch.setattr(api, "_identity", counting)
+    response = save(client, "dev", f["key"], "mine\n", body["version"])
+    assert len(calls) >= 4
+    assert (outside / "a.md").read_text() == "keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["a.md"]
+    if response.status_code == 200:
+        assert (folder / "references.old" / "a.md").read_text() == "mine\n"
