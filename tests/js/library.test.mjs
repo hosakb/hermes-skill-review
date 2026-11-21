@@ -74,7 +74,7 @@ const TREE = {
             file('council00000refa', 'skill', 'references/a.md', 1, { skill: 'council', review: { subsystem: 'skills', key: 'reviewRefKey0000' } })
           ]
         },
-        { name: 'shared', external: true, pending: 0, files: [file('shared0000000skl', 'skill', 'SKILL.md', 0, { skill: 'shared' })] }
+        { name: 'shared', pending: 0, files: [file('shared0000000skl', 'skill', 'SKILL.md', 0, { skill: 'shared' })] }
       ],
       staged: [{ file: 'release-notes/SKILL.md', subsystem: 'skills', pending: 1, review: { subsystem: 'skills', key: 'reviewNewKey0000' } }]
     },
@@ -496,4 +496,50 @@ test('the pending link with unsaved text asks to discard first', () => {
   confirmDiscard()
   assert.equal($mode.get(), 'pending')
   assert.equal($selection.get(), 'memory/dev/reviewMemKey0000')
+})
+
+// --- review cycle 1: late results -----------------------------------------------------------------
+
+const later = () => {
+  let settle
+  const promise = new Promise((resolve, reject) => { settle = { reject, resolve } })
+  return { promise, settle }
+}
+const OTHER = () => ({ ...fresh(), id: libId('dev', 'mem0000000000000'), key: 'mem0000000000000', name: 'MEMORY.md', original: 'other', text: 'other' })
+
+test('a save that finishes after the user moved to another file leaves that file alone', async () => {
+  reset()
+  const { promise, settle } = later()
+  const qc = fakeQueryClient()
+  const run = performLibrarySave({ queryClient: qc, rest: () => promise, session: dirty(), t })
+  const other = OTHER()
+  $libEditor.set(other)
+  settle.resolve({ status: 'saved', version: 'def:2' })
+  await run
+  assert.deepEqual($libEditor.get(), other)
+  assert.equal(H.toasts[0]?.kind, 'success', 'the save still happened, so it still says so')
+  assert.ok(qc.invalidated.length, 'and the tree still refreshes')
+})
+
+test('a failed save that finishes after the file was closed does not reopen it', async () => {
+  reset()
+  for (const failure of [httpError(409, 'stale'), httpError(422, 'bad'), new Error('socket hang up')]) {
+    const { promise, settle } = later()
+    const run = performLibrarySave({ queryClient: fakeQueryClient(), rest: () => promise, session: dirty(), t })
+    $libEditor.set(null)
+    settle.reject(failure)
+    await run
+    assert.equal($libEditor.get(), null)
+  }
+})
+
+test('a reload that finishes after the user moved on is not applied', async () => {
+  reset()
+  const { promise, settle } = later()
+  const run = reloadLibraryFile({ queryClient: fakeQueryClient(), rest: () => promise, session: { ...dirty(), conflict: 'stale' }, t })
+  const other = OTHER()
+  $libEditor.set(other)
+  settle.resolve({ ...SOUL, text: 'disk' })
+  await run
+  assert.deepEqual($libEditor.get(), other)
 })

@@ -2409,7 +2409,7 @@ export function treeRows(profiles, open = {}, query = '') {
     for (const s of p.skills ?? []) {
       const sid = `s:${p.profile}:${s.files?.[0]?.key ?? s.name}`
       const sOpen = all || open[sid] === true
-      rows.push({ depth: 2, external: Boolean(s.external), id: sid, label: s.name, open: sOpen, pending: s.pending ?? 0, profile: p.profile, skill: s.name, type: 'skill' })
+      rows.push({ depth: 2, id: sid, label: s.name, open: sOpen, pending: s.pending ?? 0, profile: p.profile, skill: s.name, type: 'skill' })
 
       if (sOpen) {
         ;(s.files ?? []).forEach(f => rows.push(fileRow(f, 3, s.name)))
@@ -2477,6 +2477,14 @@ function refreshAfterSave(queryClient) {
   queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
 }
 
+/** Set the editor state only while it still holds `session`'s file: a result that arrives after
+ *  the user discarded the text or opened another file is not applied to that file. */
+const setIfStill = (session, next) => {
+  if ($libEditor.get()?.id === session.id) {
+    $libEditor.set(next)
+  }
+}
+
 /** PUT the text with the version it was opened at. Saved: the file is clean at the new version.
  *  409: the text stays and the editor offers Reload. 422: the text stays with Hermes's reason. */
 export async function performLibrarySave({ session, rest, queryClient, t }) {
@@ -2493,18 +2501,18 @@ export async function performLibrarySave({ session, rest, queryClient, t }) {
     const { detail, status } = restError(error)
 
     if (status === 409) {
-      $libEditor.set({ ...session, conflict: detail || t('libConflict'), error: null, saving: false })
+      setIfStill(session, { ...session, conflict: detail || t('libConflict'), error: null, saving: false })
     } else if (status === 422) {
-      $libEditor.set({ ...session, conflict: null, error: detail, saving: false })
+      setIfStill(session, { ...session, conflict: null, error: detail, saving: false })
     } else {
-      $libEditor.set({ ...session, conflict: null, error: detail || t('libSaveFailed'), saving: false })
+      setIfStill(session, { ...session, conflict: null, error: detail || t('libSaveFailed'), saving: false })
       host.notifyError(error, t('libSaveFailed'))
     }
 
     return null
   }
 
-  $libEditor.set({ ...session, conflict: null, error: null, original: session.text, saving: false, version: result?.version ?? session.version })
+  setIfStill(session, { ...session, conflict: null, error: null, original: session.text, saving: false, version: result?.version ?? session.version })
   host.notify({ kind: 'success', message: t('libSaved', session.name) })
   refreshAfterSave(queryClient)
 
@@ -2518,13 +2526,13 @@ export async function reloadLibraryFile({ session, rest, queryClient, t }) {
   try {
     data = await rest(libraryFilePath(session.profile, session.key))
   } catch (error) {
-    $libEditor.set({ ...session, error: restError(error).detail || t('libReloadFailed'), saving: false })
+    setIfStill(session, { ...session, error: restError(error).detail || t('libReloadFailed'), saving: false })
     host.notifyError(error, t('libReloadFailed'))
 
     return null
   }
 
-  $libEditor.set(librarySession(null, session.id, data))
+  setIfStill(session, librarySession(null, session.id, data))
   queryClient.invalidateQueries({ queryKey: [ID, 'library'] })
 
   return data
@@ -2680,7 +2688,6 @@ function treeRow({ row, selected, dirty, onSelect, onToggle, t }) {
     children: [
       caret,
       jsx('span', { style: row.type === 'file' || row.type === 'staged' ? LIB_STYLES.fileLabel : { ...LIB_STYLES.label, fontWeight: row.type === 'profile' ? 600 : 400 }, children: row.label }),
-      row.external ? jsx(Badge, { size: 'xs', variant: 'outline', children: t('libExternal') }) : null,
       row.type === 'file' && row.file?.exists === false ? jsx('span', { style: STYLES.muted, children: t('libNotCreated') }) : null,
       row.error ? jsx('span', { style: STYLES.muted, children: t('libProfileError') }) : null,
       dirty ? jsx('span', { 'aria-label': t('libUnsaved'), 'data-dirty': true, role: 'img', style: LIB_STYLES.dot }) : null,
@@ -2943,11 +2950,10 @@ const LIB_EN = {
   libEditorLabel: name => `Text of ${name}`,
   libEmptyBody: 'No profile files to show.',
   libEmptyTitle: 'Nothing here',
-  libExternal: 'external',
   libGroup_identity: 'Identity',
   libGroup_memory: 'Memory',
   libGroup_skills: 'Skills',
-  libGroup_staged: 'Not on disk yet',
+  libGroup_staged: 'Only in Pending',
   libKind_identity: 'Identity',
   libKind_memory: 'Memory',
   libKind_skill: 'Skill',
@@ -2967,7 +2973,7 @@ const LIB_EN = {
   libSearchNone: query => `Nothing matches "${query}".`,
   libSelectBody: 'Pick a file in the library to read or edit it.',
   libSelectTitle: 'No file selected',
-  libStagedTip: name => `${name} is only a pending change so far. Open it in Pending.`,
+  libStagedTip: name => `${name} is not in the library: a new file, or a skill outside this profile's folder. Open its changes in Pending.`,
   libStraightToFile: 'Saves straight to the file',
   libUnsaved: 'Unsaved changes'
 }
