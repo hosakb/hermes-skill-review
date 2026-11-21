@@ -273,26 +273,26 @@ def list_pending_all() -> dict[str, Any]:
     return {"profiles": profiles, "items": items, "total": len(items), "totals": totals}
 
 
-@router.get("/pending/{subsystem}/{profile}/{pending_id}/diff")
-def pending_diff(subsystem: str, profile: str, pending_id: str) -> dict[str, Any]:
+@router.get("/pending/{subsystem}/{owner}/{pending_id}/diff")
+def pending_diff(subsystem: str, owner: str, pending_id: str) -> dict[str, Any]:
     from tools import write_approval as wa
     _check_subsystem(subsystem)
     _check_id(pending_id)
-    home = _resolve_profile(profile)
+    home = _resolve_profile(owner)
     with _profile_scope(home):
         record = wa.get_pending(subsystem, pending_id)
         if record is None:
-            return {"status": "already_handled", "id": pending_id, "profile": profile, "subsystem": subsystem}
+            return {"status": "already_handled", "id": pending_id, "profile": owner, "subsystem": subsystem}
         sections = _sections(subsystem, record)
-    return {"status": "ok", "item": _summarise(subsystem, profile, record), "sections": sections}
+    return {"status": "ok", "item": _summarise(subsystem, owner, record), "sections": sections}
 
 
-@router.post("/pending/{subsystem}/{profile}/{pending_id}/accept")
-def accept(subsystem: str, profile: str, pending_id: str) -> dict[str, Any]:
+@router.post("/pending/{subsystem}/{owner}/{pending_id}/accept")
+def accept(subsystem: str, owner: str, pending_id: str) -> dict[str, Any]:
     _check_subsystem(subsystem)
     _check_id(pending_id)
-    home = _resolve_profile(profile)
-    base = {"id": pending_id, "profile": profile, "subsystem": subsystem}
+    home = _resolve_profile(owner)
+    base = {"id": pending_id, "profile": owner, "subsystem": subsystem}
     with _resolve_lock, _profile_scope(home), _queue_lock(subsystem):
         outcome = _claim_and_resolve(subsystem, pending_id, op_fingerprint=None, apply=True)
     if outcome["status"] == "already_handled":
@@ -303,12 +303,12 @@ def accept(subsystem: str, profile: str, pending_id: str) -> dict[str, Any]:
     return {"status": "applied", **base, "item": outcome["item"]}
 
 
-@router.post("/pending/{subsystem}/{profile}/{pending_id}/reject")
-def reject(subsystem: str, profile: str, pending_id: str) -> dict[str, Any]:
+@router.post("/pending/{subsystem}/{owner}/{pending_id}/reject")
+def reject(subsystem: str, owner: str, pending_id: str) -> dict[str, Any]:
     _check_subsystem(subsystem)
     _check_id(pending_id)
-    home = _resolve_profile(profile)
-    base = {"id": pending_id, "profile": profile, "subsystem": subsystem}
+    home = _resolve_profile(owner)
+    base = {"id": pending_id, "profile": owner, "subsystem": subsystem}
     with _resolve_lock, _profile_scope(home), _queue_lock(subsystem):
         outcome = _claim_and_resolve(subsystem, pending_id, op_fingerprint=None, apply=False)
     if outcome["status"] == "already_handled":
@@ -889,19 +889,19 @@ def list_files(kind: str = "all") -> dict[str, Any]:
     return {"files": files, "profile_errors": errors}
 
 
-@router.get("/files/{profile}/{subsystem}/{key}/diff")
-def file_diff(profile: str, subsystem: str, key: str) -> dict[str, Any]:
+@router.get("/files/{owner}/{subsystem}/{key}/diff")
+def file_diff(owner: str, subsystem: str, key: str) -> dict[str, Any]:
     _check_subsystem(subsystem)
     _check_key(key)
-    home = _resolve_profile(profile)
+    home = _resolve_profile(owner)
     with _profile_scope(home):
-        entry = _find_entry(subsystem, profile, key)
+        entry = _find_entry(subsystem, owner, key)
         if entry is None:
             return {"status": "gone"}
         memo: dict = {}
         cur, blocks, version = _evaluate(subsystem, entry, memo)
         _store(memo)
-    return {"status": "ok", "file": _file_info(profile, subsystem, entry, blocks, version),
+    return {"status": "ok", "file": _file_info(owner, subsystem, entry, blocks, version),
             "segments": _segments(cur, blocks)}
 
 
@@ -918,14 +918,14 @@ def _resolve_block(profile: str, subsystem: str, key: str, block_id: str, apply:
     return {"status": outcome["status"], "error": outcome["error"], "file_gone": gone}
 
 
-@router.post("/files/{profile}/{subsystem}/{key}/blocks/{block_id}/accept")
-def accept_block(profile: str, subsystem: str, key: str, block_id: str) -> dict[str, Any]:
-    return _resolve_block(profile, subsystem, key, block_id, apply=True)
+@router.post("/files/{owner}/{subsystem}/{key}/blocks/{block_id}/accept")
+def accept_block(owner: str, subsystem: str, key: str, block_id: str) -> dict[str, Any]:
+    return _resolve_block(owner, subsystem, key, block_id, apply=True)
 
 
-@router.post("/files/{profile}/{subsystem}/{key}/blocks/{block_id}/reject")
-def reject_block(profile: str, subsystem: str, key: str, block_id: str) -> dict[str, Any]:
-    return _resolve_block(profile, subsystem, key, block_id, apply=False)
+@router.post("/files/{owner}/{subsystem}/{key}/blocks/{block_id}/reject")
+def reject_block(owner: str, subsystem: str, key: str, block_id: str) -> dict[str, Any]:
+    return _resolve_block(owner, subsystem, key, block_id, apply=False)
 
 
 def _resolve_all(profile: str, subsystem: str, key: str, apply: bool) -> dict[str, Any]:
@@ -956,14 +956,14 @@ def _resolve_all(profile: str, subsystem: str, key: str, apply: bool) -> dict[st
     return {"results": results}
 
 
-@router.post("/files/{profile}/{subsystem}/{key}/accept-all")
-def accept_all(profile: str, subsystem: str, key: str) -> dict[str, Any]:
-    return _resolve_all(profile, subsystem, key, apply=True)
+@router.post("/files/{owner}/{subsystem}/{key}/accept-all")
+def accept_all(owner: str, subsystem: str, key: str) -> dict[str, Any]:
+    return _resolve_all(owner, subsystem, key, apply=True)
 
 
-@router.post("/files/{profile}/{subsystem}/{key}/reject-all")
-def reject_all(profile: str, subsystem: str, key: str) -> dict[str, Any]:
-    return _resolve_all(profile, subsystem, key, apply=False)
+@router.post("/files/{owner}/{subsystem}/{key}/reject-all")
+def reject_all(owner: str, subsystem: str, key: str) -> dict[str, Any]:
+    return _resolve_all(owner, subsystem, key, apply=False)
 
 
 # =================================================================================================
@@ -1205,13 +1205,13 @@ def _edit(subsystem: str, profile: str, key: str, block_id: str, text: str, appl
     return _claim_and_rewrite(subsystem, profile, key, record_id, fingerprint, field, text)
 
 
-@router.get("/files/{profile}/{subsystem}/{key}/edits")
-def file_edits(profile: str, subsystem: str, key: str) -> dict[str, Any]:
+@router.get("/files/{owner}/{subsystem}/{key}/edits")
+def file_edits(owner: str, subsystem: str, key: str) -> dict[str, Any]:
     _check_subsystem(subsystem)
     _check_key(key)
-    home = _resolve_profile(profile)
+    home = _resolve_profile(owner)
     with _profile_scope(home):
-        entry = _find_entry(subsystem, profile, key)
+        entry = _find_entry(subsystem, owner, key)
         if entry is None:
             return {"status": "gone"}
         blocks = {b["id"]: b for b in _evaluate_uncached(subsystem, entry)[1]}
@@ -1231,21 +1231,21 @@ def file_edits(profile: str, subsystem: str, key: str) -> dict[str, Any]:
     return {"status": "ok", "blocks": out}
 
 
-@router.post("/files/{profile}/{subsystem}/{key}/blocks/{block_id}/edit")
-def edit_block(profile: str, subsystem: str, key: str, block_id: str, raw: Any = Body(...)) -> dict[str, Any]:
+@router.post("/files/{owner}/{subsystem}/{key}/blocks/{block_id}/edit")
+def edit_block(owner: str, subsystem: str, key: str, block_id: str, raw: Any = Body(...)) -> dict[str, Any]:
     text, apply = _edit_body(raw)
     _check_subsystem(subsystem)
     _check_key(key)
     _parse_block_id(block_id)
     if len(text) > _EDIT_MAX_CHARS:
         raise HTTPException(status_code=413, detail=f"an edit is at most {_EDIT_MAX_CHARS:,} characters")
-    home = _resolve_profile(profile)
+    home = _resolve_profile(owner)
     with _resolve_lock, _profile_scope(home):
         with _queue_lock(subsystem):
-            outcome = _edit(subsystem, profile, key, block_id, text, apply)
+            outcome = _edit(subsystem, owner, key, block_id, text, apply)
             if outcome["status"] in ("applied", "saved"):
                 _forget_cached(subsystem)  # as Remove entirely does: never answer an edited file from the cache
-            gone = key not in _file_entries(subsystem, profile)
+            gone = key not in _file_entries(subsystem, owner)
     return {**outcome, "file_gone": gone}
 
 
@@ -1277,13 +1277,13 @@ def _login_name() -> str:
         return os.environ.get("USER") or os.environ.get("USERNAME") or ""
 
 
-@router.get("/files/{profile}/{subsystem}/{key}/location")
-def file_location(profile: str, subsystem: str, key: str) -> dict[str, Any]:
+@router.get("/files/{owner}/{subsystem}/{key}/location")
+def file_location(owner: str, subsystem: str, key: str) -> dict[str, Any]:
     _check_subsystem(subsystem)
     _check_key(key)
-    home = _resolve_profile(profile)
+    home = _resolve_profile(owner)
     with _profile_scope(home):
-        entry = _find_entry(subsystem, profile, key)
+        entry = _find_entry(subsystem, owner, key)
         if entry is None:
             return {"status": "gone"}
         root, target, refused = _live_target(subsystem, entry)
@@ -1357,13 +1357,13 @@ def _forget_cached(subsystem: str) -> None:
             del _cache[cache_key]
 
 
-@router.post("/files/{profile}/{subsystem}/{key}/blocks/{block_id}/remove-entry")
-def remove_entry_block(profile: str, subsystem: str, key: str, block_id: str) -> dict[str, Any]:
+@router.post("/files/{owner}/{subsystem}/{key}/blocks/{block_id}/remove-entry")
+def remove_entry_block(owner: str, subsystem: str, key: str, block_id: str) -> dict[str, Any]:
     from tools import write_approval as wa
     _check_subsystem(subsystem)
     _check_key(key)
     record_id, fingerprint = _parse_block_id(block_id)
-    home = _resolve_profile(profile)
+    home = _resolve_profile(owner)
     if subsystem != MEMORY:
         return {"status": "failed", "error": "Remove entirely works only on memory entries.", "file_gone": False}
     with _resolve_lock, _profile_scope(home):
@@ -1374,16 +1374,16 @@ def remove_entry_block(profile: str, subsystem: str, key: str, block_id: str) ->
                 (op, label) for _i, op, label in _record_ops(subsystem, record) if _fingerprint(op) == fingerprint]
             if found:
                 op, label = found[0]
-                entry = _file_entries(subsystem, profile).get(key)
-                if _file_key(profile, subsystem, label) != key or entry is None:
+                entry = _file_entries(subsystem, owner).get(key)
+                if _file_key(owner, subsystem, label) != key or entry is None:
                     outcome = {"status": "failed", "error": "that change belongs to another file"}
                 elif refusal := _removal_refusal(entry, block_id, op):
                     outcome = {"status": "failed", "error": refusal}
                 else:
                     outcome = _claim_and_resolve(subsystem, record_id, op_fingerprint=fingerprint, apply=True,
-                                                 expected_key=key, profile=profile, apply_record=_remove_record)
+                                                 expected_key=key, profile=owner, apply_record=_remove_record)
                     if outcome["status"] == "applied":
                         outcome["status"] = "removed"
                         _forget_cached(subsystem)
-            gone = key not in _file_entries(subsystem, profile)
+            gone = key not in _file_entries(subsystem, owner)
     return {"status": outcome["status"], "error": outcome["error"], "file_gone": gone}
