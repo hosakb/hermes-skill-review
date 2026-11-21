@@ -88,7 +88,8 @@ test('register adds no pane at startup; Review registers one pane on the workspa
   assert.equal(LIST_PANE, 'skill-review:list')
   const [pane] = panes
   assert.deepEqual(pane.data.dock, { pane: 'workspace', pos: 'right' }, 'the pane splits the workspace right edge')
-  assert.equal(pane.data.placement, 'main')
+  assert.equal(pane.data.placement, 'right')
+  assert.equal(pane.data.hideOnly, true)
   assert.equal(pane.data.width, '720px', 'wide enough for the list and the diff side by side')
   assert.equal(pane.render().type, ReviewPane)
   assert.ok(!ctx.registered.some(c => c.area === 'routes'), 'no route when the desktop has the pane APIs')

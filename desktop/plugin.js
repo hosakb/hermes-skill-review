@@ -3069,18 +3069,28 @@ const EXPAND_EN = {
  * collapsed zone, so in practice it opens straight away.
  *
  * Desktop cannot dismiss a pane for a plugin at startup. This is the plugin's only pane, and
- * Desktop turns a plugin off when its only pane is closed (closeTreePane in the tree store): its X,
- * cmd-W and the Close menu rows do that. Capabilities > Plugins turns it back on. Collapsing the tab
- * keeps it.
+ * Desktop turns a plugin off when its only pane is closed (closeTreePane in the tree store). So the
+ * pane is hideOnly: no X, no middle or cmd-click close, no Close menu rows; the zone menu's Show/Hide
+ * rows and the palette's "Toggle Pending writes tab" replace them, and collapsing still works.
+ * placement 'right' keeps cmd-W away from it too: cmd-W closes the active tab of a zone that holds a
+ * 'main' pane and does not check hideOnly. Known gap: if the user drags this tab into the chat zone,
+ * cmd-W there still closes it and turns the plugin off.
  */
 export function reviewPaneContribution() {
   return {
     id: 'list', // skill-review:list, the same id as before, so saved layouts still match it
     area: 'panes',
     title: en.listTitle,
-    // Its own tiling column on the workspace's right edge, like Bots' Routines pane. 'right'
-    // placement is the collapsible right sidebar's role, so this docks explicitly instead.
-    data: { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, defaultCollapsed: true, width: '720px', minWidth: '240px' },
+    // Its own tiling column on the workspace's right edge (the dock), with the right side's role:
+    // the right-sidebar toggle (cmd-J) can fold it with the other right columns.
+    data: {
+      placement: 'right',
+      hideOnly: true,
+      dock: { pane: 'workspace', pos: 'right' },
+      defaultCollapsed: true,
+      width: '720px',
+      minWidth: '240px'
+    },
     render: () => jsx(ReviewPane, {})
   }
 }

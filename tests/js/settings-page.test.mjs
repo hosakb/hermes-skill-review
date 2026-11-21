@@ -97,13 +97,13 @@ test('register adds one settings page: id settings, titled Skill Review, with an
   dispose(ctx)
 })
 
-test('openReview registers only the list pane, with today\'s data', () => {
+test('openReview registers only the list pane: placement right, hideOnly', () => {
   const ctx = start()
   openReview()
   assert.deepEqual(panesOf(ctx).map(p => p.id), ['list'])
   assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, 'register:list', `reveal:${LIST_PANE}`])
   const list = reviewPaneContribution()
-  assert.deepEqual(list.data, { placement: 'main', dock: { pane: 'workspace', pos: 'right' }, defaultCollapsed: true, width: '720px', minWidth: '240px' })
+  assert.deepEqual(list.data, { placement: 'right', hideOnly: true, dock: { pane: 'workspace', pos: 'right' }, defaultCollapsed: true, width: '720px', minWidth: '240px' })
   assert.equal(list.render().type, ReviewPane)
   assert.ok(!/SETTINGS_PANE|settingsPaneContribution|id: 'settings', \/\/ skill-review:settings/.test(src), 'no settings pane any more')
   dispose(ctx)
