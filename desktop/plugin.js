@@ -2037,7 +2037,8 @@ export function FilesListPane() {
         style: LIST_STYLES.controls,
         children: [
           jsx(SettingsSummary, { hidden: v.hidden, profiles: v.profiles, sort: v.sort, t }),
-          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t })
+          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t }),
+          jsx(SidebarHideControl, { t })
         ]
       }),
       jsx('div', {
@@ -2773,7 +2774,8 @@ export function LibraryListPane() {
         style: LIST_STYLES.controls,
         children: [
           jsx('span', { style: { ...STYLES.muted, ...STYLES.ellipsis }, children: profiles.length ? profileLabel(summary, hidden, t) : '' }),
-          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t })
+          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t }),
+          jsx(SidebarHideControl, { t })
         ]
       }),
       jsx(LibrarySearch, { onChange: value => $libSearch.set(value), t, value: search }),
@@ -3933,6 +3935,61 @@ export function SettingsGearButton({ onOpen, t }) {
   })
 }
 
+/** The built-in action behind Cmd/Ctrl+J and the title bar's right sidebar button. */
+const TOGGLE_RIGHT_SIDEBAR = 'view.toggleRightSidebar'
+
+/** Whether this host lets the plugin run that action: ctx.runAction exists (newer hosts) and, when
+ *  the host lists the allowed ids, the toggle is among them. False on the route page fallback, where
+ *  there is no pane to hide. */
+export function canHideSidebar() {
+  if (useRouteFallback || typeof CTX?.runAction !== 'function') {
+    return false
+  }
+
+  if (typeof CTX.listActions !== 'function') {
+    return true
+  }
+
+  try {
+    return CTX.listActions().some(a => a?.id === TOGGLE_RIGHT_SIDEBAR)
+  } catch {
+    return false
+  }
+}
+
+/** Collapse the whole right sidebar, the same as Cmd/Ctrl+J. Desktop keeps a zone's last visible tab
+ *  from being hidden, so with Files hidden this is the only way to put the review tab away. The host
+ *  refuses a denied or early call with { ok: false } and a console warning; a throw is swallowed too. */
+export function hideSidebar() {
+  if (!canHideSidebar()) {
+    return
+  }
+
+  try {
+    CTX.runAction(TOGGLE_RIGHT_SIDEBAR)
+  } catch {
+    // Older or broken host: nothing to do, the shortcut still works.
+  }
+}
+
+/** The pane header's Hide button, next to the gear. Absent when the host cannot run the toggle. */
+export function SidebarHideControl({ t }) {
+  if (!canHideSidebar()) {
+    return null
+  }
+
+  return jsx(Button, {
+    'aria-label': t('hideSidebarTip'),
+    onClick: hideSidebar,
+    size: 'xs',
+    style: STYLES.button,
+    title: t('hideSidebarTip'),
+    type: 'button',
+    variant: 'ghost',
+    children: t('hideSidebar')
+  })
+}
+
 /** autoOpen as a settings row: the SDK's ToggleRow, or the plain checkbox on older hosts. */
 export function AutoOpenRow() {
   const t = usePluginI18n(ID)
@@ -4000,6 +4057,8 @@ export const $inlineSettings = atom(false)
 
 const SETTINGS_EN = {
   autoOpenHelp: 'Off: a new change shows a popup or lights up the Review chip, as chosen above.',
+  hideSidebar: 'Hide',
+  hideSidebarTip: 'Hide the sidebar (Ctrl+J / Cmd+J). Reopen it from the title bar.',
   openSettings: 'Skill Review settings',
   settingsNoProfiles: 'Profiles show up here once they have pending changes.',
   settingsNotifyHelp: 'Popup shows a notification. Light up icon marks the Review chip instead.',
