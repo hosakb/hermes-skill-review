@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { register } from 'node:module'
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
@@ -588,4 +589,57 @@ test('a late 409 after discarding and reopening the same file does not bring the
   settle.resolve({ status: 'saved', version: 'def:2' })
   await run
   assert.deepEqual($libEditor.get(), reopened, 'a late success does not mark the new text saved either')
+})
+
+// --- read-only memory and skill files (no public helper for their save checks yet) -----------------
+
+const MEMORY_READ_ONLY = {
+  status: 'ok',
+  file: { key: 'memory0000000000', kind: 'memory', name: 'MEMORY.md', skill: null, exists: true, size: 10, mtime: 1,
+    read_only: true, read_only_reason: 'Library shows memory files read-only for now.' },
+  text: 'alpha fact',
+  version: 'v1',
+  limit: null
+}
+
+test('a read-only file opens without Save or Revert, with a read-only text box and its reason', () => {
+  reset()
+  const id = libId('dev', 'memory0000000000')
+  const session = librarySession(null, id, MEMORY_READ_ONLY)
+  assert.equal(session.readOnly, true)
+  assert.equal(session.readOnlyReason, 'Library shows memory files read-only for now.')
+  const view = LibraryEditorView({ meta: { file: MEMORY_READ_ONLY.file, profile: 'dev' }, session, t })
+  assert.equal(byLabel(view, 'libSave'), undefined)
+  assert.equal(byLabel(view, 'libRevert'), undefined)
+  assert.match(text(view), /libReadOnly/)
+  assert.match(text(view), /Library shows memory files read-only for now\./)
+  assert.match(text(view), /libReadOnlyFooter/)
+  const [area] = walk(view).filter(n => n.type === Textarea)
+  assert.equal(area.props.readOnly, true)
+  changeLibraryText(session, 'typed anyway')
+  assert.equal($libEditor.get(), null, 'typing never starts an edit of a read-only file')
+})
+
+test('an identity file stays editable', () => {
+  reset()
+  const session = fresh()
+  assert.equal(session.readOnly, false)
+  const view = LibraryEditorView({ meta: { file: SOUL.file, profile: 'dev' }, session, t })
+  assert.ok(byLabel(view, 'libSave'))
+  assert.doesNotMatch(text(view), /libReadOnly/)
+})
+
+test('the read-only and missing-API strings are plain', () => {
+  for (const key of ['libReadOnly', 'libReadOnlyFooter', 'libNoReviewApi', 'needsApi', 'needsApiTitle']) {
+    assert.equal(typeof messages.en[key], 'string', key)
+    assert.doesNotMatch(messages.en[key], /—/, key)
+  }
+})
+
+test('the Pending list shows the missing-API message before any error or empty state', () => {
+  const src = readFileSync(pluginPath, 'utf8')
+  const pane = src.slice(src.indexOf('export function FilesListPane()'), src.indexOf('/** Empty list: why'))
+  assert.ok(pane.indexOf('v.unavailable') > 0 && pane.indexOf('v.unavailable') < pane.indexOf('v.isError) {'))
+  assert.match(pane, /jsx\(EmptyState, \{ description: v\.unavailable, title: t\('needsApiTitle'\) \}\)/)
+  assert.match(pane, /t\('needsReview', v\.needsReview\)/)
 })

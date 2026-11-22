@@ -300,10 +300,3 @@ test('a stale block keeps its grey treatment, shows dimmed marks and no Accept',
   assert.ok(live.every(s => s.props.style === MARK_STYLES[s.type === 'del' ? 'remove' : 'add']))
 })
 
-test('the per-item diff view marks a replaced line in a unified hunk, and not a new file', () => {
-  const patch = { kind: 'patch', text: '--- a/SKILL.md\n+++ b/SKILL.md\n@@ -1,3 +1,3 @@\n keep\n-use foo_bar here\n+use foo_baz here\n keep2\n' }
-  const spans = markNodes(expand(DiffView({ sections: [patch], newFileLabel: 'new', t })))
-  assert.deepEqual(spans.map(s => [s.type, s.props.children]), [['del', 'r'], ['ins', 'z']])
-  const create = { kind: 'create', text: 'line one\nline two\n' }
-  assert.equal(markNodes(expand(DiffView({ sections: [create], newFileLabel: 'new', t }))).length, 0)
-})

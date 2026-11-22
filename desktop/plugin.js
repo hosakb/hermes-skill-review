@@ -71,7 +71,6 @@ let hasSettingsPage = false
 /** UI state shared by both panes. Module-level atoms, so a pane remount (drag, tab switch, reload of
  *  the layout) keeps the selection and filters. */
 export const $selection = atom(null)
-const $scope = atom(null) // null: follow the focused profile while it has items, else all
 export const $kind = atom('all')
 const $confirming = atom(null) // key of the item whose reject dialog is open
 
@@ -90,9 +89,6 @@ export const countBySubsystem = items => ({
   skills: items.filter(item => item.subsystem === 'skills').length
 })
 
-export const pendingPath = (item, verb) =>
-  `/pending/${encodeURIComponent(item.subsystem)}/${encodeURIComponent(item.profile)}/${encodeURIComponent(item.id)}/${verb}`
-
 /** Keys that were not announced before, and the announced set to keep (pruned to what is still pending). */
 export function planAutoOpen(items, announced) {
   const known = new Set(announced)
@@ -101,25 +97,6 @@ export function planAutoOpen(items, announced) {
   const keep = current.filter(key => known.has(key) || fresh.includes(key))
 
   return { fresh, keep }
-}
-
-/** Items for the chosen profile scope ('focused' | 'all') and kind ('all' | 'skills' | 'memory'). */
-/** After resolving `key`, the item to select next: the following one, else the previous, else none. */
-export function nextKeyAfter(items, key) {
-  const keys = items.map(itemKey)
-  const index = keys.indexOf(key)
-
-  if (index < 0) {
-    return keys[0] ?? null
-  }
-
-  return keys[index + 1] ?? keys[index - 1] ?? null
-}
-
-export function visibleItems(items, scope, focused, kind = 'all') {
-  const inScope = scope === 'all' ? items : items.filter(item => item.profile === focused)
-
-  return kind === 'all' ? inScope : inScope.filter(item => item.subsystem === kind)
 }
 
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
@@ -580,25 +557,74 @@ export function endSentence(text) {
   return /[.!?…]["')\]]*$/.test(trimmed) ? trimmed : `${trimmed}.`
 }
 
-/** One toast per backend status. Returns { kind, message }. */
-export function resultToast(verb, result, t) {
-  const name = result?.item?.subject || ''
+// The slash command that closes a write Hermes stopped partway through applying (needs_review).
+const rejectCommand = result => `/${result?.kind === 'memory' ? 'memory' : 'skills'} reject ${result?.id ?? '<id>'}`
+
+/**
+ * One plain sentence per decision status from the write review API (decide_write), and the ones
+ * this backend adds: stale (the fresh preview says the write no longer applies, so Hermes was not
+ * asked), unseen (staged after the file was loaded), whole_write (one part of a write with several
+ * changes), gone (no longer pending) and unavailable (a Hermes without the API).
+ */
+export function statusText(result, t) {
+  const reason = endSentence(result?.reason)
 
   switch (result?.status) {
     case 'applied':
-      return { kind: 'success', message: t('accepted', name) }
+      return t('statusApplied')
     case 'rejected':
-      return { kind: 'info', message: t('rejected', name) }
+      return result.warning ? t('statusRejectedWarning', endSentence(result.warning)) : t('statusRejected')
+    case 'already_resolved':
+      return t(result.prior === 'rejected' ? 'statusAlreadyRejected' : 'statusAlreadyApplied')
+    case 'conflict':
+      return t('statusConflict', reason)
+    case 'needs_review':
+      return t('statusNeedsReview', reason, rejectCommand(result))
+    case 'stale':
+      return t('statusStale', reason)
+    case 'unseen':
+      return t('statusUnseen')
+    case 'whole_write':
+      return reason || t('statusWholeWrite')
+    case 'gone':
     case 'already_handled':
-      return { kind: 'info', message: t('alreadyHandled') }
-    default: {
-      // A Skills Guard block is a multi-line report: headline in the toast, full report as detail.
-      const error = String(result?.error || '')
-      const [headline] = error.split('\n')
-
-      return { kind: 'error', message: t('failed', headline), ...(error.includes('\n') ? { detail: error } : {}) }
-    }
+      return t('alreadyHandled')
+    case 'unavailable':
+      return result.message || t('needsApi')
+    default:
+      return t('failed', result?.reason || result?.error || '')
   }
+}
+
+const TOAST_KIND = {
+  already_handled: 'info',
+  already_resolved: 'info',
+  applied: 'success',
+  gone: 'info',
+  rejected: 'info',
+  stale: 'info',
+  unseen: 'info',
+  whole_write: 'info'
+}
+
+/** One toast per backend status. Returns { kind, message } and, for a long reason, { detail }. */
+export function resultToast(verb, result, t) {
+  const name = result?.item?.subject || ''
+
+  if (result?.status === 'applied') {
+    return { kind: 'success', message: t('accepted', name) }
+  }
+
+  if (result?.status === 'rejected' && !result.warning) {
+    return { kind: 'info', message: t('rejected', name) }
+  }
+
+  // A Skills Guard refusal is a multi-line report: its first line in the toast, all of it as detail.
+  const raw = String(result?.reason || result?.error || '')
+  const [headline] = raw.split('\n')
+  const message = statusText({ ...result, error: headline, reason: headline }, t)
+
+  return { kind: TOAST_KIND[result?.status] ?? 'error', message, ...(raw.includes('\n') ? { detail: raw } : {}) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -812,55 +838,10 @@ export function DiffRow({ row, t, dim = false }) {
   })
 }
 
-export function DiffView({ sections, newFileLabel, t }) {
-  return jsx('div', {
-    style: STYLES.sections,
-    children: sections.map((section, index) => {
-      const lead = section.kind === 'create' ? [{ kind: 'file', text: newFileLabel }] : []
-      const rows = [...lead, ...markRows(parseSection(section), section)]
-
-      return jsxs(
-        'div',
-        {
-          style: { minWidth: 0 },
-          children: [
-            section.title ? jsx('div', { style: STYLES.sectionTitle, children: section.title }) : null,
-            jsx('div', { style: STYLES.diffBox, children: rows.map((row, i) => jsx(DiffRow, { row, t }, i)) })
-          ]
-        },
-        index
-      )
-    })
-  })
-}
 
 // ---------------------------------------------------------------------------------------------
 // List pane
 // ---------------------------------------------------------------------------------------------
-
-export function ListRow({ item, selected, onSelect, t }) {
-  const key = itemKey(item)
-
-  return jsxs('button', {
-    'aria-current': selected,
-    onClick: () => onSelect(key),
-    style: selected ? { ...STYLES.listRow, ...STYLES.listRowSelected } : STYLES.listRow,
-    type: 'button',
-    children: [
-      jsx('span', { style: STYLES.listTitle, children: item.subject }),
-      jsxs('span', {
-        style: STYLES.listMeta,
-        children: [
-          jsx(Badge, { size: 'xs', variant: item.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${item.subsystem}`) }),
-          jsx(Badge, { size: 'xs', variant: 'muted', children: t(`action_${item.action}`) }),
-          jsx(Badge, { size: 'xs', variant: 'outline', children: item.profile }),
-          item.origin === 'background_review' ? jsx(Badge, { size: 'xs', variant: 'muted', children: t('auto') }) : null,
-          jsx('span', { style: STYLES.muted, children: relativeTime(item.created_at * 1000) })
-        ]
-      })
-    ]
-  })
-}
 
 const pendingKey = profile => [ID, 'pending', profile]
 const fetchPending = () => CTX.rest('/pending')
@@ -876,31 +857,6 @@ function usePending() {
   })
 }
 
-/** Items the list shows, with the same filters for both panes (the detail needs them to pick the
- *  next item after an accept or reject). */
-function useVisible() {
-  const query = usePending()
-  const focused = useValue(host.state.focusedSessionProfile) || 'default'
-  const scope = useValue($scope)
-  const kind = useValue($kind)
-  const items = query.data?.items ?? []
-  const focusedCount = visibleItems(items, 'focused', focused).length
-  const effective = scope ?? (focusedCount > 0 ? 'focused' : 'all')
-  const inScope = visibleItems(items, effective, focused)
-
-  return {
-    ...query,
-    effective,
-    focused,
-    focusedCount,
-    inScope,
-    items,
-    kind,
-    kindCounts: countBySubsystem(inScope),
-    shown: visibleItems(items, effective, focused, kind)
-  }
-}
-
 export function FilterButton({ active, label, onClick }) {
   return jsx(Button, {
     'aria-pressed': active,
@@ -914,206 +870,6 @@ export function FilterButton({ active, label, onClick }) {
   })
 }
 
-function ListPane() {
-  const t = usePluginI18n(ID)
-  const v = useVisible()
-  const selection = useValue($selection)
-  const missing = v.isError && /404/.test(String(v.error?.message || ''))
-  const gateOn = (v.data?.profiles ?? []).some(p => Object.values(p.gates ?? {}).some(Boolean))
-
-  // Keep a selection while anything is listed: the detail pane is never blank by accident.
-  useEffect(() => {
-    if (v.shown.length && !v.shown.some(item => itemKey(item) === selection)) {
-      $selection.set(itemKey(v.shown[0]))
-    }
-  }, [v.shown, selection])
-
-  const bar = jsxs('div', {
-    style: STYLES.bar,
-    children: [
-      jsxs('div', {
-        style: STYLES.barRow,
-        children: [
-          jsx('span', { style: { fontSize: '0.875rem', fontWeight: 600, minWidth: 0 }, children: t('paneTitle') }),
-          v.items.length ? jsx(Badge, { variant: 'warn', children: v.items.length }) : null
-        ]
-      }),
-      jsxs('div', {
-        'aria-label': t('scopeGroup'),
-        role: 'group',
-        style: STYLES.barRow,
-        children: [
-          jsx(FilterButton, { active: v.effective === 'focused', label: t('scopeFocused', v.focused, v.focusedCount), onClick: () => $scope.set('focused') }),
-          jsx(FilterButton, { active: v.effective === 'all', label: t('scopeAll', v.items.length), onClick: () => $scope.set('all') })
-        ]
-      }),
-      jsx('div', {
-        'aria-label': t('kindGroup'),
-        role: 'group',
-        style: STYLES.barRow,
-        children: KINDS.map(k =>
-          jsx(FilterButton, { active: v.kind === k, label: t('kindFilter', t(`kind_${k}`), v.kindCounts[k]), onClick: () => $kind.set(k) }, k)
-        )
-      }),
-      jsx(NotifyModeControl, {})
-    ]
-  })
-
-  let body
-
-  if (missing) {
-    body = jsx(ErrorState, { description: t('backendMissing'), title: t('loadError') })
-  } else if (v.isError) {
-    body = jsx(ErrorState, {
-      children: jsx(Button, { onClick: () => v.refetch(), size: 'sm', type: 'button', variant: 'outline', children: t('retry') }),
-      description: String(v.error?.message || ''),
-      title: t('loadError')
-    })
-  } else if (v.isLoading) {
-    body = jsx('div', { style: { ...STYLES.muted, padding: PAD }, children: t('loading') })
-  } else if (!v.shown.length) {
-    const description = v.inScope.length
-      ? t('emptyKind', t(`kind_${v.kind}`))
-      : v.items.length
-        ? t('emptyElsewhere', v.items.length)
-        : gateOn
-          ? t('emptyBody')
-          : t('gateOff')
-
-    body = jsx(EmptyState, { description, title: t('emptyTitle') })
-  } else {
-    body = v.shown.map(item =>
-      jsx(ListRow, { item, onSelect: key => $selection.set(key), selected: itemKey(item) === selection, t }, itemKey(item))
-    )
-  }
-
-  return jsxs('div', {
-    style: STYLES.paneRoot,
-    children: [bar, jsx('div', { style: STYLES.listScroll, children: body })]
-  })
-}
-
-// ---------------------------------------------------------------------------------------------
-// Detail pane
-// ---------------------------------------------------------------------------------------------
-
-export function DetailHeader({ item, busy, onAccept, onReject, t }) {
-  const row = jsxs('header', {
-    style: STYLES.header,
-    children: [
-      jsx('span', { style: STYLES.headerTitle, children: item.subject }),
-      jsx(Button, { disabled: busy, onClick: onAccept, size: 'sm', type: 'button', children: t('accept') }),
-      jsx(Button, { disabled: busy, onClick: onReject, size: 'sm', type: 'button', variant: 'outline', children: t('reject') }),
-      jsxs('div', {
-        style: { ...STYLES.listMeta, flexBasis: '100%' },
-        children: [
-          jsx(Badge, { variant: item.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${item.subsystem}`) }),
-          jsx(Badge, { variant: 'muted', children: t(`action_${item.action}`) }),
-          jsx(Badge, { variant: 'outline', children: item.profile }),
-          item.origin === 'background_review'
-            ? jsx(Tip, { label: t('autoTip'), children: jsx(Badge, { variant: 'muted', children: t('auto') }) })
-            : null,
-          jsx('span', { style: STYLES.muted, children: relativeTime(item.created_at * 1000) })
-        ]
-      })
-    ]
-  })
-
-  return jsxs('div', {
-    style: STYLES.headerWrap,
-    children: [row, item.summary ? jsx('div', { style: STYLES.summary, children: item.summary }) : null]
-  })
-}
-
-function Detail({ item, shown }) {
-  const t = usePluginI18n(ID)
-  const queryClient = useQueryClient()
-  const confirming = useValue($confirming)
-
-  const diff = useQuery({
-    queryFn: () => CTX.rest(pendingPath(item, 'diff')),
-    queryKey: [ID, 'diff', item.subsystem, item.profile, item.id],
-    refetchOnWindowFocus: false,
-    staleTime: Infinity
-  })
-
-  const resolve = useMutation({
-    mutationFn: verb => CTX.rest(pendingPath(item, verb), { method: 'POST' }).then(result => ({ result, verb })),
-    onError: (error, verb) => host.notifyError(error, t(verb === 'accept' ? 'acceptError' : 'rejectError')),
-    onSuccess: ({ result, verb }) => {
-      host.notify(resultToast(verb, result, t))
-
-      if (result?.status !== 'failed') {
-        $selection.set(nextKeyAfter(shown, itemKey(item)))
-      }
-
-      queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
-    }
-  })
-
-  const gone = diff.data?.status === 'already_handled'
-
-  useEffect(() => {
-    if (gone) {
-      queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
-    }
-  }, [gone, queryClient])
-
-  const body = diff.isError
-    ? jsx(ErrorState, { description: String(diff.error?.message || ''), title: t('diffError') })
-    : diff.isLoading
-      ? jsx('div', { style: STYLES.muted, children: t('loading') })
-      : gone
-        ? jsx('div', { style: STYLES.muted, children: t('alreadyHandled') })
-        : jsx(DiffView, { newFileLabel: t(item.subsystem === 'memory' ? 'newEntry' : 'newFile'), sections: diff.data?.sections ?? [], t })
-
-  return jsxs('div', {
-    style: STYLES.paneRoot,
-    children: [
-      jsx(DetailHeader, {
-        busy: resolve.isPending,
-        item,
-        onAccept: () => {
-          haptic('tap')
-          resolve.mutate('accept')
-        },
-        onReject: () => $confirming.set(itemKey(item)),
-        t
-      }),
-      jsx('div', { style: STYLES.detailScroll, children: body }),
-      jsx(ConfirmDialog, {
-        confirmLabel: t('reject'),
-        description: t('rejectBody', item.subject),
-        destructive: true,
-        dismissOnConfirm: true,
-        onClose: () => $confirming.set(null),
-        onConfirm: () => resolve.mutateAsync('reject'),
-        open: confirming === itemKey(item),
-        title: t('rejectTitle')
-      })
-    ]
-  })
-}
-
-
-function DetailPane() {
-  const t = usePluginI18n(ID)
-  const v = useVisible()
-  const selection = useValue($selection)
-  const item = v.items.find(i => itemKey(i) === selection)
-
-  if (!item) {
-    return jsx('div', {
-      style: STYLES.paneRoot,
-      children: jsx(EmptyState, { description: v.items.length ? t('selectBody') : t('emptyBody'), title: t('selectTitle') })
-    })
-  }
-
-  // Keyed by item, so the diff query, mutation and dialog state belong to exactly one pending write.
-  return jsx(Detail, { item, shown: v.shown }, itemKey(item))
-}
-
-/** Route page for desktops without the pane APIs: the same list and diff as the pane. */
 /** Desktops without the pane APIs: one route page with the settings above the review. */
 function FallbackPage() {
   return jsxs('div', { style: STYLES.paneRoot, children: [jsx(SettingsPage, {}), jsx(ReviewPane, {})] })
@@ -1152,6 +908,22 @@ export function actionPath(file, action) {
   }
 
   throw new Error(`unknown action ${action.verb}`)
+}
+
+/**
+ * The body of a decision: the `expect` preview_write returned for the write, exactly as the diff
+ * carried it. A block sends its own write's; Accept all and Reject all send one per write shown.
+ */
+export function decisionBody(action, data) {
+  const writes = data?.writes ?? {}
+
+  if (action.verb === 'accept' || action.verb === 'reject') {
+    const block = (data?.segments ?? []).find(s => s.type === 'block' && s.block?.id === action.blockId)?.block
+
+    return { expect: writes[block?.record_id]?.expect ?? null }
+  }
+
+  return { expects: Object.fromEntries(Object.entries(writes).map(([id, w]) => [id, w.expect])) }
 }
 
 const LAST_OPENED = 'lastOpened'
@@ -1211,7 +983,9 @@ export function openVisit(storage, key, mark) {
 /** A block is New if the file was never opened, or it was staged after the last open. */
 export const isNewBlock = (block, prior) => prior == null || block.staged_at > prior
 
-const canAcceptBlock = block => block.can_accept === true && block.state !== 'stale'
+const canAcceptBlock = block => block.can_accept === true && block.state === 'pending'
+// Hermes decides a write only as a whole, so a block of a write with several changes has neither button.
+const canRejectBlock = block => block.can_reject !== false
 
 /** Rows for DiffRow: context and removed lines number in the first gutter, added lines in the second. */
 export function segmentRows(segment) {
@@ -1220,6 +994,13 @@ export function segmentRows(segment) {
   }
 
   const block = segment.block ?? {}
+
+  // A block from the write review API carries its preview as text: a unified diff, a new file or
+  // entry, or a removed entry. The file header row is dropped, the pane header names the file.
+  if (typeof block.text === 'string') {
+    return markRows(parseSection({ kind: block.kind, text: block.text }).filter(row => row.kind !== 'file'), segment.block)
+  }
+
   const rows = [
     ...(block.removed ?? []).map(line => ({ kind: 'remove', oldNo: line.no, text: line.text })),
     ...(block.added ?? []).map(line => ({ kind: 'add', newNo: line.no, text: line.text }))
@@ -1246,11 +1027,13 @@ export function actionToast(action, result, file, t) {
   }
 
   const done = results.filter(r => r.status === (action.verb === 'accept-all' ? 'applied' : 'rejected')).length
-  const failed = results.filter(r => r.status === 'failed')
+  const others = results.filter(r => r.status !== (action.verb === 'accept-all' ? 'applied' : 'rejected'))
   const message = t(action.verb === 'accept-all' ? 'bulkAccepted' : 'bulkRejected', done, results.length)
 
-  if (failed.length) {
-    return { kind: 'error', message, detail: failed.map(r => `${r.block_id}: ${r.error || ''}`).join('\n') }
+  if (others.length) {
+    const kind = others.some(r => ['conflict', 'needs_review', 'failed'].includes(r.status)) ? 'error' : 'info'
+
+    return { kind, message, detail: others.map(r => `${r.id}: ${statusText(r, t)}`).join('\n') }
   }
 
   return { kind: action.verb === 'accept-all' ? 'success' : 'info', message }
@@ -1265,7 +1048,7 @@ function leaveFile(file) {
 
 /** POST one action, toast the result, refetch the file and the list, leave the file if it is gone. */
 export async function performAction({ action, file, queryClient, rest, t }) {
-  const result = await rest(actionPath(file, action), { method: 'POST' })
+  const result = await rest(actionPath(file, action), { body: action.body ?? null, method: 'POST' })
 
   host.notify(actionToast(action, result, file, t))
   queryClient.invalidateQueries({ queryKey: diffKey(file) })
@@ -1358,10 +1141,9 @@ export function FileList({ files, lastOpened, selection, onSelect, t }) {
   })
 }
 
-export function BlockView({ block, isNew, busy, onAccept, onReject, removal, t, edit = null }) {
+export function BlockView({ block, isNew, busy, onAccept, onReject, t }) {
   const stale = block.state === 'stale'
-  const editing = Boolean(edit?.session)
-  const tone = stale && !editing ? FILE_STYLES.blockStale : isNew ? FILE_STYLES.blockNew : FILE_STYLES.blockOlder
+  const tone = stale ? FILE_STYLES.blockStale : isNew ? FILE_STYLES.blockNew : FILE_STYLES.blockOlder
 
   const head = jsxs('div', {
     style: FILE_STYLES.blockHead,
@@ -1375,12 +1157,12 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, removal, t, 
       jsxs('span', {
         style: STYLES.actions,
         children: [
-          edit && !editing && !removalFor(removal?.current, removal?.file, block.id) ? jsx(EditButton, { busy, edit, t }) : null,
-          canAcceptBlock(block) && !editing
+          canAcceptBlock(block)
             ? jsx(Button, { disabled: busy, onClick: onAccept, size: 'xs', style: STYLES.button, type: 'button', children: t('accept') })
             : null,
-          jsx(Button, { disabled: busy, onClick: onReject, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('reject') }),
-          removal && !editing ? jsx(RemoveEntryButton, { block, busy, removal, t }) : null
+          canRejectBlock(block)
+            ? jsx(Button, { disabled: busy, onClick: onReject, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('reject') })
+            : null
         ]
       })
     ]
@@ -1394,16 +1176,26 @@ export function BlockView({ block, isNew, busy, onAccept, onReject, removal, t, 
     style: { ...FILE_STYLES.block, ...tone },
     children: [
       head,
-      removal && !editing ? jsx(RemoveEntryRow, { block, removal, t }) : null,
-      block.state === 'conflict' ? jsx('div', { style: FILE_STYLES.blockNote, children: t('conflictAbove') }) : null,
-      stale && block.reason ? jsx('div', { style: FILE_STYLES.blockNote, children: t('staleReason', block.reason) }) : null,
-      ...segmentRows({ type: 'block', block: editing ? { ...block, added: [] } : block }).map((row, i) => jsx(DiffRow, { dim: stale && !editing, row, t }, i)),
-      editing ? jsx(BlockEditor, { info: edit.info, onCancel: edit.onCancel, onChange: edit.onChange, onSave: edit.onSave, session: edit.session, t }) : null
+      block.reason ? jsx('div', { style: FILE_STYLES.blockNote, children: blockNote(block, t) }) : null,
+      ...segmentRows({ type: 'block', block }).map((row, i) => jsx(DiffRow, { dim: stale, row, t }, i))
     ]
   })
 }
 
-export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, removal, t, edit = null }) {
+/** Why a block looks the way it does: Hermes's reason for a stale or conflicting write, or a note. */
+export function blockNote(block, t) {
+  if (block.state === 'stale') {
+    return t('staleReason', block.reason)
+  }
+
+  if (block.state === 'conflict') {
+    return t('conflictReason', block.reason)
+  }
+
+  return block.reason
+}
+
+export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, t }) {
   return jsx('div', {
     style: STYLES.diffBox,
     children: contextPlan(segments, gaps).map(segment => {
@@ -1419,11 +1211,9 @@ export function FileDiffView({ segments, prior, busy, onBlock, gaps, onExpand, r
           {
             block,
             busy,
-            edit: blockEdit(edit, block),
             isNew: isNewBlock(block, prior),
             onAccept: () => onBlock({ blockId: block.id, verb: 'accept' }),
             onReject: () => onBlock({ blockId: block.id, verb: 'reject' }),
-            removal,
             t
           },
           block.id
@@ -1466,12 +1256,14 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
 }
 
 /** The whole detail pane for one file, as a pure view: data and callbacks in, tree out. */
-export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, expansion, onExpand, removal, t, edit = null }) {
+export function FileDetailView({ file, data, loading, error, prior, busy, confirmOpen, onAction, onAskRejectAll, onCloseConfirm, expansion, onExpand, t }) {
   // A response for another file (a late answer after the user moved on) counts as not loaded yet.
   const own = data && diffMatches(data, file) ? data : undefined
   const shownFile = own?.status === 'ok' ? own.file : file
   const segments = own?.status === 'ok' ? own.segments ?? [] : []
   const blockList = segments.filter(s => s.type === 'block').map(s => s.block)
+  // Every decision carries the expect of the preview shown here, unchanged (decisionBody).
+  const decide = action => onAction({ ...action, body: decisionBody(action, own) })
 
   const body = error
     ? jsx(ErrorState, { description: String(error?.message || ''), title: t('diffError') })
@@ -1479,17 +1271,17 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
       ? jsx(DiffSkeleton, { t })
       : own.status === 'gone'
         ? jsx('div', { style: STYLES.muted, children: t('fileGone') })
-        : jsx(FileDiffView, {
-            busy,
-            edit,
-            gaps: expansionFor(expansion, shownFile).gaps,
-            onBlock: onAction,
-            onExpand: (gapId, dir) => onExpand?.(shownFile, gapId, dir),
-            prior,
-            removal,
-            segments,
-            t
-          })
+        : own.status === 'unavailable'
+          ? jsx(EmptyState, { description: own.message || t('needsApi'), title: t('needsApiTitle') })
+          : jsx(FileDiffView, {
+              busy,
+              gaps: expansionFor(expansion, shownFile).gaps,
+              onBlock: decide,
+              onExpand: (gapId, dir) => onExpand?.(shownFile, gapId, dir),
+              prior,
+              segments,
+              t
+            })
 
   return jsxs('div', {
     style: STYLES.paneRoot,
@@ -1498,7 +1290,7 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
         acceptable: blockList.filter(canAcceptBlock).length,
         busy,
         file: shownFile,
-        onAcceptAll: () => onAction({ verb: 'accept-all' }),
+        onAcceptAll: () => decide({ verb: 'accept-all' }),
         onRejectAll: onAskRejectAll,
         t
       }),
@@ -1509,203 +1301,12 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
         destructive: true,
         dismissOnConfirm: true,
         onClose: onCloseConfirm,
-        onConfirm: () => onAction({ verb: 'reject-all' }),
+        onConfirm: () => decide({ verb: 'reject-all' }),
         open: confirmOpen,
         title: t('rejectAllTitle')
       })
     ]
   })
-}
-
-// ---------------------------------------------------------------------------------------------
-// Remove entirely: on a memory block that replaces or patches one existing entry, a third action
-// deletes that entry and drops the proposal, so neither the red line nor the green one stays.
-//   POST /files/{profile}/{subsystem}/{key}/blocks/{id}/remove-entry
-//        -> { status: 'removed' | 'already_handled' | 'failed', error, file_gone }
-// It asks first, in a row under the block head. Skill blocks never offer it.
-// ---------------------------------------------------------------------------------------------
-
-/** null, or { key: fileKey, blockId, phase: 'confirm' | 'busy' | 'error', error }. One block at a time. */
-export const $removal = atom(null)
-
-$selection.listen(next => {
-  if ($removal.get() && $removal.get().key !== next) {
-    $removal.set(null)
-  }
-})
-
-export const removeEntryPath = (file, blockId) => `${fileBase(file)}/blocks/${encodeURIComponent(blockId)}/remove-entry`
-
-/** A pending or conflicting memory block that swaps one existing line for new text. An add has no
- *  removed line, a plain remove no added one; a multi-line entry has several removed lines. */
-export function canRemoveEntry(block, subsystem) {
-  return (
-    subsystem === 'memory' &&
-    (block?.state === 'pending' || block?.state === 'conflict') &&
-    (block.removed?.length ?? 0) === 1 &&
-    (block.added?.length ?? 0) > 0
-  )
-}
-
-/** The removal state of this one block, or null. */
-export const removalFor = (current, file, blockId) =>
-  current && current.key === fileKey(file) && current.blockId === blockId ? current : null
-
-/**
- * POST the removal. Success toasts, refetches and returns to the list when the file is gone. A
- * failure leaves the file open and puts the error in the block's own row, where the user is.
- */
-export async function performRemove({ file, blockId, queryClient, rest, t }) {
-  const base = { blockId, key: fileKey(file) }
-  let result = null
-
-  $removal.set({ ...base, phase: 'busy', error: null })
-
-  try {
-    result = await rest(removeEntryPath(file, blockId), { method: 'POST' })
-  } catch (error) {
-    $removal.set({ ...base, phase: 'error', error: String(error?.message || '') || t('removeError') })
-
-    return null
-  }
-
-  const done = result?.status === 'removed' || result?.status === 'already_handled'
-
-  if (done) {
-    $removal.set(null)
-    host.notify(result.status === 'removed' ? { kind: 'success', message: t('entryRemoved') } : { kind: 'info', message: t('alreadyHandled') })
-  } else {
-    $removal.set({ ...base, phase: 'error', error: String(result?.error || '') || t('removeError') })
-  }
-
-  queryClient.invalidateQueries({ queryKey: diffKey(file) })
-
-  if (done) {
-    queryClient.invalidateQueries({ queryKey: [ID, 'files'] })
-    queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
-
-    if (result.file_gone) {
-      leaveFile(file)
-    }
-  }
-
-  return result
-}
-
-export const REMOVE_STYLES = {
-  // Quiet like Reject; the label carries the theme's removed-line red.
-  button: { ...STYLES.button, color: 'var(--ui-diff-remove-foreground)' },
-  // Continues the block head, so the question sits directly above the lines it deletes.
-  row: {
-    alignItems: 'center',
-    background: 'var(--ui-bg-tertiary)',
-    borderTop: '1px solid var(--ui-stroke-tertiary)',
-    display: 'flex',
-    flexWrap: 'wrap',
-    gap: '0.3rem 0.5rem',
-    minWidth: 0,
-    padding: '0.3rem 0.6rem'
-  },
-  question: { color: 'var(--ui-text-primary)', flex: '1 1 12rem', fontSize: '0.75rem', fontWeight: 500, minWidth: 0, overflowWrap: 'anywhere' },
-  error: {
-    color: 'var(--ui-diff-remove-foreground)',
-    flex: '1 1 12rem',
-    fontSize: '0.75rem',
-    minWidth: 0,
-    overflowWrap: 'anywhere',
-    whiteSpace: 'pre-wrap'
-  }
-}
-
-/** removal: { file, current ($removal value), onAsk(blockId), onConfirm(blockId), onCancel() }. */
-export function RemoveEntryButton({ block, busy, removal, t }) {
-  if (!canRemoveEntry(block, removal.file?.subsystem)) {
-    return null
-  }
-
-  const mine = removalFor(removal.current, removal.file, block.id)
-  const open = mine?.phase === 'confirm' || mine?.phase === 'busy'
-
-  return jsx(Tip, {
-    label: t('removeEntryTip'),
-    children: jsx(Button, {
-      'aria-expanded': open,
-      disabled: busy || open,
-      onClick: () => removal.onAsk(block.id),
-      size: 'xs',
-      style: REMOVE_STYLES.button,
-      type: 'button',
-      variant: 'outline',
-      children: t('removeEntry')
-    })
-  })
-}
-
-/** The confirm question with Delete and Cancel, or the error of a removal that failed. */
-export function RemoveEntryRow({ block, removal, t }) {
-  const mine = removalFor(removal.current, removal.file, block.id)
-
-  if (!mine) {
-    return null
-  }
-
-  if (mine.phase === 'error') {
-    return jsxs('div', {
-      role: 'alert',
-      style: REMOVE_STYLES.row,
-      children: [
-        jsx('span', { style: REMOVE_STYLES.error, children: mine.error }),
-        jsx('span', {
-          style: STYLES.actions,
-          children: jsx(Button, { onClick: removal.onCancel, size: 'xs', style: STYLES.button, type: 'button', variant: 'ghost', children: t('removeDismiss') })
-        })
-      ]
-    })
-  }
-
-  const working = mine.phase === 'busy'
-
-  return jsxs('div', {
-    'aria-label': t('removeConfirm'),
-    onKeyDown: event => {
-      if (event.key === 'Escape' && !working) {
-        removal.onCancel()
-      }
-    },
-    role: 'group',
-    style: REMOVE_STYLES.row,
-    children: [
-      jsx('span', { style: REMOVE_STYLES.question, children: t('removeConfirm') }),
-      jsxs('span', {
-        style: STYLES.actions,
-        children: [
-          jsx(Button, {
-            disabled: working,
-            loading: working,
-            onClick: () => removal.onConfirm(block.id),
-            size: 'xs',
-            style: STYLES.button,
-            type: 'button',
-            variant: 'destructive',
-            children: t('removeDelete')
-          }),
-          // Focus lands on Cancel, the safe choice, when the question opens.
-          jsx(Button, { autoFocus: true, disabled: working, onClick: removal.onCancel, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('removeCancel') })
-        ]
-      })
-    ]
-  })
-}
-
-const REMOVE_EN = {
-  entryRemoved: 'Entry removed',
-  removeCancel: 'Cancel',
-  removeConfirm: 'Delete this entry and drop the proposal?',
-  removeDelete: 'Delete',
-  removeDismiss: 'Dismiss',
-  removeEntry: 'Remove entirely',
-  removeEntryTip: 'Deletes the existing entry and drops this proposal. Neither version is kept.',
-  removeError: 'Could not remove the entry'
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1946,7 +1547,7 @@ export const diffQueryKey = file => [...diffKey(file), diffVersion(file)]
 
 /** True when a diff response belongs to `file`; a late answer for another file is never shown. */
 export function diffMatches(data, file) {
-  if (data?.status === 'gone') {
+  if (data?.status === 'gone' || data?.status === 'unavailable') {
     return true
   }
 
@@ -2002,7 +1603,9 @@ function useVisibleFiles() {
     inScope,
     kind,
     kindCounts: countBySubsystem(inScope),
+    needsReview: query.data?.needs_review?.total ?? 0,
     profileErrors: query.data?.profile_errors ?? [],
+    unavailable: query.data?.status === 'unavailable' ? query.data.message || null : null,
     profiles: profileSummary(files),
     shown: shownFiles(files, hidden, kind, sort),
     sort
@@ -2049,6 +1652,9 @@ export function FilesListPane() {
           jsx(FilterButton, { active: v.kind === k, label: t('kindFilter', t(`kind_${k}`), v.kindCounts[k]), onClick: () => $kind.set(k) }, k)
         )
       }),
+      v.needsReview
+        ? jsx('div', { role: 'status', style: { ...STYLES.muted, overflowWrap: 'anywhere' }, children: t('needsReview', v.needsReview) })
+        : null,
       v.profileErrors.length
         ? jsx('div', { style: { ...STYLES.muted, overflowWrap: 'anywhere' }, children: t('profileErrors', v.profileErrors.map(e => e.profile).join(', ')) })
         : null,
@@ -2061,6 +1667,9 @@ export function FilesListPane() {
 
   if (missing) {
     body = jsx(ErrorState, { description: t('backendMissing'), title: t('loadError') })
+  } else if (v.unavailable) {
+    // A Hermes without the public write review API: one plain message, no other path.
+    body = jsx(EmptyState, { description: v.unavailable, title: t('needsApiTitle') })
   } else if (v.isError) {
     body = jsx(ErrorState, {
       children: jsx(Button, { onClick: () => v.refetch(), size: 'sm', type: 'button', variant: 'outline', children: t('retry') }),
@@ -2132,22 +1741,12 @@ function FileDetail({ file }) {
   })
 
   const confirmId = `reject-all:${key}`
-  const removing = useValue($removal)
-
-  const removal = {
-    current: removing,
-    file,
-    onAsk: blockId => $removal.set({ blockId, error: null, key, phase: 'confirm' }),
-    onCancel: () => $removal.set(null),
-    onConfirm: blockId => performRemove({ blockId, file, queryClient, rest: (path, opts) => CTX.rest(path, opts), t })
-  }
 
   // Which context gaps are open; reset when the shown diff's version changes (expansionFor).
   const [expansion, setExpansion] = useState(null)
-  const edit = useBlockEdit(file, queryClient, t)
 
   return jsx(FileDetailView, {
-    busy: act.isPending || removing?.phase === 'busy' || Boolean(edit.session?.saving),
+    busy: act.isPending,
     confirmOpen: confirming === confirmId,
     data: diff.data,
     error: diff.isError ? diff.error : null,
@@ -2160,13 +1759,11 @@ function FileDetail({ file }) {
 
       return act.mutateAsync(action).catch(() => null) // onError already toasted
     },
-    edit,
     onAskRejectAll: () => $confirming.set(confirmId),
     onCloseConfirm: () => $confirming.set(null),
     expansion,
     onExpand: (shown, gapId, dir) => setExpansion(prev => expandGap(prev, shown, gapId, dir)),
     prior,
-    removal,
     t
   })
 }
@@ -2258,6 +1855,9 @@ export function librarySession(current, id, data) {
     name: data.file.name,
     original: data.text,
     profile: splitLibId(id).profile,
+    // Memory and skill files are read-only until Hermes offers public helpers for their save checks.
+    readOnly: data.file.read_only === true,
+    readOnlyReason: data.file.read_only_reason ?? null,
     saving: false,
     skill: data.file.skill ?? null,
     text: data.text,
@@ -2266,7 +1866,7 @@ export function librarySession(current, id, data) {
 }
 
 export function changeLibraryText(session, text) {
-  if (session && !session.saving) {
+  if (session && !session.saving && !session.readOnly) {
     $libEditor.set({ ...session, text })
   }
 }
@@ -2638,7 +2238,8 @@ export const LIB_STYLES = {
     gap: '0.4rem',
     minWidth: 0,
     overflowWrap: 'anywhere'
-  }
+  },
+  readOnly: { color: 'var(--ui-text-secondary)', flex: 'none', fontSize: '0.75rem', minWidth: 0, overflowWrap: 'anywhere' }
 }
 
 const indent = depth => ({ paddingLeft: `calc(${PAD} + ${depth * 0.85}rem)` })
@@ -2779,6 +2380,10 @@ export function LibraryListPane() {
         ]
       }),
       jsx(LibrarySearch, { onChange: value => $libSearch.set(value), t, value: search }),
+      // On a Hermes without the write review API the tree still lists files, without pending counts.
+      library.data?.review?.status === 'unavailable'
+        ? jsx('div', { role: 'status', style: { ...STYLES.muted, overflowWrap: 'anywhere' }, children: t('libNoReviewApi') })
+        : null,
       inline ? jsx(SettingsPage, {}) : null
     ]
   })
@@ -2815,6 +2420,8 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
   const dirty = isDirty(session)
   const saving = Boolean(session?.saving)
   const pending = file?.pending ?? 0
+  const readOnly = Boolean(session?.readOnly ?? file?.read_only)
+  const readOnlyReason = session?.readOnlyReason ?? file?.read_only_reason ?? null
 
   const header = jsxs('div', {
     style: STYLES.headerWrap,
@@ -2825,13 +2432,15 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
           jsx('span', { style: FILE_STYLES.fileTitle, title, children: title }),
           file?.kind ? jsx(Badge, { size: 'xs', variant: file.kind === 'memory' ? 'default' : 'muted', children: t(`libKind_${file.kind}`) }) : null,
           profile ? jsx(Badge, { size: 'xs', variant: 'outline', children: profile }) : null,
-          jsxs('span', {
-            style: STYLES.actions,
-            children: [
-              jsx(Button, { disabled: !dirty || saving, onClick: () => onRevert?.(), size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('libRevert') }),
-              jsx(Button, { disabled: !dirty || saving, onClick: () => onSave?.(), size: 'xs', style: STYLES.button, type: 'button', children: t('libSave') })
-            ]
-          })
+          readOnly
+            ? jsx(Badge, { size: 'xs', variant: 'muted', children: t('libReadOnly') })
+            : jsxs('span', {
+                style: STYLES.actions,
+                children: [
+                  jsx(Button, { disabled: !dirty || saving, onClick: () => onRevert?.(), size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('libRevert') }),
+                  jsx(Button, { disabled: !dirty || saving, onClick: () => onSave?.(), size: 'xs', style: STYLES.button, type: 'button', children: t('libSave') })
+                ]
+              })
         ]
       }),
       pending > 0 && file?.review
@@ -2863,6 +2472,7 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
             ]
           }, 'conflict')
         : null,
+      readOnly && readOnlyReason ? jsx('div', { role: 'note', style: LIB_STYLES.readOnly, children: readOnlyReason }, 'read-only') : null,
       session.error ? jsx('div', { role: 'alert', style: EDIT_STYLES.error, children: session.error }, 'error') : null,
       jsxs('div', {
         style: LIB_STYLES.editorBox,
@@ -2872,7 +2482,7 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
             'aria-invalid': Boolean(session.error),
             'aria-label': t('libEditorLabel', name),
             onChange: event => onChange?.(event.target.value),
-            readOnly: saving,
+            readOnly: saving || readOnly,
             rows: lines,
             spellCheck: false,
             // Every line shows; room is left for a horizontal scrollbar under a long line.
@@ -2886,7 +2496,7 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
         style: LIB_STYLES.footer,
         children: [
           dirty ? jsxs('span', { 'aria-live': 'polite', style: LIB_STYLES.unsaved, children: [jsx('span', { style: LIB_STYLES.dot }), t('libUnsaved')] }) : null,
-          jsx('span', { children: t('libStraightToFile') }),
+          jsx('span', { children: t(readOnly ? 'libReadOnlyFooter' : 'libStraightToFile') }),
           jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: t('libLines', lines) })
         ]
       }, 'footer')
@@ -3003,6 +2613,9 @@ const LIB_EN = {
   libSelectTitle: 'No file selected',
   libStagedTip: name => `${name} is not in the library: a new file, or a skill outside this profile's folder. Open its changes in Pending.`,
   libStraightToFile: 'Saves straight to the file',
+  libNoReviewApi: 'Pending counts need a Hermes with the write review API. Files still open, and identity files still save.',
+  libReadOnly: 'read-only',
+  libReadOnlyFooter: 'Read-only in Library for now',
   libUnsaved: 'Unsaved changes',
   libUnsupportedTitle: 'Library is not available on this system'
 }
@@ -3132,7 +2745,7 @@ const FILE_EN = {
   bulkRejected: (n, total) => `Rejected ${n} of ${total} change${total === 1 ? '' : 's'}`,
   changes: n => `${n} change${n === 1 ? '' : 's'}`,
   conflict: 'conflict',
-  conflictAbove: 'Conflicts with the block above',
+  conflictReason: reason => `Cannot apply: ${reason}`,
   conflictCount: n => `${n} conflict${n === 1 ? '' : 's'}`,
   fileGone: 'No changes left in this file.',
   new: 'new',
@@ -3150,152 +2763,8 @@ const FILE_EN = {
   staleReason: reason => `Can no longer apply: ${reason}`
 }
 
-// ---------------------------------------------------------------------------------------------
-// Edit a proposed change in place. Routes beside contract v1:
-//   GET  /files/{profile}/{subsystem}/{key}/edits              editable blocks, their text and limit
-//   POST /files/{profile}/{subsystem}/{key}/blocks/{id}/edit   { text, apply }
-// The editor replaces a block's added lines; its removed lines stay above it as the reference.
-// ---------------------------------------------------------------------------------------------
-
-export const editsPath = file => `${fileBase(file)}/edits`
-export const editPath = (file, blockId) => `${fileBase(file)}/blocks/${encodeURIComponent(blockId)}/edit`
-// Under diffKey, so every refetch of the file after an action also refetches it.
-const editsKey = file => [...diffKey(file), 'edits', diffVersion(file)]
-
-/** The one block being edited: { file, blockId, info, text, error, saving }. Kept outside the pane,
- *  so a refetch or a remount of the detail pane keeps what the user typed. */
-export const $editing = atom(null)
-
-export function startEdit(file, blockId, info) {
-  $editing.set({ blockId, error: null, file: fileKey(file), info, saving: null, text: info?.text ?? '' })
-}
-
-export function changeEdit(text) {
-  const session = $editing.get()
-
-  if (session && !session.saving) {
-    $editing.set({ ...session, text })
-  }
-}
-
-export const cancelEdit = () => $editing.set(null)
-
-/** Edit props for one block, or null when it has nothing to edit. An open editor stays up while
- *  /edits reloads after a version change. */
-export function blockEdit(edit, block) {
-  if (!edit) {
-    return null
-  }
-
-  const session = edit.session?.blockId === block.id ? edit.session : null
-  const info = edit.blocks?.[block.id] ?? session?.info
-
-  if (!info) {
-    return null
-  }
-
-  return { info, onCancel: edit.onCancel, onChange: edit.onChange, onSave: edit.onSave, onStart: () => edit.onStart(block.id, info), session }
-}
-
-/** Toast for an edit. The verbs match the buttons: Save and accept, Save as proposal. */
-export function editToast(apply, result, file, t) {
-  switch (result?.status) {
-    case 'applied':
-      return { kind: 'success', message: t('editApplied', file.file) }
-    case 'saved':
-      return { kind: 'info', message: t('editSaved', file.file) }
-    case 'already_handled':
-      return { kind: 'info', message: t('alreadyHandled') }
-    default:
-      return { detail: result?.error || '', kind: 'error', message: t(apply ? 'editApplyFailed' : 'editSaveFailed') }
-  }
-}
-
-/** POST the edit. Applied, saved or already handled closes the editor; anything else keeps it open
- *  with the user's text and Hermes's reason, so a failed Save and accept loses nothing. */
-export async function performEdit({ apply, file, session, queryClient, rest, t }) {
-  $editing.set({ ...session, error: null, saving: apply ? 'apply' : 'save' })
-  let result
-
-  try {
-    result = await rest(editPath(file, session.blockId), { body: { apply, text: session.text }, method: 'POST' })
-  } catch (error) {
-    $editing.set({ ...session, error: String(error?.message || error || t('editSaveFailed')), saving: null })
-    host.notifyError(error, t(apply ? 'editApplyFailed' : 'editSaveFailed'))
-
-    return null
-  }
-
-  const done = ['applied', 'saved', 'already_handled'].includes(result?.status)
-  $editing.set(done ? null : { ...session, error: result?.error || t(apply ? 'editApplyFailed' : 'editSaveFailed'), saving: null })
-  host.notify(editToast(apply, result, file, t))
-  queryClient.invalidateQueries({ queryKey: diffKey(file) })
-  queryClient.invalidateQueries({ queryKey: [ID, 'files'] })
-  queryClient.invalidateQueries({ queryKey: [ID, 'pending'] })
-
-  if (result?.file_gone) {
-    leaveFile(file)
-  }
-
-  return result
-}
-
-const wordCount = text => (text.trim() ? text.trim().split(/\s+/).length : 0)
-
-/** Live count. With Hermes's limit: the total after this change (base + this text, trimmed as
- *  Hermes trims it). Without one: words and characters of the text. */
-export function editCount(text, limit) {
-  if (!limit) {
-    return { chars: text.length, words: wordCount(text) }
-  }
-
-  const chars = limit.strip ? text.trim().length : text.length
-  const total = limit.base + chars
-
-  return { chars, label: limit.label, max: limit.max, over: total > limit.max, total }
-}
-
-const countLabel = (count, t) => {
-  if (count.max == null) {
-    return t('editCount', count.words, count.chars)
-  }
-
-  const n = v => v.toLocaleString('en-US')
-
-  return count.over ? t('editTotalOver', count.label, n(count.total), n(count.max), n(count.total - count.max)) : t('editTotal', count.label, n(count.total), n(count.max))
-}
-
+// An error under the Library editor: Hermes's or the backend's reason, which can run to a few lines.
 export const EDIT_STYLES = {
-  editor: {
-    borderTop: '1px solid var(--ui-stroke-tertiary)',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.4rem',
-    minWidth: 0,
-    padding: '0.5rem 0.6rem'
-  },
-  label: { color: 'var(--ui-text-secondary)', fontSize: '0.7rem', minWidth: 0, overflowWrap: 'anywhere' },
-  // Same face, size and leading as the diff rows, so the text does not jump when the editor opens.
-  textarea: {
-    background: 'var(--ui-editor-surface-background)',
-    boxSizing: 'border-box',
-    color: 'var(--ui-text-primary)',
-    fontFamily: mono,
-    fontSize: '0.75rem',
-    lineHeight: 1.55,
-    maxWidth: '100%',
-    minWidth: 0,
-    overflowWrap: 'anywhere',
-    padding: '0.4rem 0.5rem',
-    resize: 'vertical',
-    whiteSpace: 'pre-wrap',
-    width: '100%',
-    wordBreak: 'break-word'
-  },
-  footer: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.3rem 0.5rem', minWidth: 0 },
-  count: { color: 'var(--ui-text-tertiary)', flex: '1 1 10rem', fontSize: '0.7rem', fontVariantNumeric: 'tabular-nums', minWidth: 0, overflowWrap: 'anywhere' },
-  over: { color: 'var(--ui-red, var(--ui-diff-remove-foreground))' },
-  // Hermes's Skills Guard report runs to many lines: it scrolls inside its own box.
   error: {
     color: 'var(--ui-red, var(--ui-diff-remove-foreground))',
     fontSize: '0.75rem',
@@ -3305,110 +2774,6 @@ export const EDIT_STYLES = {
     overflowY: 'auto',
     whiteSpace: 'pre-wrap'
   }
-}
-
-const EDITOR_MIN_ROWS = 3
-const EDITOR_MAX_ROWS = 24
-
-export function EditButton({ busy, edit, t }) {
-  return jsx(Button, { disabled: busy, onClick: edit.onStart, size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('edit') })
-}
-
-/** The in-place editor as a pure view. Grows with the text up to 24 lines, then scrolls; the user
- *  can still drag it taller. */
-export function BlockEditor({ session, info, onChange, onSave, onCancel, t }) {
-  const saving = Boolean(session.saving)
-  const count = editCount(session.text, info.limit)
-  const rows = Math.min(Math.max(session.text.split('\n').length + 1, EDITOR_MIN_ROWS), EDITOR_MAX_ROWS)
-  const id = `skill-review-edit-${session.blockId}`
-
-  return jsxs('div', {
-    'data-editor': session.blockId,
-    style: EDIT_STYLES.editor,
-    children: [
-      jsx('label', { htmlFor: id, style: EDIT_STYLES.label, children: t(`editScope_${info.scope || 'file'}`) }),
-      jsx(Textarea, {
-        'aria-invalid': Boolean(session.error) || Boolean(count.over),
-        autoFocus: true,
-        id,
-        onChange: event => onChange(event.target.value),
-        readOnly: saving,
-        rows,
-        spellCheck: false,
-        style: { ...EDIT_STYLES.textarea, minHeight: `${(rows * 1.55 * 0.75 + 0.8).toFixed(2)}rem` },
-        value: session.text,
-        wrap: 'soft'
-      }),
-      session.error ? jsx('div', { role: 'alert', style: EDIT_STYLES.error, children: session.error }) : null,
-      jsxs('div', {
-        style: EDIT_STYLES.footer,
-        children: [
-          jsx('span', { 'aria-live': 'polite', style: count.over ? { ...EDIT_STYLES.count, ...EDIT_STYLES.over } : EDIT_STYLES.count, children: countLabel(count, t) }),
-          jsxs('span', {
-            style: STYLES.actions,
-            children: [
-              jsx(Button, { disabled: saving, onClick: () => onSave(true), size: 'xs', style: STYLES.button, type: 'button', children: t('editApply') }),
-              jsx(Button, { disabled: saving, onClick: () => onSave(false), size: 'xs', style: STYLES.button, type: 'button', variant: 'outline', children: t('editSave') }),
-              jsx(Button, { disabled: saving, onClick: onCancel, size: 'xs', style: STYLES.button, type: 'button', variant: 'ghost', children: t('editCancel') })
-            ]
-          })
-        ]
-      })
-    ]
-  })
-}
-
-/** Edit wiring for one open file: the editable blocks from /edits and the session for this file. */
-function useBlockEdit(file, queryClient, t) {
-  const editing = useValue($editing)
-  const key = fileKey(file)
-  const edits = useQuery({
-    placeholderData: previous => previous,
-    queryFn: () => CTX.rest(editsPath(file)),
-    queryKey: editsKey(file),
-    refetchOnWindowFocus: false,
-    retry: false, // a backend from before this feature has no /edits: no Edit buttons
-    staleTime: Infinity
-  })
-  const session = editing?.file === key ? editing : null
-
-  return {
-    blocks: edits.data?.status === 'ok' ? edits.data.blocks ?? {} : {},
-    onCancel: cancelEdit,
-    onChange: changeEdit,
-    onSave: apply => {
-      const current = $editing.get()
-
-      if (!current || current.file !== key || current.saving) {
-        return null
-      }
-
-      if (apply) {
-        haptic('tap')
-      }
-
-      return performEdit({ apply, file, queryClient, rest: (path, opts) => CTX.rest(path, opts), session: current, t })
-    },
-    onStart: (blockId, info) => startEdit(file, blockId, info),
-    session
-  }
-}
-
-const EDIT_EN = {
-  edit: 'Edit',
-  editApplied: name => `Accepted your edited change to ${name}`,
-  editApply: 'Save and accept',
-  editApplyFailed: 'Your edit was not accepted. The proposal is unchanged.',
-  editCancel: 'Cancel',
-  editCount: (words, chars) => `${words} word${words === 1 ? '' : 's'}, ${chars} character${chars === 1 ? '' : 's'}`,
-  editSave: 'Save as proposal',
-  editSaveFailed: 'Your edit was not saved. The proposal is unchanged.',
-  editSaved: name => `Saved your edit to the proposed change to ${name}. It is still pending.`,
-  editScope_entry: 'The whole entry after this change',
-  editScope_file: 'The whole file after this change',
-  editScope_span: 'The new text for the part this change replaces',
-  editTotal: (label, total, max) => `${label} after this change: ${total} of ${max} characters`,
-  editTotalOver: (label, total, max, over) => `${label} after this change: ${total} of ${max} characters, ${over} over the limit`,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4191,6 +3556,19 @@ const en = {
   emptyKind: kind => `Nothing under ${kind} for this profile.`,
   emptyTitle: 'No changes waiting',
   failed: reason => (endSentence(reason) ? `Change not applied: ${endSentence(reason)} It stays pending.` : 'Change not applied. It stays pending.'),
+  needsApi: 'This version of Skill Review needs a Hermes with the write review API (tools.write_review_api). Update Hermes to review staged writes here. Library still works.',
+  needsApiTitle: 'Hermes is too old for this review tab',
+  needsReview: n => `${n} write${n === 1 ? '' : 's'} stopped partway through approval. Check the files, then close ${n === 1 ? 'it' : 'each one'} in chat with /memory reject <id> or /skills reject <id>.`,
+  statusAlreadyApplied: 'Already accepted elsewhere, for example from chat. Nothing changed.',
+  statusAlreadyRejected: 'Already rejected elsewhere, for example from chat. Nothing changed.',
+  statusApplied: 'Accepted.',
+  statusConflict: reason => `Not applied: ${reason || 'Hermes refused it.'} Nothing was written, and the write is still pending. Look at it again.`,
+  statusNeedsReview: (reason, command) => `Hermes stopped partway through applying this write: ${reason || 'the files may be partly changed.'} Check the files, then run ${command} in chat.`,
+  statusRejected: 'Rejected.',
+  statusRejectedWarning: warning => `Rejected. ${warning}`,
+  statusStale: reason => `Not applied, because it no longer fits the file: ${reason || 'the file changed since it was staged.'} Reject it, or ask Hermes for a new change.`,
+  statusUnseen: 'Left pending: it was staged after this file was loaded. Look at it first.',
+  statusWholeWrite: 'This change is one part of a larger write. Use Accept all or Reject all for this file.',
   gateOff: 'Writes are saved right away. Set skills.write_approval or memory.write_approval to true to review them first.',
   kindFilter: (label, n) => `${label} (${n})`,
   kindGroup: 'Kind of change',
@@ -4225,8 +3603,7 @@ const en = {
 }
 
 messages.en = en
-Object.assign(en, NOTIFY_EN, LIST_EN, EDIT_EN, SETTINGS_EN)
-Object.assign(en, REMOVE_EN)
+Object.assign(en, NOTIFY_EN, LIST_EN, SETTINGS_EN)
 Object.assign(en, EXPAND_EN)
 Object.assign(en, LIB_EN)
 

@@ -6,7 +6,7 @@ import { register } from 'node:module'
 import { test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { CREATE_DIFF, FILES, GONE, MEMORY_DIFF, MEMORY_FILE, NEW_SKILL_FILE, ODD_FILE, SKILL_DIFF, SKILL_FILE, T0, USER_FILE } from './fixtures.mjs'
+import { API_DIFF, CREATE_DIFF, EXPECT_M1, EXPECT_M2, FILES, GONE, MEMORY_DIFF, MEMORY_FILE, NEW_SKILL_FILE, ODD_FILE, SKILL_DIFF, SKILL_FILE, T0, USER_FILE } from './fixtures.mjs'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const pluginPath = fileURLToPath(new URL('../../desktop/plugin.js', import.meta.url))
@@ -29,7 +29,7 @@ const mod = await import(pathToFileURL(pluginPath).href)
 const {
   $selection, STYLES, FILE_STYLES, BlockView, FileDetailView, FileDiffView, FileHeader, FileList, FileListRow,
   actionPath, actionToast, diffKey, fileDiffPath, fileKey, filesPath, handleDiffData, isNewBlock, lastOpenedAt,
-  messages, openVisit, performAction, segmentRows, visibleItems
+  decisionBody, messages, openVisit, performAction, segmentRows
 } = mod
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
 
@@ -69,7 +69,7 @@ function fakeQueryClient() {
 
 function fakeRest(reply) {
   const calls = []
-  const rest = async (path, opts) => { calls.push({ path, method: opts?.method }); return typeof reply === 'function' ? reply(path) : reply }
+  const rest = async (path, opts) => { calls.push({ path, method: opts?.method, body: opts?.body }); return typeof reply === 'function' ? reply(path) : reply }
   return { calls, rest }
 }
 
@@ -102,12 +102,6 @@ test('the list has one row per profile and file, keyed by fileKey', () => {
   assert.equal(rows.length, 5)
   assert.deepEqual(rows.map(r => r.key), files.map(fileKey))
   assert.equal(new Set(rows.map(r => r.key)).size, 5, 'USER.md in dev and in ops are two rows')
-})
-
-test('profile scope and kind filters apply to files', () => {
-  assert.deepEqual(visibleItems(FILES.files, 'focused', 'dev').map(f => f.file), ['MEMORY.md', 'USER.md', 'council/SKILL.md'])
-  assert.deepEqual(visibleItems(FILES.files, 'all', 'dev', 'skills').map(f => f.file), ['council/SKILL.md', 'release-notes/SKILL.md'])
-  assert.deepEqual(visibleItems(FILES.files, 'focused', 'dev', 'memory').map(f => f.file), ['MEMORY.md', 'USER.md'])
 })
 
 test('a list row shows the file, profile, counts and a New badge, and selects on click', () => {
@@ -262,14 +256,75 @@ test('a stale block is greyed, shows its reason and offers Reject only', () => {
     'can_accept false hides Accept even for a pending block')
 })
 
-test('a conflict block says it conflicts with the block above', () => {
-  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: SKILL_DIFF.segments, t }))
-  const conflict = blocks(tree).find(b => b.props['data-block'] === 'p2-0')
-  assert.match(text(conflict), /conflictAbove/)
-  assert.ok(button(conflict, 'accept'), 'a conflict block can still be accepted when the backend allows it')
-  assert.equal(messages.en.conflictAbove, 'Conflicts with the block above')
-  const plain = blocks(tree).find(b => b.props['data-block'] === 'p1-0')
-  assert.doesNotMatch(text(plain), /conflictAbove/)
+test('a conflict block shows Hermes\'s reason and offers only Reject', () => {
+  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: API_DIFF.segments, t }))
+  const conflict = blocks(tree).find(b => b.props['data-block'] === 'm3-cccccccccc')
+  assert.match(text(conflict), /conflictReason:Skill 'council' already exists/)
+  assert.equal(button(conflict, 'accept'), undefined, 'a write Hermes cannot apply has no Accept')
+  assert.ok(button(conflict, 'reject'))
+  assert.equal(messages.en.conflictReason('x.'), 'Cannot apply: x.')
+  assert.equal(messages.en.conflictAbove, undefined, 'no overlap guess any more: Hermes decides')
+})
+
+test('a block of a write with several changes has no buttons and says why', () => {
+  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: API_DIFF.segments, t }))
+  for (const id of ['m2-aaaaaaaaaa', 'm2-bbbbbbbbbb']) {
+    const part = blocks(tree).find(b => b.props['data-block'] === id)
+    assert.equal(button(part, 'accept'), undefined, id)
+    assert.equal(button(part, 'reject'), undefined, id)
+    assert.match(text(part), /one part of a write with 2 changes/)
+  }
+  const single = blocks(tree).find(b => b.props['data-block'] === 'm1-0123456789')
+  assert.ok(button(single, 'accept') && button(single, 'reject'), 'a one-change write keeps both buttons')
+})
+
+test('blocks render the preview text: a new entry, a unified diff, a removed entry', () => {
+  const rows = id => segmentRows({ type: 'block', block: API_DIFF.segments.find(s => s.block.id === id).block })
+  assert.deepEqual(rows('m1-0123456789').map(r => [r.kind, r.text]), [['add', 'gamma fact']])
+  assert.deepEqual(rows('m2-aaaaaaaaaa').map(r => [r.kind, r.text]),
+    [['hunk', '@@ -1 +1 @@'], ['remove', 'alpha fact'], ['add', 'ALPHA fact']], 'the file header row is dropped')
+  assert.deepEqual(rows('m2-bbbbbbbbbb').map(r => [r.kind, r.text]), [['remove', 'beta fact']])
+  assert.deepEqual(rows('m3-cccccccccc'), [], 'a blocked op shows its reason, not a diff')
+})
+
+test('every decision sends back the expect of the preview shown, unchanged', () => {
+  const actions = []
+  const view = expand(FileDetailView({
+    busy: false, confirmOpen: true, data: API_DIFF, file: MEMORY_FILE, onAction: a => actions.push(a),
+    onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t
+  }))
+  const single = blocks(view).find(b => b.props['data-block'] === 'm1-0123456789')
+  button(single, 'accept').props.onClick()
+  button(single, 'reject').props.onClick()
+  button(view, 'acceptAll').props.onClick()
+  walk(view).find(n => n.props?.destructive === true).props.onConfirm()
+  const all = { m1: EXPECT_M1, m2: EXPECT_M2, m3: null }
+  assert.deepEqual(actions, [
+    { blockId: 'm1-0123456789', verb: 'accept', body: { expect: EXPECT_M1 } },
+    { blockId: 'm1-0123456789', verb: 'reject', body: { expect: EXPECT_M1 } },
+    { verb: 'accept-all', body: { expects: all } },
+    { verb: 'reject-all', body: { expects: all } }
+  ])
+  assert.equal(actions[0].body.expect, EXPECT_M1, 'the same object, not a copy or a rebuild')
+  assert.equal(decisionBody({ verb: 'accept', blockId: 'nope' }, API_DIFF).expect, null)
+})
+
+test('a decision POSTs its body to the block or file URL', async () => {
+  host.reset()
+  const qc = fakeQueryClient()
+  const { calls, rest } = fakeRest({ status: 'applied', reason: null, file_gone: false })
+  await performAction({ action: { blockId: 'm1-0123456789', verb: 'accept', body: { expect: EXPECT_M1 } }, file: MEMORY_FILE, queryClient: qc, rest, t })
+  assert.deepEqual(calls.at(-1).body, { expect: EXPECT_M1 })
+  assert.equal(calls.at(-1).path, `/files/dev/memory/${MEMORY_FILE.key}/blocks/m1-0123456789/accept`)
+})
+
+test('a file view on a Hermes without the write review API shows its one message', () => {
+  const view = expand(FileDetailView({
+    busy: false, confirmOpen: false, data: { status: 'unavailable', message: 'needs the API' }, file: MEMORY_FILE,
+    onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t
+  }))
+  assert.ok(walk(view).some(n => n.props?.description === 'needs the API'))
+  assert.equal(blocks(view).length, 0)
 })
 
 // --- file header, confirmation ----------------------------------------------------------------
@@ -283,10 +338,10 @@ test('the file header has Accept all and Reject all; Reject all only asks for co
   }))
   assert.match(text(view), /council\/SKILL\.md/)
   button(view, 'acceptAll').props.onClick()
-  assert.deepEqual(actions, [{ verb: 'accept-all' }])
+  assert.deepEqual(actions, [{ verb: 'accept-all', body: { expects: {} } }])
   button(view, 'rejectAll').props.onClick()
   assert.deepEqual(asked, [true])
-  assert.deepEqual(actions, [{ verb: 'accept-all' }], 'Reject all does not call the backend by itself')
+  assert.deepEqual(actions, [{ verb: 'accept-all', body: { expects: {} } }], 'Reject all does not call the backend by itself')
   const dialog = walk(view).find(n => n.props?.destructive === true)
   assert.equal(dialog.props.open, false)
   const open = expand(FileDetailView({
@@ -297,7 +352,7 @@ test('the file header has Accept all and Reject all; Reject all only asks for co
   assert.equal(confirm.props.open, true)
   assert.match(confirm.props.description, /rejectAllBody:3,council\/SKILL\.md/)
   confirm.props.onConfirm()
-  assert.deepEqual(actions.at(-1), { verb: 'reject-all' })
+  assert.deepEqual(actions.at(-1), { verb: 'reject-all', body: { expects: {} } })
 })
 
 test('Accept all is disabled when no block can be accepted', () => {
@@ -328,14 +383,14 @@ test('per-block accept and reject POST to the block URL, toast, and refetch the 
   const { calls, rest } = fakeRest({ status: 'applied', error: null, file_gone: false })
   $selection.set(fileKey(MEMORY_FILE))
   await performAction({ action: { blockId: 'r1-0', verb: 'accept' }, file: MEMORY_FILE, queryClient: qc, rest, t })
-  assert.deepEqual(calls, [{ path: `/files/dev/memory/${MEMORY_FILE.key}/blocks/r1-0/accept`, method: 'POST' }])
+  assert.deepEqual(calls, [{ path: `/files/dev/memory/${MEMORY_FILE.key}/blocks/r1-0/accept`, method: 'POST', body: null }])
   assert.deepEqual(host.toasts.map(x => x.kind), ['success'])
   assert.deepEqual(qc.invalidated, [diffKey(MEMORY_FILE), ['skill-review', 'files'], ['skill-review', 'pending']])
   assert.equal($selection.get(), fileKey(MEMORY_FILE), 'the file stays open while it has changes')
 
   const second = fakeRest({ status: 'rejected', error: null, file_gone: false })
   await performAction({ action: { blockId: 'r2-0', verb: 'reject' }, file: MEMORY_FILE, queryClient: qc, rest: second.rest, t })
-  assert.deepEqual(second.calls, [{ path: `/files/dev/memory/${MEMORY_FILE.key}/blocks/r2-0/reject`, method: 'POST' }])
+  assert.deepEqual(second.calls, [{ path: `/files/dev/memory/${MEMORY_FILE.key}/blocks/r2-0/reject`, method: 'POST', body: null }])
   assert.equal(host.toasts.at(-1).kind, 'info')
 })
 

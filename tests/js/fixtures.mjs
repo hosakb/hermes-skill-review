@@ -181,3 +181,44 @@ export const CREATE_DIFF = {
 }
 
 export const GONE = { status: 'gone' }
+
+// The shape the write review API backend sends: each block carries its preview as `kind` and
+// `text`, and `writes` carries every write's opaque `expect`, to send back unchanged.
+const EXPECT_M1 = { profile: 'p', record_sha256: 'a'.repeat(64), targets: {}, review_kind: 'memory', review_id: 'm1' }
+const EXPECT_M2 = { profile: 'p', record_sha256: 'b'.repeat(64), targets: {}, review_kind: 'memory', review_id: 'm2', extra: [1, { x: 2 }] }
+
+export const API_DIFF = {
+  status: 'ok',
+  file: MEMORY_FILE,
+  segments: [
+    {
+      type: 'block',
+      block: block({ id: 'm1-0123456789', record_id: 'm1', staged_at: T0 + 100, summary: 'add to MEMORY.md: gamma fact',
+        can_reject: true, kind: 'create', text: 'gamma fact' })
+    },
+    {
+      type: 'block',
+      block: block({ id: 'm2-aaaaaaaaaa', record_id: 'm2', staged_at: T0 + 200, summary: 'patch in MEMORY.md: ALPHA',
+        can_accept: false, can_reject: false, kind: 'diff',
+        reason: 'This change is one part of a write with 2 changes. Hermes accepts or rejects a write only as a whole, so use Accept all or Reject all for this file.',
+        text: '--- a/MEMORY.md\n+++ b/MEMORY.md\n@@ -1 +1 @@\n-alpha fact\n+ALPHA fact\n' })
+    },
+    {
+      type: 'block',
+      block: block({ id: 'm2-bbbbbbbbbb', record_id: 'm2', staged_at: T0 + 200, summary: 'remove from MEMORY.md: beta fact',
+        can_accept: false, can_reject: false, kind: 'delete', text: 'beta fact',
+        reason: 'This change is one part of a write with 2 changes. Hermes accepts or rejects a write only as a whole, so use Accept all or Reject all for this file.' })
+    },
+    {
+      type: 'block',
+      block: block({ id: 'm3-cccccccccc', record_id: 'm3', staged_at: T0 + 300, summary: 'create skill council', state: 'conflict',
+        can_accept: false, can_reject: true, kind: 'diff', text: '', reason: "Skill 'council' already exists, so this create cannot apply." })
+    }
+  ],
+  writes: {
+    m1: { expect: EXPECT_M1, status: 'ready', reason: null, op_count: 1 },
+    m2: { expect: EXPECT_M2, status: 'ready', reason: null, op_count: 2 },
+    m3: { expect: null, status: 'conflict', reason: "Skill 'council' already exists, so this create cannot apply.", op_count: 1 }
+  }
+}
+export { EXPECT_M1, EXPECT_M2 }

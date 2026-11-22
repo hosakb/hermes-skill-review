@@ -340,7 +340,7 @@ def test_every_decide_status_is_passed_to_the_client(client, stage, root, record
     f = only_file(client)
     data = diff(client, f)
     out = accept(client, f, data, blocks(data)[0], "reject" if reply["status"] == "rejected" else "accept")
-    assert {k: v for k, v in out.items() if k != "file_gone"} == {"id": pid(staged), **expected}
+    assert {k: v for k, v in out.items() if k != "file_gone"} == {"id": pid(staged), "kind": "memory", **expected}
 
 
 def test_a_stale_write_is_answered_stale_without_asking_hermes(client, stage, root, recorded):

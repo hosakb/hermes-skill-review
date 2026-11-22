@@ -322,7 +322,7 @@ def _decide(kind: str, write_id: str, decision: str, expect: Any) -> dict[str, A
         reply = decide_write(kind, write_id, decision, expect=expect)
     except (OSError, ValueError) as exc:
         reply = {"status": "conflict", "reason": str(exc)}
-    out = {"id": write_id, "status": reply.get("status") or "conflict", "reason": reply.get("reason")}
+    out = {"id": write_id, "kind": kind, "status": reply.get("status") or "conflict", "reason": reply.get("reason")}
     for extra in ("prior", "decided_at", "warning"):
         if reply.get(extra) is not None:
             out[extra] = reply[extra]
@@ -334,7 +334,7 @@ def _guarded_decide(write: dict[str, Any], decision: str, expect: Any) -> dict[s
     answered with that status and its reason, and Hermes is not asked. A reject is always sent."""
     if decision == "approve" and write["status"] != "ready":
         status = write["status"] if write["status"] in ("stale", "conflict") else "conflict"
-        return {"id": write["id"], "status": status, "reason": write["reason"]}
+        return {"id": write["id"], "kind": write["kind"], "status": status, "reason": write["reason"]}
     return _decide(write["kind"], write["id"], decision, expect)
 
 
@@ -453,7 +453,7 @@ def _resolve_all(owner: str, subsystem: str, key: str, decision: str, raw: Any) 
     results = []
     for write in sorted(entry["writes"].values(), key=lambda w: (w["staged_at"], w["id"])):
         if write["id"] not in expects:
-            results.append({"id": write["id"], "status": "unseen", "reason": UNSEEN})
+            results.append({"id": write["id"], "kind": write["kind"], "status": "unseen", "reason": UNSEEN})
             continue
         results.append(_guarded_decide(write, decision, expects[write["id"]]))
     return {"results": results, "file_gone": key not in _entries((subsystem,))[0]}

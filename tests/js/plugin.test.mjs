@@ -32,8 +32,8 @@ globalThis.__queryClient = {
 register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  parseSection, planAutoOpen, visibleItems, itemKey, resultToast, openReview, countBySubsystem, pendingPath,
-  messages, STYLES, DiffRow, DiffView, DetailHeader, ListRow, $selection, nextKeyAfter, LIST_PANE, ReviewPane
+  parseSection, planAutoOpen, itemKey, resultToast, statusText, openReview, countBySubsystem,
+  messages, STYLES, DiffRow, $selection, LIST_PANE, ReviewPane
 } = mod
 const plugin = mod.default
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
@@ -187,33 +187,6 @@ test('selection is a module-level atom, so it survives pane remounts', () => {
   $selection.set(null)
 })
 
-test('nextKeyAfter picks the following item, else the previous, else null', () => {
-  const items = ['a', 'b', 'c'].map(id => ({ subsystem: 'skills', profile: 'dev', id }))
-  assert.equal(nextKeyAfter(items, 'skills/dev/b'), 'skills/dev/c')
-  assert.equal(nextKeyAfter(items, 'skills/dev/c'), 'skills/dev/b')
-  assert.equal(nextKeyAfter(items.slice(0, 1), 'skills/dev/a'), null)
-  assert.equal(nextKeyAfter(items, 'skills/dev/zzz'), 'skills/dev/a')
-})
-
-test('ListRow highlights the selected item and selects on click', () => {
-  const item = { subsystem: 'skills', profile: 'default', id: '3e0b9dba', subject: 'council', action: 'batch', created_at: 1 }
-  let picked = null
-  const on = ListRow({ item, selected: true, onSelect: k => { picked = k }, t })
-  const off = ListRow({ item, selected: false, onSelect: () => {}, t })
-  assert.equal(on.props['aria-current'], true)
-  assert.equal(off.props['aria-current'], false)
-  assert.notDeepEqual(on.props.style, off.props.style, 'selected row is visually distinct')
-  assert.equal(on.props.style.borderLeft, '2px solid var(--ui-accent)')
-  assert.ok(styleHas(on.props.style, { minWidth: 0, width: '100%' }))
-  on.props.onClick()
-  assert.equal(picked, itemKey(item))
-  const title = find(on, n => n.props?.children === 'council')
-  assert.ok(styleHas(title.props.style, { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }),
-    'long names are truncated, never widen the list')
-})
-
-// --- overflow: style objects ------------------------------------------------------------------
-
 test('pane roots are clipped flex columns that let children shrink', () => {
   assert.ok(styleHas(STYLES.paneRoot, {
     display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden'
@@ -255,46 +228,6 @@ test('a 400-character single line renders as one wrapping row, text under the te
   assert.equal(row.props.style.background, 'var(--ui-diff-add-background)')
 })
 
-test('a new-file diff box carries the guarded box style and no max-content sizing anywhere', () => {
-  const tree = DiffView({ sections: [{ title: '', kind: 'create', text: 'x'.repeat(400) + '\nshort\n' }], newFileLabel: 'New file', t })
-  const box = find(tree, n => n.props?.style === STYLES.diffBox)
-  assert.ok(box, 'diff box uses STYLES.diffBox')
-  for (const node of walk(tree)) {
-    const s = node.props?.style
-    if (!s) continue
-    assert.notEqual(s.minWidth, 'max-content')
-    assert.notEqual(s.width, 'max-content')
-    assert.notEqual(s.whiteSpace, 'pre', 'no unwrapped text anywhere')
-  }
-})
-
-test('detail header and summary keep horizontal padding off the pane edge', () => {
-  assert.equal(STYLES.header.paddingLeft, '0.75rem')
-  assert.equal(STYLES.header.paddingRight, '0.75rem')
-  assert.equal(STYLES.summary.paddingLeft, '0.75rem')
-  assert.equal(STYLES.summary.paddingRight, '0.75rem')
-  assert.ok(styleHas(STYLES.header, { display: 'flex', flexWrap: 'wrap', minWidth: 0 }))
-  const item = { subsystem: 'skills', profile: 'default', id: '3e0b9dba', subject: 'council', action: 'batch',
-    origin: 'assistant_tool', created_at: 1, summary: 'batch(1 ops: create) on council' }
-  let accepted = 0, rejected = 0
-  const header = DetailHeader({ item, busy: false, onAccept: () => { accepted += 1 }, onReject: () => { rejected += 1 }, t })
-  assert.equal(header.props.style, STYLES.headerWrap)
-  const [row, summary] = kids(header)
-  assert.equal(row.props.style, STYLES.header, 'title row carries its own padding')
-  assert.equal(summary.props.children, 'batch(1 ops: create) on council')
-  assert.equal(summary.props.style, STYLES.summary, 'summary is a sibling of the row, padded once, not nested in it')
-  assert.equal(STYLES.headerWrap.paddingLeft, undefined, 'no double indent from the wrapper')
-  const buttons = walk(header).filter(n => typeof n.props?.onClick === 'function')
-  buttons.find(b => b.props.children === 'accept').props.onClick()
-  buttons.find(b => b.props.children === 'reject').props.onClick()
-  assert.deepEqual([accepted, rejected], [1, 1])
-  const disabled = DetailHeader({ item, busy: true, onAccept() {}, onReject() {}, t })
-  assert.ok(walk(disabled).filter(n => n.props?.children === 'accept' || n.props?.children === 'reject')
-    .every(b => b.props.disabled === true), 'buttons disable while a request runs')
-})
-
-// --- pure helpers (unchanged behaviour) -------------------------------------------------------
-
 test('planAutoOpen announces only keys that are new', () => {
   const a = { subsystem: 'skills', profile: 'dev', id: 'a1' }
   const b = { subsystem: 'skills', profile: 'ops', id: 'a1' }
@@ -307,21 +240,9 @@ test('planAutoOpen announces only keys that are new', () => {
   assert.deepEqual(planAutoOpen([b], r.keep).keep, ['skills/ops/a1'])
 })
 
-test('visibleItems filters by focused profile and by subsystem', () => {
-  const items = [
-    { subsystem: 'skills', profile: 'dev', id: '1' },
-    { subsystem: 'memory', profile: 'dev', id: '2' },
-    { subsystem: 'memory', profile: 'ops', id: '3' }
-  ]
-  assert.deepEqual(visibleItems(items, 'focused', 'dev').map(i => i.id), ['1', '2'])
-  assert.deepEqual(visibleItems(items, 'all', 'dev', 'memory').map(i => i.id), ['2', '3'])
-  assert.deepEqual(visibleItems(items, 'focused', 'dev', 'skills').map(i => i.id), ['1'])
-})
-
-test('countBySubsystem and pendingPath', () => {
+test('countBySubsystem', () => {
   assert.deepEqual(countBySubsystem([{ subsystem: 'skills' }, { subsystem: 'memory' }, { subsystem: 'memory' }]),
     { all: 3, memory: 2, skills: 1 })
-  assert.equal(pendingPath({ subsystem: 'memory', profile: 'dev', id: 'a/b' }, 'accept'), '/pending/memory/dev/a%2Fb/accept')
 })
 
 test('every action the backend can report has a label', () => {
@@ -345,6 +266,59 @@ test('resultToast maps every backend status and keeps a scan report', () => {
   const r = resultToast('accept', { status: 'failed', error: scan }, t)
   assert.equal(r.kind, 'error')
   assert.equal(r.detail, scan)
+  const guard = resultToast('accept', { status: 'conflict', reason: scan }, t)
+  assert.equal(guard.kind, 'error')
+  assert.equal(guard.detail, scan, 'a Skills Guard refusal from decide_write keeps its full report')
+})
+
+// --- every status of the write review API, in the words the user reads --------------------------
+
+const tEn = (k, ...a) => (typeof messages.en[k] === 'function' ? messages.en[k](...a) : messages.en[k])
+
+test('statusText: one plain message per decide_write status and per backend status', () => {
+  const cases = [
+    [{ status: 'applied' }, 'Accepted.'],
+    [{ status: 'rejected' }, 'Rejected.'],
+    [{ status: 'rejected', warning: 'The files may be partly changed' }, 'Rejected. The files may be partly changed.'],
+    [{ status: 'already_resolved', prior: 'applied' }, 'Already accepted elsewhere, for example from chat. Nothing changed.'],
+    [{ status: 'already_resolved', prior: 'rejected' }, 'Already rejected elsewhere, for example from chat. Nothing changed.'],
+    [{ status: 'conflict', reason: 'the pending write changed since it was previewed. Preview it again.' },
+      'Not applied: the pending write changed since it was previewed. Preview it again. Nothing was written, and the write is still pending. Look at it again.'],
+    [{ status: 'conflict' }, 'Not applied: Hermes refused it. Nothing was written, and the write is still pending. Look at it again.'],
+    [{ status: 'needs_review', reason: 'An earlier approval stopped after it began writing', id: 'ab12cd34', kind: 'skills' },
+      'Hermes stopped partway through applying this write: An earlier approval stopped after it began writing. Check the files, then run /skills reject ab12cd34 in chat.'],
+    [{ status: 'needs_review', id: 'ab12cd34', kind: 'memory' },
+      'Hermes stopped partway through applying this write: the files may be partly changed. Check the files, then run /memory reject ab12cd34 in chat.'],
+    [{ status: 'stale', reason: 'an entry this write targets changed since it was staged' },
+      'Not applied, because it no longer fits the file: an entry this write targets changed since it was staged. Reject it, or ask Hermes for a new change.'],
+    [{ status: 'unseen' }, 'Left pending: it was staged after this file was loaded. Look at it first.'],
+    [{ status: 'whole_write', reason: 'This change is one part of a write with 2 changes' }, 'This change is one part of a write with 2 changes.'],
+    [{ status: 'whole_write' }, 'This change is one part of a larger write. Use Accept all or Reject all for this file.'],
+    [{ status: 'gone' }, 'Already handled, for example from chat.'],
+    [{ status: 'unavailable', message: 'needs the API' }, 'needs the API'],
+    [{ status: 'unavailable' }, messages.en.needsApi],
+    [{ status: 'something new', reason: 'odd' }, 'Change not applied: odd. It stays pending.']
+  ]
+  for (const [result, expected] of cases) {
+    assert.equal(statusText(result, tEn), expected, JSON.stringify(result))
+  }
+})
+
+test('resultToast: success for applied, info for the quiet outcomes, error for refusals', () => {
+  const kinds = Object.fromEntries(['applied', 'rejected', 'already_resolved', 'conflict', 'needs_review', 'stale', 'unseen',
+    'whole_write', 'gone', 'unavailable'].map(status => [status, resultToast('accept', { status, reason: 'r' }, tEn).kind]))
+  assert.deepEqual(kinds, {
+    applied: 'success', rejected: 'info', already_resolved: 'info', conflict: 'error', needs_review: 'error', stale: 'info',
+    unseen: 'info', whole_write: 'info', gone: 'info', unavailable: 'error'
+  })
+  assert.equal(resultToast('accept', { status: 'applied', item: { subject: 'MEMORY.md' } }, tEn).message, 'Accepted change to MEMORY.md')
+  assert.equal(resultToast('reject', { status: 'rejected', item: { subject: 'MEMORY.md' } }, tEn).message, 'Rejected change to MEMORY.md')
+})
+
+test('the missing-API message is one plain sentence pair with the module name', () => {
+  assert.equal(messages.en.needsApi, 'This version of Skill Review needs a Hermes with the write review API ' +
+    '(tools.write_review_api). Update Hermes to review staged writes here. Library still works.')
+  assert.doesNotMatch(messages.en.needsApi + messages.en.needsApiTitle, /\u2014/)
 })
 
 test('source: no hardcoded colours, only allowed imports, no workspace takeover, no Radix table wrapper', () => {
@@ -585,8 +559,3 @@ test('NotifyModeSwitch is a labelled two-option segmented control', () => {
   assert.deepEqual([messages.en.notifyPopup, messages.en.notifyLight], ['Popup', 'Light up icon'])
 })
 
-test('the list pane header carries the notify control', () => {
-  const src = readFileSync(pluginPath, 'utf8')
-  const list = src.slice(src.indexOf('function ListPane()'), src.indexOf('// Detail pane'))
-  assert.match(list, /jsx\(NotifyModeControl, \{\}\)/)
-})
