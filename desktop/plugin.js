@@ -2870,9 +2870,25 @@ const MIRROR_PROPS = [
   'tabSize', 'textRendering', 'textTransform', 'whiteSpace', 'wordBreak', 'wordSpacing'
 ]
 
-/** Lay each line out in `mirror` with the textarea's font and width, and return how many rows
- *  each one takes. Null when there is nothing to measure (no nodes, or the editor is not laid out). */
-export function measureWrapRows(area, mirror, lines) {
+// Per mirror node: the lines laid out in it (one div each), their row counts, and the style and
+// font generation they were measured with.
+const MIRROR_CACHE = new WeakMap()
+
+const mirrorLine = (doc, content) => {
+  const el = doc.createElement('div')
+
+  // An empty div has no height, but an empty line still takes one row.
+  el.textContent = content || '\u200b'
+
+  return el
+}
+
+/** Lay the lines out in `mirror` with the textarea's font and width, and return how many rows
+ *  each one takes. Lines that match the last call at the start and the end keep their nodes and
+ *  counts, so a keystroke lays out only the lines it changed. A new width, font or `generation`
+ *  (bumped when fonts finish loading) reads every line again. Null when there is nothing to
+ *  measure (no nodes, or the editor is not laid out). */
+export function measureWrapRows(area, mirror, lines, generation = 0) {
   const doc = area?.ownerDocument
   const style = doc?.defaultView?.getComputedStyle?.(area)
 
@@ -2880,30 +2896,67 @@ export function measureWrapRows(area, mirror, lines) {
     return null
   }
 
-  for (const prop of MIRROR_PROPS) {
-    mirror.style[prop] = style[prop]
+  let cache = MIRROR_CACHE.get(mirror)
+
+  if (!cache) {
+    cache = { counts: [], generation, lines: [], look: null, nodes: [], probe: mirrorLine(doc, ''), row: 0 }
+    mirror.replaceChildren(cache.probe)
+    MIRROR_CACHE.set(mirror, cache)
   }
 
-  const line = content => {
-    const el = doc.createElement('div')
+  const look = MIRROR_PROPS.map(prop => style[prop]).join('|')
 
-    // An empty div has no height, but an empty line still takes one row.
-    el.textContent = content || '​'
+  if (cache.look !== look || cache.generation !== generation) {
+    for (const prop of MIRROR_PROPS) {
+      mirror.style[prop] = style[prop]
+    }
 
-    return el
+    Object.assign(cache, { generation, look, row: 0 })
   }
-  const nodes = lines.map(line)
-  const probe = line('')
 
-  mirror.replaceChildren(...nodes, probe)
+  const old = cache.lines
+  const most = Math.min(old.length, lines.length)
+  let head = 0
+  let tail = 0
 
-  const row = probe.getBoundingClientRect().height
+  while (head < most && old[head] === lines[head]) {
+    head += 1
+  }
+
+  while (tail < most - head && old[old.length - 1 - tail] === lines[lines.length - 1 - tail]) {
+    tail += 1
+  }
+
+  // Swap the changed middle. No spread: a file can have more lines than a call takes arguments.
+  const added = lines.slice(head, lines.length - tail).map(content => mirrorLine(doc, content))
+  const fragment = doc.createDocumentFragment()
+
+  for (const node of added) {
+    fragment.appendChild(node)
+  }
+
+  for (let i = head; i < old.length - tail; i += 1) {
+    cache.nodes[i].remove()
+  }
+
+  mirror.insertBefore(fragment, cache.nodes[old.length - tail] ?? cache.probe)
+
+  const nodes = cache.nodes.slice(0, head).concat(added, cache.nodes.slice(old.length - tail))
+  const row = cache.probe.getBoundingClientRect().height
 
   if (!(row > 0)) {
+    Object.assign(cache, { counts: [], lines, nodes, row: 0 })
+
     return null
   }
 
-  return nodes.map(el => Math.max(1, Math.round(el.getBoundingClientRect().height / row)))
+  const rows = el => Math.max(1, Math.round(el.getBoundingClientRect().height / row))
+  const counts =
+    row === cache.row ? cache.counts.slice(0, head).concat(added.map(rows), cache.counts.slice(old.length - tail)) : nodes.map(rows)
+
+  Object.assign(cache, { counts, lines, nodes, row })
+
+  return counts
 }
 
 /** The file editor as a pure view: header, pending link, alerts, the editor and its footer. */
@@ -2928,7 +2981,7 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
 
   const measure = text =>
     setMeasured({
-      counts: measureWrapRows(box?.querySelector('textarea'), box?.querySelector('[data-wrap-mirror]'), libraryLines(text)),
+      counts: measureWrapRows(box?.querySelector('textarea'), box?.querySelector('[data-wrap-mirror]'), libraryLines(text), fontLoads),
       fontLoads,
       text,
       width
