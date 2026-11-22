@@ -2,10 +2,10 @@
  * Skill Review: Hermes Desktop half.
  *
  * Shows every skill and memory write that Hermes staged under skills.write_approval and
- * memory.write_approval. One pane, a tab in the Files zone, holds a list of every pending write
- * and, beside it, the diff of the selected one with Accept and Reject. The pane opens only from the
- * status-bar Review chip, the palette or a toast, or by itself when a new change arrives and autoOpen
- * is on. Otherwise a new change shows as a toast or a lit chip. Nothing takes over the main view.
+ * memory.write_approval. A page of its own, reached from the sidebar's Skill review row, the
+ * status-bar Review chip, the palette or a toast, holds a list of every pending write and, beside
+ * it, the diff of the selected one with Accept and Reject. A new change shows as a toast with an
+ * Open action or as a lit chip; nothing opens or navigates by itself.
  * The backend is dashboard/plugin_api.py (/api/plugins/skill-review).
  *
  * Plain ESM, loaded uncompiled: UI is jsx() calls. Only @hermes/plugin-sdk, react and
@@ -60,16 +60,16 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'skill-review'
 const ROUTE = '/skill-review'
 const POLL_MS = 3000
-
-export const LIST_PANE = `${ID}:list`
+// Read through the namespace with the area's own name as the fallback: a named import of a member an
+// older host does not export stops the whole plugin from loading.
+const SIDEBAR_NAV_AREA = SDK.SIDEBAR_NAV_AREA ?? 'sidebar.nav'
 
 let CTX = null
-let useRouteFallback = false
 // True once Settings > Plugins holds this plugin's page (hosts with ctx.registerSettingsPage).
 let hasSettingsPage = false
 
-/** UI state shared by both panes. Module-level atoms, so a pane remount (drag, tab switch, reload of
- *  the layout) keeps the selection and filters. */
+/** UI state shared by the list and the detail. Module-level atoms, so leaving the page and coming
+ *  back keeps the selection and filters. */
 export const $selection = atom(null)
 const $scope = atom(null) // null: follow the focused profile while it has items, else all
 export const $kind = atom('all')
@@ -1113,12 +1113,6 @@ function DetailPane() {
   return jsx(Detail, { item, shown: v.shown }, itemKey(item))
 }
 
-/** Route page for desktops without the pane APIs: the same list and diff as the pane. */
-/** Desktops without the pane APIs: one route page with the settings above the review. */
-function FallbackPage() {
-  return jsxs('div', { style: STYLES.paneRoot, children: [jsx(SettingsPage, {}), jsx(ReviewPane, {})] })
-}
-
 // ---------------------------------------------------------------------------------------------
 // File view: the list shows each (profile, file) once; the detail shows one composite diff of that
 // file, its current text as grey context with every pending change drawn where it applies, and an
@@ -2017,28 +2011,17 @@ export function FilesListPane() {
   // Gates are not part of /files; /pending (the status chip's query) still reports them.
   const gateOn = (usePending().data?.profiles ?? []).some(p => Object.values(p.gates ?? {}).some(Boolean))
   const missing = v.isError && /404/.test(String(v.error?.message || ''))
-  const total = v.files.reduce((sum, f) => sum + (f.counts?.total ?? 0), 0)
   const inline = useValue($inlineSettings)
-
-  // Desktops without paneVisibility: the list mounting is the best sign the user opened it.
-  useEffect(() => {
-    if (typeof host.paneVisibility !== 'function') {
-      markSeen()
-    }
-  }, [])
 
   const bar = jsxs('div', {
     style: STYLES.bar,
     children: [
-      // Pending | Library, with the Pending total where the title and its badge were.
-      jsx('div', { style: STYLES.barRow, children: jsx(ModeControl, { total }) }),
-      // The settings live in their own pane; the header says what they are set to.
+      // The settings live on their own page; the header says what they are set to.
       jsxs('div', {
         style: LIST_STYLES.controls,
         children: [
           jsx(SettingsSummary, { hidden: v.hidden, profiles: v.profiles, sort: v.sort, t }),
-          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t }),
-          jsx(SidebarHideControl, { t })
+          jsx(SettingsGearButton, { onOpen: openSettings, t })
         ]
       }),
       jsx('div', {
@@ -2643,24 +2626,37 @@ export const LIB_STYLES = {
 
 const indent = depth => ({ paddingLeft: `calc(${PAD} + ${depth * 0.85}rem)` })
 
-/** The Pending | Library switch as a pure view. */
-export function ModeSwitch({ mode, total, onChange, t }) {
-  return jsx(SegmentedControl, {
-    onChange,
-    options: [
-      { id: 'pending', label: t('modePending', total ?? 0) },
-      { id: 'library', label: t('modeLibrary') }
-    ],
-    sizing: 'content',
-    value: MODES.includes(mode) ? mode : 'pending'
+/** The Pending | Library switch as a pure view: two buttons, the shown one pressed, the way Memory
+ *  Wiki switches its sections. Pending carries its count when there is anything to review. */
+export function ModeSwitch({ mode, total, onChange, t, unsaved = '' }) {
+  const shown = MODES.includes(mode) ? mode : 'pending'
+  const count = Number(total) > 0 ? Number(total) : 0
+  const dot = unsaved ? jsx('span', { 'aria-hidden': true, 'data-dirty': true, style: { ...LIB_STYLES.dot, marginLeft: '0.4rem' } }) : null
+
+  const button = (id, label, extra = null, aria = undefined) =>
+    jsxs(Button, {
+      'aria-label': aria,
+      'aria-pressed': shown === id,
+      onClick: () => onChange(id),
+      size: 'sm',
+      style: STYLES.button,
+      type: 'button',
+      variant: shown === id ? 'secondary' : 'outline',
+      children: [label, extra]
+    }, id)
+
+  return jsx('div', {
+    'aria-label': t('modeGroup'),
+    role: 'group',
+    style: PAGE_STYLES.modes,
+    children: [
+      button('pending', t('modePending'), count ? jsx('span', { style: PAGE_STYLES.count, children: count }) : null, count ? t('modePendingAria', count) : undefined),
+      button('library', t('modeLibrary'), dot, unsaved ? t('modeLibraryUnsaved', unsaved) : undefined),
+      // A draft kept from an earlier visit: the page has no way to stop a sidebar click, so it says
+      // here that the text is still waiting in Library.
+      unsaved ? jsx('span', { role: 'status', style: PAGE_STYLES.unsaved, title: t('unsavedIn', unsaved), children: t('unsavedIn', unsaved) }) : null
+    ]
   })
-}
-
-export function ModeControl({ total }) {
-  const t = usePluginI18n(ID)
-  const mode = useValue($mode)
-
-  return jsx(ModeSwitch, { mode, onChange: setMode, t, total })
 }
 
 /** The search box: the SDK's SearchField where the host has it, else its Input. */
@@ -2755,7 +2751,6 @@ function useLibrary() {
 export function LibraryListPane() {
   const t = usePluginI18n(ID)
   const library = useLibrary()
-  const files = useFiles()
   const hidden = useValue($hidden)
   const search = useValue($libSearch)
   const open = useValue($libOpen)
@@ -2769,13 +2764,11 @@ export function LibraryListPane() {
   const bar = jsxs('div', {
     style: STYLES.bar,
     children: [
-      jsx('div', { style: STYLES.barRow, children: jsx(ModeControl, { total: pendingTotal(files.data?.files) }) }),
       jsxs('div', {
         style: LIST_STYLES.controls,
         children: [
           jsx('span', { style: { ...STYLES.muted, ...STYLES.ellipsis }, children: profiles.length ? profileLabel(summary, hidden, t) : '' }),
-          useRouteFallback ? null : jsx(SettingsGearButton, { onOpen: openSettings, t }),
-          jsx(SidebarHideControl, { t })
+          jsx(SettingsGearButton, { onOpen: openSettings, t })
         ]
       }),
       jsx(LibrarySearch, { onChange: value => $libSearch.set(value), t, value: search }),
@@ -2969,8 +2962,10 @@ export function LibraryDetailPane() {
 }
 
 const LIB_EN = {
+  modeGroup: 'Show',
   modeLibrary: 'Library',
-  modePending: n => `Pending ${n}`,
+  modePending: 'Pending',
+  modePendingAria: n => `Pending, ${n} change${n === 1 ? '' : 's'}`,
   libConflict: 'The file changed on disk since you opened it. Reload it to see the new text.',
   libDiscard: 'Discard',
   libDiscardBody: 'Your edits to this file are not saved. They are lost if you go on.',
@@ -3008,17 +3003,18 @@ const LIB_EN = {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The review tab: list and diff side by side in one pane, stacked when the pane is narrow
+// The review page: title, lede, the Pending | Library switch, then the list and the diff side by
+// side in one work area, stacked when the work area is narrow
 // ---------------------------------------------------------------------------------------------
 
-/** Pane width (px) below which the list and the diff take turns in one column. */
+/** Work area width (px) below which the list and the diff take turns in one column. */
 export const REVIEW_NARROW_PX = 560
 
-/** A 0 width means the pane is hidden or not laid out yet; keep the wide layout then. */
+/** A 0 width means the work area is hidden or not laid out yet; keep the wide layout then. */
 export const isNarrowWidth = width => typeof width === 'number' && width > 0 && width < REVIEW_NARROW_PX
 
 /** Report the node's content width on every resize. Returns the cleanup, or undefined when there
- *  is no node or no ResizeObserver (the pane then stays side by side). */
+ *  is no node or no ResizeObserver (the work area then stays side by side). */
 export function observeWidth(node, onWidth, RO = globalThis.ResizeObserver) {
   if (!node || typeof RO !== 'function') {
     return undefined
@@ -3043,7 +3039,7 @@ export const REVIEW_STYLES = {
   root: { display: 'flex', flexDirection: 'row', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden', position: 'relative' },
   list: { ...COLUMN, borderRight: '1px solid var(--ui-stroke-secondary)', flex: '0 0 300px' },
   detail: { ...COLUMN, flex: '1 1 0' },
-  // Narrow: the one visible column fills the pane.
+  // Narrow: the one visible column fills the work area.
   alone: { borderRight: 0, flex: '1 1 0' },
   // Narrow with a file open: the list stays mounted, out of sight, so its scroll position survives.
   parked: { inset: 0, pointerEvents: 'none', position: 'absolute', visibility: 'hidden' },
@@ -3101,8 +3097,8 @@ export function ReviewLayout({ mode = 'pending', narrow, selection, onBack, root
   })
 }
 
-/** The single review pane: measures its own width and picks side by side or stacked. */
-export function ReviewPane() {
+/** The list and the detail: measures its own width and picks side by side or stacked. */
+export function ReviewWorkArea() {
   const t = usePluginI18n(ID)
   const mode = useValue($mode)
   const pendingSelection = useValue($selection)
@@ -3122,6 +3118,102 @@ export function ReviewPane() {
     : () => $selection.set(null)
 
   return jsx(ReviewLayout, { mode, narrow, onBack, rootRef: setNode, selection: library ? librarySelection : pendingSelection, t })
+}
+
+// Page spacing follows Memory Wiki's page (p-5, text-xl title, secondary lede, gap-2 buttons).
+export const PAGE_STYLES = {
+  // The page fills the workspace pane. When the pane is too short for the header and a usable work
+  // area, the page scrolls instead of squeezing the list to nothing.
+  root: {
+    boxSizing: 'border-box',
+    color: 'var(--ui-text-primary)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '1rem',
+    height: '100%',
+    minHeight: 0,
+    minWidth: 0,
+    overflowX: 'hidden',
+    overflowY: 'auto',
+    padding: '1.25rem'
+  },
+  header: { display: 'flex', flex: 'none', flexDirection: 'column', gap: '0.5rem', minWidth: 0 },
+  title: { fontSize: '1.25rem', fontWeight: 600, lineHeight: 1.3, margin: 0, minWidth: 0, overflowWrap: 'anywhere' },
+  lede: { color: 'var(--ui-text-secondary)', fontSize: '0.875rem', lineHeight: 1.5, margin: 0, maxWidth: '70ch', minWidth: 0 },
+  modes: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem', minWidth: 0 },
+  count: { color: 'var(--ui-text-tertiary)', fontVariantNumeric: 'tabular-nums', marginLeft: '0.4rem' },
+  unsaved: { color: 'var(--ui-text-secondary)', fontSize: '0.8125rem', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  work: {
+    border: '1px solid var(--ui-stroke-secondary)',
+    borderRadius: '8px',
+    display: 'flex',
+    flex: '1 1 auto',
+    flexDirection: 'column',
+    minHeight: '16rem',
+    minWidth: 0,
+    overflow: 'hidden'
+  }
+}
+
+/** The page as a pure view, so tests can read its structure. */
+export function ReviewPageView({ mode, onMode, t, total, unsaved = '' }) {
+  return jsxs('div', {
+    style: PAGE_STYLES.root,
+    children: [
+      jsxs('header', {
+        style: PAGE_STYLES.header,
+        children: [
+          jsx('h1', { style: PAGE_STYLES.title, children: t('pageTitle') }),
+          jsx('p', { style: PAGE_STYLES.lede, children: t('pageLede') }),
+          jsx(ModeSwitch, { mode, onChange: onMode, t, total, unsaved })
+        ]
+      }),
+      jsx('div', { style: PAGE_STYLES.work, children: jsx(ReviewWorkArea, {}) })
+    ]
+  })
+}
+
+// How many review pages are mounted (a split tile can show a second one). While any is, the user is
+// looking at the review, so the watcher marks every change seen.
+let pageMounts = 0
+
+export const pageMounted = () => pageMounts > 0
+
+/** The page came on screen: it counts as opening the review. Returns the unmount cleanup. */
+export function notePageMount() {
+  pageMounts += 1
+  markSeen()
+
+  return () => {
+    pageMounts = Math.max(0, pageMounts - 1)
+  }
+}
+
+/** The kept Library draft as the notice names it: profile, then skill folder when there is one,
+ *  then the file. */
+export const draftLabel = session =>
+  session ? [session.profile, session.skill, session.name].filter(Boolean).join('/') : ''
+
+/** The route page. */
+export function ReviewPage() {
+  const t = usePluginI18n(ID)
+  const mode = useValue($mode)
+  const editing = useValue($libEditor)
+  const files = useFiles()
+
+  useEffect(() => notePageMount(), [])
+
+  const unsaved = isDirty(editing) ? draftLabel(editing) : ''
+
+  return jsx(ReviewPageView, { mode, onMode: setMode, t, total: pendingTotal(files.data?.files), unsaved })
+}
+
+const PAGE_EN = {
+  modeLibraryUnsaved: file => `Library, unsaved changes in ${file}`,
+  unsavedIn: file => `Unsaved changes in ${file}`,
+  pageLede:
+    'Changes your agents want to make to their skills and memory. Nothing is saved until you accept it. Library lets you read and edit the saved files directly.',
+  pageTitle: 'Skill review'
 }
 
 const FILE_EN = {
@@ -3589,84 +3681,15 @@ const EXPAND_EN = {
 // Reveal, watcher, status chip
 // ---------------------------------------------------------------------------------------------
 
-/**
- * The review pane. register() does not register it: Desktop docks every registered pane at launch
- * and restores a saved layout, so a pane registered at startup would appear on its own. It is
- * registered on demand (first Review press or first new change with autoOpen on), the way Bot Mode
- * registers its Routines pane. Until then a saved layout entry for it stays hidden and its zone
- * collapses, because Desktop draws no unregistered pane.
- *
- * Desktop adopts it as a background tab: the Files tab keeps the active slot until openReview
- * reveals it, which happens right after registering. defaultCollapsed is not set. In a shared zone
- * it does nothing for a background tab, and on an active one it would fold the Files tab too.
- *
- * Desktop cannot dismiss a pane for a plugin at startup. This is the plugin's only pane, and
- * Desktop turns a plugin off when its only pane is closed (closeTreePane in the tree store). So the
- * pane is hideOnly: no X, no middle or cmd-click close, no Close menu rows; the zone menu's Show/Hide
- * rows and the palette's "Toggle Pending writes tab" replace them, and collapsing still works.
- * placement 'right' keeps cmd-W away from it too: cmd-W closes the active tab of a zone that holds a
- * 'main' pane and does not check hideOnly. Known gap: if the user drags this tab into the chat zone,
- * cmd-W there still closes it and turns the plugin off.
- */
-export function reviewPaneContribution() {
-  return {
-    id: 'list', // skill-review:list, the same id as before, so saved layouts still match it
-    area: 'panes',
-    title: en.listTitle,
-    // A tab in the Files zone, re-homed there on every boot (enforce), like Bot Mode's Bots tab in
-    // the sessions zone. That zone shows a tab strip, so the chevron and zone menu are there, and
-    // cmd-J folds it with the right side. A column of its own got neither: a lone side pane has no
-    // strip on auto, and cmd-J folds only the outermost right column. Without a Files pane Desktop
-    // stacks it with another 'right' pane, else in the chat zone. width and minWidth still apply:
-    // the zone takes the largest width of its shown tabs, so it is 720px while this tab is shown.
-    data: {
-      placement: 'right',
-      hideOnly: true,
-      dock: { pane: 'files', pos: 'center', enforce: true },
-      width: '720px',
-      minWidth: '240px'
-    },
-    render: () => jsx(ReviewPane, {})
-  }
-}
-
-let unregisterPane = null
-
-function ensureReviewPane() {
-  if (unregisterPane || !CTX) {
-    return
-  }
-
-  const dispose = CTX.register(reviewPaneContribution())
-
-  unregisterPane = typeof dispose === 'function' ? dispose : () => {}
-}
-
-/** Show the review pane (registering it, bringing it back if closed, expanding it if collapsed) and
- *  optionally select an item. Never opens a main-workspace tab. Desktops without the pane APIs get
- *  the route page instead. */
-export function openReview(key) {
-  if (key) {
-    $selection.set(key)
-  }
-
+/** Show the review page. With `pending`, switch it to Pending first (asking before unsaved Library
+ *  text is dropped). Called only by a click: the chip, the palette, the sidebar row or a toast's
+ *  Open. Nothing calls it on its own. */
+export function openReview({ pending = false } = {}) {
   markSeen()
+  host.navigate(ROUTE)
 
-  if (useRouteFallback || typeof host.openWorkspace !== 'function') {
-    host.navigate(ROUTE)
-
-    return
-  }
-
-  // Forget a Close first, then register, then reveal (which expands a collapsed zone).
-  if (typeof host.undismissPane === 'function') {
-    host.undismissPane(LIST_PANE)
-  }
-
-  ensureReviewPane()
-
-  if (typeof host.revealPane === 'function') {
-    host.revealPane(LIST_PANE)
+  if (pending) {
+    setMode('pending')
   }
 }
 
@@ -3674,13 +3697,11 @@ export function openReview(key) {
 export const settingsHref = () =>
   typeof SDK.pluginSettingsHref === 'function' ? SDK.pluginSettingsHref(ID) : `/settings?tab=plugins&plugin=${ID}`
 
-/** The list header's gear: open this plugin's settings page. Hosts without settings pages show the
- *  settings inside the list (or on the route page, which already shows them). */
+/** The list header's gear: open this plugin's settings page, after the discard prompt when Library
+ *  holds unsaved text. Hosts without settings pages show the settings inside the list. */
 export function openSettings() {
   if (hasSettingsPage) {
-    host.navigate(settingsHref())
-  } else if (useRouteFallback) {
-    host.navigate(ROUTE)
+    requestLeave(() => host.navigate(settingsHref()))
   } else {
     $inlineSettings.set(!$inlineSettings.get())
   }
@@ -3688,12 +3709,10 @@ export function openSettings() {
 
 /**
  * Announce each new pending write once. Keys already announced (and still pending) are never
- * announced again; the set survives restarts through plugin storage. So a pane the user closed is not
- * reopened for the same changes. With recordOnly (the watcher's first poll after startup) the
- * pending keys are only recorded: changes that were waiting before the app started never open the
- * pane or toast. How a new change is announced:
- *   autoOpen on:  the review pane opens (no toast, the pane is the signal).
- *   autoOpen off: notifyMode decides, a toast ('popup') or the lit chip ('light').
+ * announced again; the set survives restarts through plugin storage. With recordOnly (the watcher's
+ * first poll after startup) the pending keys are only recorded: changes that were waiting before the
+ * app started never toast. notifyMode decides how a new change is announced: a toast with an Open
+ * action ('popup') or the lit chip ('light'). Neither moves the user off what they are doing.
  * Returns the number of new items.
  */
 export function announce(ctx, items, { recordOnly = false } = {}) {
@@ -3718,15 +3737,9 @@ export function announce(ctx, items, { recordOnly = false } = {}) {
     return 0
   }
 
-  // Old desktops show the review as a route page; opening it would take over the main view.
-  if ($autoOpen.get() && !useRouteFallback) {
-    // Keep the change the user is reading; select the new one only when nothing is selected.
-    openReview($selection.get() ? undefined : fresh[0])
-  } else if ($notifyMode.get() === 'popup') {
-    const first = fresh[0]
-
+  if ($notifyMode.get() === 'popup') {
     host.notify({
-      action: { label: ctx.i18n.t('review'), onClick: () => openReview(first) },
+      action: { label: ctx.i18n.t('open'), onClick: () => openReview({ pending: true }) },
       kind: 'info',
       message: ctx.i18n.t('newPending', fresh.length)
     })
@@ -3736,8 +3749,8 @@ export function announce(ctx, items, { recordOnly = false } = {}) {
 }
 
 /**
- * Background watcher, started in register(): it runs whether or not either pane is mounted. It
- * reads through the shared query client with the panes' own key, so they share one request.
+ * Background watcher, started in register(): it runs whether or not the page is mounted. It reads
+ * through the shared query client with the page's own key, so they share one request.
  */
 function startWatcher(ctx) {
   // The first successful poll after startup only records what is already pending.
@@ -3749,8 +3762,8 @@ function startWatcher(ctx) {
     return queryClient
       .fetchQuery({ queryFn: fetchPending, queryKey: pendingKey(profile), staleTime: POLL_MS - 500 })
       .then(data => {
-        if (listPaneVisible()) {
-          markSeen() // the user is looking at the list: nothing in it is unseen
+        if (pageMounted()) {
+          markSeen() // the user is looking at the review: nothing in it is unseen
         }
 
         const fresh = announce(ctx, data?.items, { recordOnly: !primed })
@@ -3761,44 +3774,22 @@ function startWatcher(ctx) {
 
         return fresh
       })
-      .catch(() => 0) // backend off or unreachable: the list pane shows the error
+      .catch(() => 0) // backend off or unreachable: the page shows the error
   }
 
   ctx.setTimeout(tick, 1500)
   ctx.setInterval(tick, POLL_MS)
-
-  // The pane coming on screen by any route (its tab, a drag, the layout restoring) counts as opening it.
-  if (typeof host.paneVisibility === 'function') {
-    const visible = host.paneVisibility(LIST_PANE)
-    const stop = visible?.listen?.(on => {
-      if (on) {
-        markSeen()
-      }
-    })
-
-    if (typeof stop === 'function') {
-      ctx.onDispose(stop)
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Notification mode: 'popup' toasts each new change, 'light' lights the status-bar chip instead
-// until the user opens the review pane. A change is unseen when it was staged after lastSeenAt.
+// until the user opens the review page. A change is unseen when it was staged after lastSeenAt.
 // ---------------------------------------------------------------------------------------------
 
 export const NOTIFY_MODES = ['popup', 'light']
 export const $notifyMode = atom('popup')
 export const $lit = atom(false)
-const $lastSeenAt = atom(0) // ms; 0 means the pane was never opened
-
-// autoOpen (default on): a change that arrives while the app runs opens the review pane, and
-// notifyMode is not used for it. Off: notifyMode applies as before, a toast ('popup') or the lit
-// chip ('light'). The chip lights by the unseen rule in both cases, and opening the pane clears it.
-export const $autoOpen = atom(true)
-
-const listPaneVisible = () =>
-  typeof host.paneVisibility === 'function' && host.paneVisibility(LIST_PANE)?.get?.() === true
+const $lastSeenAt = atom(0) // ms; 0 means the page was never opened
 
 /** True when any item was staged (created_at, seconds) after lastSeenAt (milliseconds). */
 export const hasUnseen = (items, lastSeenAt) =>
@@ -3816,10 +3807,7 @@ function loadNotifySettings(ctx) {
   const mode = readStored(ctx, 'notifyMode', 'popup')
   const seen = Number(readStored(ctx, 'lastSeenAt', 0))
 
-  const autoOpen = readStored(ctx, 'autoOpen', true)
-
   $notifyMode.set(NOTIFY_MODES.includes(mode) ? mode : 'popup')
-  $autoOpen.set(typeof autoOpen === 'boolean' ? autoOpen : true)
   $lastSeenAt.set(Number.isFinite(seen) ? seen : 0)
   $lit.set(false)
 }
@@ -3837,17 +3825,7 @@ export function setNotifyMode(mode) {
   }
 }
 
-export function setAutoOpen(on) {
-  $autoOpen.set(on === true)
-
-  try {
-    CTX?.storage.set('autoOpen', on === true)
-  } catch {
-    // storage unavailable: the choice holds for this session
-  }
-}
-
-/** The user has looked at the review pane: everything staged until now is seen. */
+/** The user has looked at the review page: everything staged until now is seen. */
 export function markSeen() {
   const now = Date.now()
 
@@ -3890,21 +3868,6 @@ export function NotifyModeControl({ bare = false } = {}) {
   return jsx(bare ? NotifyModeSegments : NotifyModeSwitch, { mode, onChange: setNotifyMode, t })
 }
 
-export const AUTO_OPEN_STYLES = {
-  row: { alignItems: 'center', cursor: 'pointer', display: 'flex', gap: '0.4rem', minWidth: 0 },
-  text: { ...STYLES.muted, color: 'var(--ui-text-secondary)', minWidth: 0, overflowWrap: 'anywhere' }
-}
-
-export function AutoOpenSwitch({ on, onChange, t }) {
-  return jsxs('label', {
-    style: AUTO_OPEN_STYLES.row,
-    children: [
-      jsx(Checkbox, { checked: on, onCheckedChange: value => onChange(value === true) }),
-      jsx('span', { style: AUTO_OPEN_STYLES.text, children: t('autoOpenLabel') })
-    ]
-  })
-}
-
 export const SETTINGS_STYLES = {
   body: { display: 'flex', flexDirection: 'column', gap: '0.9rem', minWidth: 0, padding: PAD },
   section: { display: 'flex', flexDirection: 'column', gap: '0.35rem', minWidth: 0 },
@@ -3935,77 +3898,6 @@ export function SettingsGearButton({ onOpen, t }) {
   })
 }
 
-/** The built-in action behind Cmd/Ctrl+J and the title bar's right sidebar button. */
-const TOGGLE_RIGHT_SIDEBAR = 'view.toggleRightSidebar'
-
-/** Whether this host lets the plugin run that action: ctx.runAction exists (newer hosts) and, when
- *  the host lists the allowed ids, the toggle is among them. False on the route page fallback, where
- *  there is no pane to hide. */
-export function canHideSidebar() {
-  if (useRouteFallback || typeof CTX?.runAction !== 'function') {
-    return false
-  }
-
-  if (typeof CTX.listActions !== 'function') {
-    return true
-  }
-
-  try {
-    return CTX.listActions().some(a => a?.id === TOGGLE_RIGHT_SIDEBAR)
-  } catch {
-    return false
-  }
-}
-
-/** Collapse the whole right sidebar, the same as Cmd/Ctrl+J. Desktop keeps a zone's last visible tab
- *  from being hidden, so with Files hidden this is the only way to put the review tab away. The host
- *  refuses a denied or early call with { ok: false } and a console warning; a throw is swallowed too. */
-export function hideSidebar() {
-  if (!canHideSidebar()) {
-    return
-  }
-
-  try {
-    CTX.runAction(TOGGLE_RIGHT_SIDEBAR)
-  } catch {
-    // Older or broken host: nothing to do, the shortcut still works.
-  }
-}
-
-/** The pane header's Hide button, next to the gear. Absent when the host cannot run the toggle. */
-export function SidebarHideControl({ t }) {
-  if (!canHideSidebar()) {
-    return null
-  }
-
-  return jsx(Button, {
-    'aria-label': t('hideSidebarTip'),
-    onClick: hideSidebar,
-    size: 'xs',
-    style: STYLES.button,
-    title: t('hideSidebarTip'),
-    type: 'button',
-    variant: 'ghost',
-    children: t('hideSidebar')
-  })
-}
-
-/** autoOpen as a settings row: the SDK's ToggleRow, or the plain checkbox on older hosts. */
-export function AutoOpenRow() {
-  const t = usePluginI18n(ID)
-  const on = useValue($autoOpen)
-
-  return jsx(AutoOpenToggle, { on, onChange: setAutoOpen, t })
-}
-
-export function AutoOpenToggle({ on, onChange, t }) {
-  if (typeof SDK.ToggleRow !== 'function') {
-    return AutoOpenSwitch({ on, onChange, t })
-  }
-
-  return jsx(SDK.ToggleRow, { checked: on === true, description: t('autoOpenHelp'), label: t('autoOpenLabel'), onChange })
-}
-
 /** Stand-in for the SDK's ListRow on hosts that do not export it: title, description, control. */
 function PlainRow({ title, description, action, below }) {
   return jsxs('div', {
@@ -4034,8 +3926,7 @@ export function SettingsPageView({ profiles, focused, t }) {
         title: t('scopeGroup')
       }),
       jsx(Row, { action: jsx(SortControl, {}), description: t('settingsSortHelp'), title: t('sortLabel') }),
-      jsx(Row, { action: jsx(NotifyModeControl, { bare: true }), description: t('settingsNotifyHelp'), title: t('notifyLabel') }),
-      jsx(AutoOpenRow, {})
+      jsx(Row, { action: jsx(NotifyModeControl, { bare: true }), description: t('settingsNotifyHelp'), title: t('notifyLabel') })
     ]
   })
 }
@@ -4052,16 +3943,13 @@ export function settingsPageContribution() {
   return { id: 'settings', title: en.settingsTitle, icon: 'git-pull-request', render: () => jsx(SettingsPage, {}) }
 }
 
-/** Hosts without settings pages: the gear opens the settings inside the list pane. */
+/** Hosts without settings pages: the gear opens the settings inside the list. */
 export const $inlineSettings = atom(false)
 
 const SETTINGS_EN = {
-  autoOpenHelp: 'Off: a new change shows a popup or lights up the Review chip, as chosen above.',
-  hideSidebar: 'Hide',
-  hideSidebarTip: 'Hide the sidebar (Ctrl+J / Cmd+J). Reopen it from the title bar.',
   openSettings: 'Skill Review settings',
   settingsNoProfiles: 'Profiles show up here once they have pending changes.',
-  settingsNotifyHelp: 'Popup shows a notification. Light up icon marks the Review chip instead.',
+  settingsNotifyHelp: 'Popup shows a notification with an Open button. Light up icon marks the Review chip instead.',
   settingsProfilesHelp: 'Which profiles the review list shows. The Review chip counts every profile.',
   settingsSortHelp: 'The order of the files in the review list.',
   settingsSummary: (profiles, sort) => `${profiles}, ${sort}`,
@@ -4086,7 +3974,7 @@ export const CHIP_STYLES = {
   menuLabel: { color: 'var(--ui-text-tertiary)', fontSize: '0.6875rem', padding: '0.3rem 0.5rem' }
 }
 
-/** Status-bar chip: click opens the review panes, right-click picks the notification mode. */
+/** Status-bar chip: click opens the review page, right-click picks the notification mode. */
 export function ReviewChip({ count, counts, lit, mode, onOpen, onMode, t }) {
   const button = jsxs('button', {
     'aria-label': lit ? `${t('chipTip', count, counts)}. ${t('chipUnseen')}` : t('chipTip', count, counts),
@@ -4133,7 +4021,7 @@ function StatusChip() {
   const { data, isError } = usePending()
   const lit = useValue($lit)
   const mode = useValue($notifyMode)
-  // Always shown, so Review can open the pane with nothing pending; no badge at 0 or on error.
+  // Always shown, so Review can open the page with nothing pending; no badge at 0 or on error.
   const items = isError || !Array.isArray(data?.items) ? [] : data.items
 
   return jsx(ReviewChip, {
@@ -4151,7 +4039,6 @@ function StatusChip() {
 }
 
 const NOTIFY_EN = {
-  autoOpenLabel: 'Open this tab automatically when a change arrives',
   chipUnseen: 'New changes since you last opened Review',
   notifyLabel: 'When a new change arrives',
   notifyLight: 'Light up icon',
@@ -4203,7 +4090,7 @@ const en = {
   newFile: 'New file',
   newPending: n => `${n} new change${n === 1 ? '' : 's'} to review`,
   backToList: 'Back to list',
-  listTitle: 'Pending writes',
+  open: 'Open',
   paneTitle: 'Pending writes',
   reject: 'Reject',
   rejectBody: name => `The proposed change to ${name} is discarded. Hermes can propose it again.`,
@@ -4211,7 +4098,6 @@ const en = {
   rejectTitle: 'Reject this change?',
   rejected: name => `Rejected change to ${name}`,
   retry: 'Retry',
-  review: 'Review',
   row_add: 'added line',
   row_context: 'unchanged line',
   row_remove: 'removed line',
@@ -4229,19 +4115,18 @@ Object.assign(en, NOTIFY_EN, LIST_EN, EDIT_EN, SETTINGS_EN)
 Object.assign(en, REMOVE_EN)
 Object.assign(en, EXPAND_EN)
 Object.assign(en, LIB_EN)
+Object.assign(en, PAGE_EN)
 
 export default {
   id: ID,
   name: 'Skill Review',
   register(ctx) {
     CTX = ctx
-    useRouteFallback = typeof host.openWorkspace !== 'function'
     ctx.i18n.register({ en })
     ctx.onDispose(() => {
       CTX = null
       hasSettingsPage = false
-      unregisterPane?.()
-      unregisterPane = null
+      pageMounts = 0
     })
 
     loadNotifySettings(ctx)
@@ -4252,9 +4137,12 @@ export default {
     // the settings inside the list.
     hasSettingsPage = Boolean(ctx.registerSettingsPage?.(settingsPageContribution()))
 
-    // No pane here: openReview registers it on demand (see reviewPaneContribution). A saved entry
-    // for the old detail pane is never registered again, so Desktop collapses its zone.
-    const contributions = [
+    // A page and its sidebar row, like Memory Wiki and Kanban. The plugin registers no layout pane, so
+    // a saved layout that still names the 0.2.1 pane (skill-review:list) shows nothing for it: Desktop
+    // leaves an unregistered pane out of its zone's tabs and collapses a zone that holds nothing else.
+    ctx.registerMany([
+      { id: 'page', area: ROUTES_AREA, title: en.pageTitle, data: { path: ROUTE }, render: () => jsx(ReviewPage, {}) },
+      { id: 'nav', area: SIDEBAR_NAV_AREA, data: { codicon: 'git-pull-request', label: en.pageTitle, path: ROUTE } },
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 110, render: () => jsx(StatusChip, {}) },
       {
         area: PALETTE_AREA,
@@ -4266,12 +4154,6 @@ export default {
         },
         id: 'open'
       }
-    ]
-
-    if (useRouteFallback) {
-      contributions.push({ id: 'page', area: ROUTES_AREA, data: { path: ROUTE }, render: () => jsx(FallbackPage, {}) })
-    }
-
-    ctx.registerMany(contributions)
+    ])
   }
 }

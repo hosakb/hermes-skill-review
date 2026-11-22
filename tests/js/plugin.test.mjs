@@ -11,11 +11,8 @@ const host = {
   navigate(path) { this.navigated = path },
   notify(toast) { this.toasts.push(toast) },
   notifyError() {},
-  openWorkspace() { this.workspaceOpens += 1; return () => {} },
-  revealPane(id) { this.revealed.push(id) },
-  undismissPane(id) { this.undismissed.push(id) },
   state: { profile: { get: () => 'default' } },
-  reset() { this.toasts = []; this.revealed = []; this.undismissed = []; this.workspaceOpens = 0; this.navigated = null }
+  reset() { this.toasts = []; this.navigated = null }
 }
 host.reset()
 globalThis.__host = host
@@ -33,7 +30,7 @@ register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
   parseSection, planAutoOpen, visibleItems, itemKey, resultToast, openReview, countBySubsystem, pendingPath,
-  messages, STYLES, DiffRow, DiffView, DetailHeader, ListRow, $selection, nextKeyAfter, LIST_PANE, ReviewPane
+  messages, STYLES, DiffRow, DiffView, DetailHeader, ListRow, $selection, nextKeyAfter, ReviewPage, notePageMount
 } = mod
 const plugin = mod.default
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
@@ -49,8 +46,7 @@ const styleHas = (style, expected) => Object.entries(expected).every(([k, v]) =>
 
 function fakeCtx() {
   const timers = []
-  // autoOpen off: these tests cover the notifyMode path (auto-open.test.mjs covers autoOpen on).
-  const store = { autoOpen: false }
+  const store = {}
   const ctx = {
     disposers: [],
     registered: [],
@@ -77,56 +73,35 @@ test('default export has the contract fields', () => {
   assert.equal(typeof plugin.register, 'function')
 })
 
-test('register adds no pane at startup; Review registers one pane in the Files zone, no route', () => {
+test('register adds the page and its sidebar row, never a pane, and moves nobody', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
-  assert.deepEqual(ctx.registered.filter(c => c.area === 'panes'), [], 'nothing docks itself at launch')
-  openReview()
-  const panes = ctx.registered.filter(c => c.area === 'panes')
-  assert.deepEqual(panes.map(p => p.id), ['list'])
-  assert.equal(LIST_PANE, 'skill-review:list')
-  const [pane] = panes
-  assert.deepEqual(pane.data.dock, { pane: 'files', pos: 'center', enforce: true }, 'the pane stacks as a tab in the Files zone')
-  assert.equal(pane.data.placement, 'right')
-  assert.equal(pane.data.hideOnly, true)
-  assert.equal(pane.data.width, '720px', 'wide enough for the list and the diff side by side')
-  assert.equal(pane.render().type, ReviewPane)
-  assert.ok(!ctx.registered.some(c => c.area === 'routes'), 'no route when the desktop has the pane APIs')
+  assert.deepEqual(ctx.registered.filter(c => c.area === 'panes'), [], 'no layout pane at all')
+  const route = ctx.registered.find(c => c.area === 'routes')
+  assert.equal(route.data.path, '/skill-review')
+  assert.equal(route.render().type, ReviewPage)
+  assert.equal(ctx.registered.find(c => c.area === 'sidebar.nav').data.path, '/skill-review')
   assert.ok(ctx.registered.some(c => c.area === 'statusBar.right'))
   assert.ok(ctx.registered.some(c => c.area === 'palette'))
-  assert.equal(host.workspaceOpens, 0, 'register never takes over the main view')
+  assert.equal(host.navigated, null, 'register never takes over the main view')
   dispose(ctx)
 })
 
-test('old desktops without openWorkspace get the route page as the only fallback', () => {
+test('openReview navigates to the page and registers nothing', () => {
   host.reset()
-  const saved = host.openWorkspace
-  host.openWorkspace = undefined
   const ctx = fakeCtx()
   plugin.register(ctx)
-  assert.equal(ctx.registered.find(c => c.area === 'routes')?.data.path, '/skill-review')
+  const before = ctx.registered.length
   openReview()
   assert.equal(host.navigated, '/skill-review')
-  host.openWorkspace = saved
-  dispose(ctx)
-})
-
-test('openReview reveals the review pane and never opens a workspace tab', () => {
-  host.reset()
-  const ctx = fakeCtx()
-  plugin.register(ctx)
-  openReview()
-  assert.deepEqual(host.revealed, [LIST_PANE])
-  assert.deepEqual(host.undismissed, [LIST_PANE], 'a closed pane comes back')
-  assert.equal(host.workspaceOpens, 0)
-  assert.equal(host.navigated, null)
+  assert.equal(ctx.registered.length, before)
   dispose(ctx)
 })
 
 // --- watcher ----------------------------------------------------------------------------------
 
-test('the watcher polls from register() and only toasts, with an action that reveals the item', async () => {
+test('the watcher polls from register() and only toasts, with an action that opens the page', async () => {
   host.reset()
   const qc = globalThis.__queryClient
   const ctx = fakeCtx()
@@ -137,7 +112,7 @@ test('the watcher polls from register() and only toasts, with an action that rev
   assert.ok(ctx.timers.some(x => !x.every), 'first check runs soon after load')
 
   interval.fn(); await flush()
-  assert.deepEqual(qc.lastKey, ['skill-review', 'pending', 'default'], 'shares the pane query key')
+  assert.deepEqual(qc.lastKey, ['skill-review', 'pending', 'default'], 'shares the page query key')
   assert.deepEqual(await qc.lastFn(), { path: '/pending' })
   assert.equal(host.toasts.length, 0)
 
@@ -145,14 +120,14 @@ test('the watcher polls from register() and only toasts, with an action that rev
   qc.data = { items: [council] }
   interval.fn(); await flush()
   assert.equal(host.toasts.length, 1, 'a new item is announced once')
-  assert.equal(host.workspaceOpens, 0, 'never takes over the main view')
-  assert.deepEqual(host.revealed, [], 'never steals focus by itself')
+  assert.equal(host.navigated, null, 'never takes over the main view by itself')
   const toast = host.toasts[0]
   assert.equal(toast.message, 'newPending:1')
-  assert.equal(typeof toast.action?.onClick, 'function')
+  assert.equal(toast.action?.label, 'open')
+  $selection.set(null)
   toast.action.onClick()
-  assert.deepEqual(host.revealed, [LIST_PANE])
-  assert.equal($selection.get(), itemKey(council), 'the toast action selects the new item')
+  assert.equal(host.navigated, '/skill-review')
+  assert.equal($selection.get(), null, 'an item key is not a file key, so the action selects nothing')
 
   interval.fn(); await flush()
   assert.equal(host.toasts.length, 1, 'the same item is never announced again')
@@ -355,7 +330,7 @@ test('source: no hardcoded colours, only allowed imports, no workspace takeover,
   const specs = [...src.matchAll(/from '([^']+)'/g)].map(m => m[1])
   assert.deepEqual([...new Set(specs)].sort(), ['@hermes/plugin-sdk', 'react', 'react/jsx-runtime'])
   assert.doesNotMatch(code, /\bfetch\(|XMLHttpRequest|WebSocket|window\./)
-  assert.doesNotMatch(code, /host\.openWorkspace\(/, 'openWorkspace is only feature-detected, never called')
+  assert.doesNotMatch(code, /openWorkspace|revealPane|undismissPane/, 'the page needs no pane API')
   assert.doesNotMatch(code, /\bScrollArea\b/, "Radix ScrollArea's display:table wrapper lets wide lines escape")
   assert.doesNotMatch(code, /max-content/)
 })
@@ -385,7 +360,7 @@ test('notifyMode defaults to popup and only accepts popup or light', () => {
   dispose(bad)
 })
 
-test('popup mode: a new change toasts exactly once, with a Review action that only reveals the panes', async () => {
+test('popup mode: a new change toasts exactly once, with an Open action that only opens the page', async () => {
   host.reset()
   const qc = globalThis.__queryClient
   const ctx = fakeCtx()
@@ -397,12 +372,11 @@ test('popup mode: a new change toasts exactly once, with a Review action that on
   await tick(ctx)
   await tick(ctx)
   assert.equal(host.toasts.length, 1, 'announced once, never repeated')
-  assert.equal(host.toasts[0].action.label, 'review')
+  assert.equal(host.toasts[0].action.label, 'open')
   assert.equal($lit.get(), false, 'popup mode never lights the chip')
+  assert.equal(host.navigated, null, 'nothing moves until the user clicks Open')
   host.toasts[0].action.onClick()
-  assert.deepEqual(host.revealed, [LIST_PANE])
-  assert.equal(host.workspaceOpens, 0, 'never opens a main workspace tab')
-  assert.equal(host.navigated, null)
+  assert.equal(host.navigated, '/skill-review')
   dispose(ctx)
 })
 
@@ -425,7 +399,7 @@ test('light mode: a new change does not toast and lights the chip', async () => 
   dispose(ctx)
 })
 
-test('opening the review pane clears the lit chip and stores lastSeenAt', async () => {
+test('opening the review page clears the lit chip and stores lastSeenAt', async () => {
   host.reset()
   const qc = globalThis.__queryClient
   const ctx = fakeCtx()
@@ -446,43 +420,31 @@ test('opening the review pane clears the lit chip and stores lastSeenAt', async 
   dispose(ctx)
 })
 
-test('a visible list pane counts as seen, so the chip does not light while the user is looking', async () => {
+test('a mounted page counts as seen, so the chip does not light while the user is looking', async () => {
   host.reset()
   const qc = globalThis.__queryClient
-  const visible = { value: false, listeners: new Set() }
-  const vis = {
-    get: () => visible.value,
-    subscribe(fn) { visible.listeners.add(fn); fn(visible.value); return () => visible.listeners.delete(fn) },
-    listen(fn) { visible.listeners.add(fn); return () => visible.listeners.delete(fn) }
-  }
-  const show = v => { visible.value = v; visible.listeners.forEach(fn => fn(v)) }
-  host.paneVisibility = id => { host.visibilityAsked = id; return vis }
   const ctx = fakeCtx()
   ctx.store.notifyMode = 'light'
   plugin.register(ctx)
-  assert.equal(host.visibilityAsked, LIST_PANE)
   qc.data = { items: [{ subsystem: 'skills', profile: 'default', id: 'v1', created_at: nowSec() - 1 }] }
   await tick(ctx)
   assert.equal($lit.get(), true)
   const realNow = Date.now
   const T = realNow()
   Date.now = () => T
-  show(true)
-  assert.equal($lit.get(), false, 'the pane becoming visible marks everything seen')
+  const unmount = notePageMount()
+  assert.equal($lit.get(), false, 'the page mounting marks everything seen')
   assert.equal(ctx.store.lastSeenAt, T)
   qc.data = { items: [...qc.data.items, { subsystem: 'skills', profile: 'default', id: 'v2', created_at: (T + 1000) / 1000 }] }
   Date.now = () => T + 2000
   await tick(ctx)
   Date.now = realNow
-  assert.equal($lit.get(), false, 'still visible: a change staged after the last look is seen as it lands')
-  show(false)
+  assert.equal($lit.get(), false, 'still on the page: a change staged after the last look is seen as it lands')
+  unmount()
   qc.data = { items: [...qc.data.items, { subsystem: 'skills', profile: 'default', id: 'v3', created_at: nowSec() + 5 }] }
   await tick(ctx)
-  assert.equal($lit.get(), true, 'hidden again: the next change lights the chip')
+  assert.equal($lit.get(), true, 'off the page: the next change lights the chip')
   dispose(ctx)
-  assert.equal(visible.listeners.size, 0, 'the visibility subscription is disposed with the plugin')
-  delete host.paneVisibility
-  delete host.visibilityAsked
 })
 
 test('the mode persists in plugin storage and is read back after a restart', () => {

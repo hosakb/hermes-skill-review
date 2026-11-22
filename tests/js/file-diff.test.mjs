@@ -15,11 +15,8 @@ const host = {
   navigate() {},
   notify(toast) { this.toasts.push(toast) },
   notifyError() {},
-  openWorkspace() { return () => {} },
-  revealPane(id) { this.revealed.push(id) },
-  undismissPane() {},
   state: { profile: { get: () => 'default' } },
-  reset() { this.toasts = []; this.revealed = [] }
+  reset() { this.toasts = [] }
 }
 host.reset()
 globalThis.__host ??= host

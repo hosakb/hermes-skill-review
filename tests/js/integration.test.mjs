@@ -8,7 +8,7 @@ import { MEMORY_DIFF, MEMORY_FILE, SKILL_DIFF, SKILL_FILE } from './fixtures.mjs
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const pluginPath = fileURLToPath(new URL('../../desktop/plugin.js', import.meta.url))
-const host = { navigate() {}, notify() {}, notifyError() {}, openWorkspace() { return () => {} }, revealPane() {}, undismissPane() {}, state: { profile: { get: () => 'default' } } }
+const host = { navigate() {}, notify() {}, notifyError() {}, state: { profile: { get: () => 'default' } } }
 globalThis.__host ??= host
 globalThis.__queryClient ??= { fetchQuery: () => Promise.resolve({ items: [] }) }
 register(pathToFileURL(here + 'stub-loader.mjs'))

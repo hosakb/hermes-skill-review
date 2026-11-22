@@ -1,6 +1,6 @@
 // Tests for the review settings on Settings > Plugins > Skill Review (ctx.registerSettingsPage):
-// profile subset, sort order, notify mode and autoOpen. The list header keeps a
-// summary and a gear that opens that page. The plugin registers one pane again.
+// profile subset, sort order and notify mode. The list header keeps a summary and a gear that
+// opens that page. The review itself is a route page; the plugin registers no pane.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { register } from 'node:module'
@@ -14,9 +14,6 @@ const host = {
   navigate(path) { this.calls.push(`navigate:${path}`) },
   notify(toast) { this.toasts.push(toast) },
   notifyError() {},
-  openWorkspace() { return () => {} },
-  undismissPane(id) { this.calls.push(`undismiss:${id}`) },
-  revealPane(id) { this.calls.push(`reveal:${id}`) },
   state: { profile: { get: () => 'default' } },
   reset() { this.toasts = []; this.calls = [] }
 }
@@ -27,9 +24,8 @@ register(pathToFileURL(here + 'stub-loader.mjs'))
 const sdk = await import('@hermes/plugin-sdk')
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  $autoOpen, $hidden, $inlineSettings, $notifyMode, $sort, AutoOpenRow, AutoOpenToggle, LIST_PANE, NotifyModeControl, NotifyModeSegments, ProfileControl, ReviewPane, SettingsGearButton,
-  SettingsPage, SettingsPageView, SettingsSummary, SortControl, messages, openReview, openSettings, reviewPaneContribution,
-  setAutoOpen, settingsPageContribution
+  $hidden, $inlineSettings, $notifyMode, $sort, NotifyModeControl, NotifyModeSegments, ProfileControl, ReviewPage, SettingsGearButton,
+  SettingsPage, SettingsPageView, SettingsSummary, SortControl, messages, openReview, openSettings, settingsPageContribution
 } = mod
 const plugin = mod.default
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
@@ -96,23 +92,23 @@ test('register adds one settings page: id settings, titled Skill Review, with an
   dispose(ctx)
 })
 
-test('openReview registers only the list pane: placement right, hideOnly', () => {
+test('openReview opens the page and registers nothing; there is no settings pane', () => {
   const ctx = start()
+  const before = ctx.registered.length
   openReview()
-  assert.deepEqual(panesOf(ctx).map(p => p.id), ['list'])
-  assert.deepEqual(host.calls, [`undismiss:${LIST_PANE}`, 'register:list', `reveal:${LIST_PANE}`])
-  const list = reviewPaneContribution()
-  assert.deepEqual(list.data, { placement: 'right', hideOnly: true, dock: { pane: 'files', pos: 'center', enforce: true }, width: '720px', minWidth: '240px' })
-  assert.equal(list.render().type, ReviewPane)
+  assert.equal(panesOf(ctx).length, 0)
+  assert.equal(ctx.registered.length, before)
+  assert.deepEqual(host.calls, ['navigate:/skill-review'])
+  assert.equal(ctx.registered.find(c => c.area === 'routes').render().type, ReviewPage)
   assert.ok(!/SETTINGS_PANE|settingsPaneContribution|id: 'settings', \/\/ skill-review:settings/.test(src), 'no settings pane any more')
   dispose(ctx)
 })
 
-test('the chip, palette and toast path still open the list', () => {
+test('the chip, palette and toast path open the page', () => {
   const ctx = start()
   assert.ok(ctx.registered.some(c => c.area === 'statusBar.right' && c.id === 'chip'))
   ctx.registered.find(c => c.area === 'palette').data.run()
-  assert.ok(host.calls.includes(`reveal:${LIST_PANE}`))
+  assert.ok(host.calls.includes('navigate:/skill-review'))
   assert.match(slice('function StatusChip()', '\nconst NOTIFY_EN'), /openReview\(\)/)
   dispose(ctx)
 })
@@ -156,7 +152,7 @@ const header = () => {
 
 test('the list header has the summary and the gear, no settings controls, and keeps the kind filter', () => {
   const bar = header()
-  for (const name of ['ProfileControl', 'SortControl', 'NotifyModeControl', 'AutoOpenRow']) {
+  for (const name of ['ProfileControl', 'SortControl', 'NotifyModeControl']) {
     assert.doesNotMatch(bar, new RegExp(`jsx\\(${name}\\b`), `${name} lives on the settings page`)
   }
   assert.match(bar, /jsx\(SettingsGearButton, \{ onOpen: openSettings, t \}\)/)
@@ -180,35 +176,19 @@ test('the list summary follows the shared store when the settings page changes i
 
 // --- the settings page ------------------------------------------------------------------------
 
-test('the settings page is built from ListRow and ToggleRow and holds every control', () => {
+test('the settings page is built from ListRow and holds every control', () => {
   const profiles = [{ profile: 'default', count: 2 }]
   const view = SettingsPageView({ focused: 'default', profiles, t })
   const rows = ofType(view, sdk.ListRow)
   assert.deepEqual(rows.map(r => r.props.title), ['scopeGroup', 'sortLabel', 'notifyLabel'])
-  assert.equal(kids(view).length, 4, 'profiles, sort, notify mode and auto-open, nothing else')
-  for (const type of [ProfileControl, SortControl, NotifyModeControl, AutoOpenRow]) {
+  assert.equal(kids(view).length, 3, 'profiles, sort and notify mode, nothing else')
+  for (const type of [ProfileControl, SortControl, NotifyModeControl]) {
     assert.equal(ofType(view, type).length, 1, `${type.name} is on the page`)
   }
   assert.equal(ofType(view, ProfileControl)[0].props.profiles, profiles)
   assert.equal(ofType(view, NotifyModeControl)[0].props.bare, true)
   assert.match(text(SettingsPageView({ focused: 'default', profiles: [], t })), /settingsNoProfiles/)
   assert.match(slice('export function SettingsPage()', '\n}'), /useVisibleFiles\(\)/)
-})
-
-test('the autoOpen row is a ToggleRow on the shared atom', () => {
-  const ctx = start()
-  const el = AutoOpenRow()
-  assert.equal(el.type, AutoOpenToggle)
-  assert.equal(el.props.onChange, setAutoOpen)
-  const row = AutoOpenToggle({ ...el.props, on: true, t })
-  assert.equal(row.type, sdk.ToggleRow)
-  assert.equal(row.props.checked, true)
-  assert.equal(row.props.label, 'autoOpenLabel')
-  row.props.onChange(false)
-  assert.equal($autoOpen.get(), false)
-  assert.equal(ctx.store.autoOpen, false, 'persisted through ctx.storage')
-  row.props.onChange(true)
-  dispose(ctx)
 })
 
 test('the notify control on the page is the bare segmented control', () => {
@@ -225,14 +205,15 @@ test('the notify control on the page is the bare segmented control', () => {
   dispose(ctx)
 })
 
-test('strings: the page title and the gear label', () => {
+test('strings: the page title, the gear label and the notify help', () => {
   assert.equal(messages.en.settingsTitle, 'Skill Review')
   assert.equal(messages.en.openSettings, 'Skill Review settings')
+  assert.equal(messages.en.settingsNotifyHelp, 'Popup shows a notification with an Open button. Light up icon marks the Review chip instead.')
 })
 
-test('the route fallback page shows the settings above the list; the SDK extras are read optionally', () => {
-  assert.match(slice('function FallbackPage()', '\n}'), /jsx\(SettingsPage, \{\}\)/)
+test('the SDK extras are read optionally', () => {
   assert.match(src, /import \* as SDK from '@hermes\/plugin-sdk'/)
-  assert.doesNotMatch(slice('import {', "} from '@hermes/plugin-sdk'"), /\b(ListRow|ToggleRow|pluginSettingsHref)\b/, 'never a named import: older hosts would fail to load the plugin')
+  assert.doesNotMatch(slice('import {', "} from '@hermes/plugin-sdk'"), /\b(ListRow|ToggleRow|pluginSettingsHref|SIDEBAR_NAV_AREA)\b/, 'never a named import: older hosts would fail to load the plugin')
+  assert.match(src, /SDK\.SIDEBAR_NAV_AREA \?\? 'sidebar\.nav'/)
   assert.match(slice('register(ctx) {', '\n  }\n}'), /ctx\.registerSettingsPage\?\./)
 })
