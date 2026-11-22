@@ -1,5 +1,5 @@
-// Tests for the single review tab: one registered pane that holds the list and the diff side by
-// side, and stacks them (list, then diff with Back) when the pane is narrower than the breakpoint.
+// Tests for the review work area on the page: the list and the diff side by side, stacked (list,
+// then diff with Back) when the work area is narrower than the breakpoint.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { register } from 'node:module'
@@ -13,11 +13,8 @@ const host = {
   navigate(path) { this.navigated = path },
   notify(toast) { this.toasts.push(toast) },
   notifyError() {},
-  openWorkspace() { this.workspaceOpens += 1; return () => {} },
-  revealPane(id) { this.revealed.push(id) },
-  undismissPane(id) { this.undismissed.push(id) },
   state: { profile: { get: () => 'default' } },
-  reset() { this.toasts = []; this.revealed = []; this.undismissed = []; this.workspaceOpens = 0; this.navigated = null }
+  reset() { this.toasts = []; this.navigated = null }
 }
 host.reset()
 globalThis.__host ??= host
@@ -25,8 +22,8 @@ globalThis.__queryClient ??= { fetchQuery: () => Promise.resolve({ items: [] }) 
 register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  $hidden, $kind, $selection, $sort, LIST_PANE, REVIEW_NARROW_PX, REVIEW_STYLES, ReviewLayout, ReviewPane, isNarrowWidth,
-  messages, observeWidth, openReview
+  $hidden, $kind, $selection, $sort, REVIEW_NARROW_PX, REVIEW_STYLES, ReviewLayout, ReviewWorkArea, isNarrowWidth,
+  observeWidth, openReview
 } = mod
 const plugin = mod.default
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
@@ -62,24 +59,14 @@ const dispose = ctx => ctx.disposers.forEach(fn => fn())
 
 // --- registration -----------------------------------------------------------------------------
 
-test('Review registers one review tab, titled Pending writes, under the old list pane id; the settings live on Settings > Plugins', () => {
+test('the page holds one work area, and the plugin registers no pane for it', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
   openReview()
-  const panes = ctx.registered.filter(c => c.area === 'panes')
-  assert.deepEqual(panes.map(p => p.id), ['list'], 'one pane, so one tab')
-  const [pane] = panes
-  assert.equal(pane.id, 'list', 'stable id: a saved layout that holds skill-review:list still finds it')
-  assert.equal(LIST_PANE, 'skill-review:list')
-  assert.equal(pane.title, 'Pending writes')
-  assert.equal(pane.title, messages.en.paneTitle)
-  assert.equal(pane.data.placement, 'right')
-  assert.equal(pane.data.hideOnly, true)
-  assert.deepEqual(pane.data.dock, { pane: 'files', pos: 'center', enforce: true })
-  assert.equal(pane.data.width, '720px', 'wide enough for both columns by default')
-  assert.ok(parseInt(pane.data.width, 10) >= REVIEW_NARROW_PX, 'the default width opens side by side')
-  assert.equal(pane.render().type, ReviewPane)
+  assert.deepEqual(ctx.registered.filter(c => c.area === 'panes'), [])
+  const page = ctx.registered.find(c => c.area === 'routes').render()
+  assert.equal(page.type, mod.ReviewPage)
   dispose(ctx)
 })
 
@@ -92,19 +79,14 @@ test('no detail pane is registered and nothing refers to its id any more', () =>
   dispose(ctx)
 })
 
-test('the Review action (toast, chip, palette) focuses the single pane and nothing else', () => {
+test('the Review action (chip, palette) opens the page and keeps the selection', () => {
   host.reset()
   const ctx = fakeCtx()
   plugin.register(ctx)
-  openReview('skills:default:SKILL.md')
-  assert.deepEqual(host.undismissed, [LIST_PANE])
-  assert.deepEqual(host.revealed, [LIST_PANE])
-  assert.equal(host.workspaceOpens, 0)
-  assert.equal($selection.get(), 'skills:default:SKILL.md')
-  const palette = ctx.registered.find(c => c.area === 'palette')
-  host.reset()
-  palette.data.run()
-  assert.deepEqual(host.revealed, [LIST_PANE])
+  $selection.set('skills/default/k')
+  ctx.registered.find(c => c.area === 'palette').data.run()
+  assert.equal(host.navigated, '/skill-review')
+  assert.equal($selection.get(), 'skills/default/k')
   $selection.set(null)
   dispose(ctx)
 })
@@ -118,10 +100,10 @@ test('the breakpoint is a named 560px constant; unknown widths fall back to side
   assert.equal(isNarrowWidth(560), false)
   assert.equal(isNarrowWidth(900), false)
   assert.equal(isNarrowWidth(null), false, 'not measured yet')
-  assert.equal(isNarrowWidth(0), false, 'a hidden pane measures 0: keep the wide layout')
+  assert.equal(isNarrowWidth(0), false, 'a hidden work area measures 0: keep the wide layout')
 })
 
-test('observeWidth reports the pane width through ResizeObserver and disconnects on cleanup', () => {
+test('observeWidth reports the work area width through ResizeObserver and disconnects on cleanup', () => {
   const seen = []
   let instance
   class FakeRO {
@@ -139,14 +121,14 @@ test('observeWidth reports the pane width through ResizeObserver and disconnects
   assert.equal(instance.disconnected, true)
 })
 
-test('without ResizeObserver, or before the node exists, nothing is observed and the pane stays wide', () => {
+test('without ResizeObserver, or before the node exists, nothing is observed and the work area stays wide', () => {
   const seen = []
   assert.equal(observeWidth({}, w => seen.push(w), undefined), undefined)
   assert.equal(observeWidth(null, w => seen.push(w), class { observe() { throw new Error('no') } }), undefined)
   assert.deepEqual(seen, [])
   // The stubbed hooks never measure, which is the no-ResizeObserver case: both columns show.
   $selection.set(null)
-  const pane = ReviewPane({})
+  const pane = ReviewWorkArea({})
   assert.equal(pane.type, ReviewLayout)
   assert.equal(pane.props.narrow, false)
   assert.equal(visibleColumns(ReviewLayout(pane.props)).length, 2)
@@ -225,19 +207,19 @@ test('Back clears the selection, returns to the list and leaves every filter as 
   $kind.set('all'); $sort.set('newest'); $hidden.set([])
 })
 
-test('ReviewPane Back button wiring clears the shared selection atom', () => {
+test('ReviewWorkArea Back button wiring clears the shared selection atom', () => {
   $selection.set('skills:default:SKILL.md')
-  const layout = ReviewPane({})
-  // ReviewPane hands its layout an onBack bound to the atom; call it through the rendered layout.
+  const layout = ReviewWorkArea({})
+  // ReviewWorkArea hands its layout an onBack bound to the atom; call it through the rendered layout.
   const inner = layout.type === ReviewLayout ? layout : walk(layout).find(n => n.type === ReviewLayout)
-  assert.ok(inner, 'ReviewPane renders ReviewLayout')
+  assert.ok(inner, 'ReviewWorkArea renders ReviewLayout')
   inner.props.onBack()
   assert.equal($selection.get(), null)
 })
 
 // --- styles -----------------------------------------------------------------------------------
 
-test('columns clip on their own, never force the pane wider, and use theme variables only', () => {
+test('columns clip on their own, never force the page wider, and use theme variables only', () => {
   const { root, list, detail, back } = REVIEW_STYLES
   assert.equal(root.minWidth, 0)
   assert.equal(root.overflow, 'hidden')
@@ -257,6 +239,6 @@ test('columns clip on their own, never force the pane wider, and use theme varia
     assert.match(value, /var\(--ui-|transparent|none|^[a-zA-Z]+":"0"$/, value)
   }
   assert.equal(back.flex, 'none')
-  const block = src.slice(src.indexOf('export const REVIEW_STYLES'), src.indexOf('export function ReviewPane'))
+  const block = src.slice(src.indexOf('export const REVIEW_STYLES'), src.indexOf('export function ReviewWorkArea'))
   assert.ok(!/#[0-9a-f]{3,8}\b|rgba?\(/i.test(block), 'no colour literals anywhere in the wrapper code')
 })

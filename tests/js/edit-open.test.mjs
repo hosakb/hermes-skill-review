@@ -15,9 +15,6 @@ const host = {
   navigate() {},
   notify(toast) { this.toasts.push(toast) },
   notifyError() {},
-  openWorkspace() { return () => {} },
-  revealPane() {},
-  undismissPane() {},
   state: { profile: { get: () => 'default' } },
   reset() { this.toasts = [] }
 }

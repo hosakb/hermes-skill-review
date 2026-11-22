@@ -2,13 +2,13 @@
 
 ![Skill Review: a review tab with the pending file list and per-change diff blocks](docs/banner.png)
 
-Skill Review is a Hermes Desktop plugin with a Python backend that shows staged skill and memory writes as visual diffs in one review tab, where you accept or reject each proposed change. Its Library mode lists each profile's identity, memory and skill files and edits them in place.
+Skill Review is a Hermes Desktop plugin with a Python backend that shows staged skill and memory writes as visual diffs on one review page, where you accept or reject each proposed change. Its Library mode lists each profile's identity, memory and skill files and edits them in place.
 
 ## What it does
 
 With `skills.write_approval` or `memory.write_approval` on, Hermes does not write skill or memory changes straight to disk. It stages each one as a JSON record under `<HERMES_HOME>/pending/skills/` or `<HERMES_HOME>/pending/memory/`. Skill Review reads those records and shows them in Desktop.
 
-- One review tab lists every file with pending changes once: a `SKILL.md` or supporting file, `MEMORY.md` or `USER.md`.
+- Skill review in the sidebar opens the review page in the main area, the way Memory Wiki and Kanban open theirs. The page lists every file with pending changes once: a `SKILL.md` or supporting file, `MEMORY.md` or `USER.md`.
 - Each proposed change is its own block in the file's diff. You accept or reject blocks one at a time, or use Accept all and Reject all for the whole file.
 - Blocks staged since you last opened the file are marked New. Earlier ones are marked Older.
 - Changed lines get word-level highlights.
@@ -16,13 +16,13 @@ With `skills.write_approval` or `memory.write_approval` on, Hermes does not writ
 - You can edit a proposed change in place before you accept it. Hermes's own size limits and content scan run on the edited text.
 - For a memory replace or patch, Remove entirely deletes the existing entry and drops the proposal, so neither version is kept.
 - Filters show skills, memory or all. You can limit the list to some profiles and sort it by newest, oldest, name or number of changes.
-- A Review button in the status bar shows the pending count. Click it to open the tab. Right-click it to pick the notification mode.
-- New changes show a popup or light up the Review button, as you choose. With auto-open on, the tab opens by itself instead.
+- A Review button in the status bar shows the pending count. Click it to open the page. Right-click it to pick the notification mode.
+- New changes show a popup with an Open button or light up the Review button, as you choose. Nothing opens the page by itself.
 - Settings live under Settings > Plugins > Skill Review.
 
 ### Library
 
-A switch at the top of the list, Pending N | Library, changes what the tab shows. Pending is the review list above.
+Two buttons under the page title, Pending N and Library, switch what the page shows. Pending is the review list above.
 
 - Library lists the default profile and every named profile, minus the profiles you hid in the settings. Each profile has three groups: Identity (`SOUL.md`, `PROJECT.md`, `AGENTS.md`, each when it exists in the profile folder), Memory (`MEMORY.md`, `USER.md`) and Skills (each skill folder with its `SKILL.md` and the text files under `references/`, `templates/`, `scripts/` and `assets/`). Library lists only files inside the profile folder: skills in external skill folders from `skills.external_dirs` are not listed, and a file is left out when any part of its path below the profile folder is a symlink.
 - Every profile, skill and file row shows how many pending changes it has. Pending changes to files that are not in the library, such as a new skill or a skill in an external skill folder, are listed under "Only in Pending" and open in Pending. The counts add up to the Pending total.
@@ -75,7 +75,7 @@ The gateway imports the Python backend when it starts. After an install or updat
 
 `dashboard/plugin_api.py` mounts routes under `/api/plugins/skill-review/` in the gateway. It lists the pending records of the default profile and every profile under `<HERMES_HOME>/profiles/`, groups their operations by target file and diffs each one against the file as it is now. It uses Hermes's own functions in `tools/write_approval.py` and the memory store for this.
 
-`desktop/plugin.js` asks the backend for the pending list every 3 seconds through `ctx.rest`. It draws the tab, the Review button and the settings page.
+`desktop/plugin.js` asks the backend for the pending list every 3 seconds through `ctx.rest`. It draws the page, its sidebar row, the Review button and the settings page.
 
 Accepting a block takes Hermes's pending-queue lock, cuts that operation out of its record and applies it with the same code as `/skills approve` and `/memory approve`. If Hermes refuses to apply it, the record stays as it was. Rejecting drops the operation from its record, and a record with no operations left is deleted.
 
@@ -100,12 +100,11 @@ The diff marks a block stale when its file changed so that the change no longer 
 - On Accept, Hermes's own approval code writes the change to the profile's skill or memory files, the same as `/skills approve` or `/memory approve`.
 - Editing a skill change, and saving a skill file in Library, runs Hermes's content scan on a copy of the file in a temporary folder, which is deleted right after.
 - The backend keeps an in-memory cache of up to 512 diff results. Nothing is cached on disk.
-- The Desktop half stores its settings in Desktop plugin storage: notification mode, auto-open, shown profiles, sort order, which changes it already announced and when you last opened each file.
+- The Desktop half stores its settings in Desktop plugin storage: notification mode, shown profiles, sort order, which changes it already announced and when you last opened each file.
 
 ## Known limits
 
-- The review tab cannot be closed, because Desktop turns a plugin off when its only pane closes. Collapse it, or hide it from the zone menu or with "Toggle Pending writes tab" in the command palette. Desktop will not hide the last visible tab of a zone, so if Files is hidden, press Hide in the pane header (or Ctrl+J / Cmd+J) to collapse the whole right sidebar. Hide needs a Desktop that gives plugins `ctx.runAction`; on older ones the button is not shown.
-- The tab lives in the Files zone, where cmd-W does not reach it. If you drag it into the chat zone, or your layout has no Files pane or other right-side pane so Desktop puts it there, cmd-W there still closes it and switches the plugin off. This is a Desktop limitation.
+- The review page takes the main area while it is open, as Memory Wiki and Kanban do. Pick a chat in the sidebar to go back.
 - After an update, reload Desktop and restart the backend before the new version runs.
 - Word highlights stop at 2,500 tokens per line and 4,000,000 comparison cells per line pair (16,000,000 per block). Longer lines are tinted without word marks. Diffs themselves are not truncated.
 - An edit can be at most 100,000 characters, and Hermes's own size limit for the file still applies.

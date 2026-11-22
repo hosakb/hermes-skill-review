@@ -10,7 +10,7 @@ const here = fileURLToPath(new URL('.', import.meta.url))
 const pluginPath = fileURLToPath(new URL('../../desktop/plugin.js', import.meta.url))
 
 globalThis.__host ??= {
-  navigate() {}, notify() {}, notifyError() {}, openWorkspace() { return () => {} }, revealPane() {}, undismissPane() {},
+  navigate() {}, notify() {}, notifyError() {},
   state: { profile: { get: () => 'default' } }
 }
 globalThis.__queryClient ??= { fetchQuery: () => Promise.resolve({ items: [] }) }

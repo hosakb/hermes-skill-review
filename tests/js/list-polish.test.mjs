@@ -15,9 +15,6 @@ const host = {
   navigate() {},
   notify(toast) { this.toasts.push(toast) },
   notifyError() {},
-  openWorkspace() { return () => {} },
-  revealPane() {},
-  undismissPane() {},
   state: { profile: { get: () => 'default' } },
   reset() { this.toasts = [] }
 }
@@ -345,7 +342,7 @@ test('the live list header uses only wrapping rows', () => {
   const list = slice('function FilesListPane()', '\nfunction ')
   const bar = list.slice(list.indexOf('const bar'), list.indexOf('let body'))
   const styles = [...bar.matchAll(/style: ([A-Z_]+\.[a-zA-Z]+)/g)].map(m => m[1])
-  assert.deepEqual(styles, ['STYLES.bar', 'STYLES.barRow', 'LIST_STYLES.controls', 'STYLES.barRow'])
+  assert.deepEqual(styles, ['STYLES.bar', 'LIST_STYLES.controls', 'STYLES.barRow'])
 })
 
 // --- 3b. failure message punctuation ----------------------------------------------------------

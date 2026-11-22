@@ -12,9 +12,6 @@ const host = {
   navigate() {},
   notify(toast) { this.toasts.push(toast) },
   notifyError(error, message) { this.errors.push(message) },
-  openWorkspace() { return () => {} },
-  revealPane() {},
-  undismissPane() {},
   state: { profile: { get: () => 'default' } },
   reset() { this.toasts = []; this.errors = [] }
 }
@@ -129,13 +126,14 @@ test('the switch shows Pending with its count and Library, and changes the mode'
   reset()
   const changes = []
   const view = ModeSwitch({ mode: 'pending', onChange: m => changes.push(m), t, total: 5 })
-  const [control] = walk(view).filter(n => n.type === SegmentedControl)
-  assert.ok(control, 'the SDK segmented control')
-  assert.deepEqual(control.props.options.map(o => [o.id, o.label]), [['pending', 'modePending:5'], ['library', 'modeLibrary']])
-  assert.equal(control.props.value, 'pending')
-  control.props.onChange('library')
+  const buttons = walk(view).filter(n => n.type?.name === 'Button')
+  assert.deepEqual(buttons.map(b => b.key), ['pending', 'library'])
+  assert.deepEqual(buttons.map(b => b.props['aria-pressed']), [true, false])
+  assert.equal(buttons[0].props['aria-label'], 'modePendingAria:5')
+  buttons[1].props.onClick()
   assert.deepEqual(changes, ['library'])
-  assert.equal(messages.en.modePending(3), 'Pending 3')
+  assert.equal(messages.en.modePending, 'Pending')
+  assert.equal(messages.en.modePendingAria(1), 'Pending, 1 change')
   assert.equal(messages.en.modeLibrary, 'Library')
 })
 
@@ -181,14 +179,15 @@ test('the layout shows the Library panes in Library mode and the Pending panes o
   assert.ok(walk(narrow).some(n => n.props?.['data-review-back']))
 })
 
-test('the Pending list header carries the switch in place of its title row', async () => {
+test('the switch sits in the page header, not in either list header', async () => {
   const { readFileSync } = await import('node:fs')
   const src = readFileSync(pluginPath, 'utf8')
-  const list = src.slice(src.indexOf('function FilesListPane()'), src.indexOf('\nfunction ', src.indexOf('function FilesListPane()') + 10))
-  const bar = list.slice(list.indexOf('const bar'), list.indexOf('let body'))
-  assert.match(bar, /jsx\(ModeControl, \{ total \}\)/)
-  const lib = src.slice(src.indexOf('function LibraryListPane()'), src.indexOf('\nfunction ', src.indexOf('function LibraryListPane()') + 10))
-  assert.match(lib, /jsx\(ModeControl, \{ total: /)
+  const list = src.slice(src.indexOf('function FilesListPane()'), src.indexOf('export function FilesEmpty('))
+  assert.doesNotMatch(list, /ModeSwitch|ModeControl/)
+  const lib = src.slice(src.indexOf('function LibraryListPane()'), src.indexOf('const textLines'))
+  assert.doesNotMatch(lib, /ModeSwitch|ModeControl/)
+  const page = src.slice(src.indexOf('export function ReviewPageView('), src.indexOf('\n}\n', src.indexOf('export function ReviewPageView(')))
+  assert.match(page, /jsx\(ModeSwitch, \{ mode, onChange: onMode, t, total \}\)/)
   assert.ok(typeof FilesListPane === 'function' && typeof LibraryListPane === 'function' && typeof LibraryDetailPane === 'function')
 })
 
