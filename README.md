@@ -114,7 +114,7 @@ The diff marks a block stale when its file changed so that the change no longer 
 - Once you edit a file with Windows line endings in Library, it is saved with Unix line endings, because the browser's text box turns every line ending into a line feed.
 - The profile picker in the settings lists only profiles with pending changes, so a profile with none cannot be hidden from Library.
 - The Skills Guard scan on a Library save sees only the file you save, not the rest of the skill folder, the same as when you edit a proposed change.
-- Closing or reloading Desktop with unsaved text in Library does not ask first. The Desktop plugin SDK has no hook for that; only switching files, switching to Pending and Back ask.
+- Closing or reloading Desktop, or leaving the page from the sidebar, with unsaved text in Library does not ask first. The Desktop plugin SDK has no hook for that; switching files, switching to Pending, Back and the settings gear ask. Text left this way stays in Library until Desktop reloads: the page opens on that file again and shows "Unsaved changes in" the file next to the Library button.
 - Library leaves out a file that has a second hard link, and refuses one that gains a link after the list was read. It leaves out a file reached through a symlink, even one that points inside the profile folder. A skill whose `SKILL.md` is left out this way is left out whole, with its other files.
 - Library writes files directly. A Hermes process that holds a file's text in memory, such as a running chat with `SOUL.md` already in its prompt, sees the new text only when it reads the file again.
 

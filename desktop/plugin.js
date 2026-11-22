@@ -2628,9 +2628,10 @@ const indent = depth => ({ paddingLeft: `calc(${PAD} + ${depth * 0.85}rem)` })
 
 /** The Pending | Library switch as a pure view: two buttons, the shown one pressed, the way Memory
  *  Wiki switches its sections. Pending carries its count when there is anything to review. */
-export function ModeSwitch({ mode, total, onChange, t }) {
+export function ModeSwitch({ mode, total, onChange, t, unsaved = '' }) {
   const shown = MODES.includes(mode) ? mode : 'pending'
   const count = Number(total) > 0 ? Number(total) : 0
+  const dot = unsaved ? jsx('span', { 'aria-hidden': true, 'data-dirty': true, style: { ...LIB_STYLES.dot, marginLeft: '0.4rem' } }) : null
 
   const button = (id, label, extra = null, aria = undefined) =>
     jsxs(Button, {
@@ -2650,7 +2651,10 @@ export function ModeSwitch({ mode, total, onChange, t }) {
     style: PAGE_STYLES.modes,
     children: [
       button('pending', t('modePending'), count ? jsx('span', { style: PAGE_STYLES.count, children: count }) : null, count ? t('modePendingAria', count) : undefined),
-      button('library', t('modeLibrary'))
+      button('library', t('modeLibrary'), dot, unsaved ? t('modeLibraryUnsaved', unsaved) : undefined),
+      // A draft kept from an earlier visit: the page has no way to stop a sidebar click, so it says
+      // here that the text is still waiting in Library.
+      unsaved ? jsx('span', { role: 'status', style: PAGE_STYLES.unsaved, title: t('unsavedIn', unsaved), children: t('unsavedIn', unsaved) }) : null
     ]
   })
 }
@@ -3138,6 +3142,7 @@ export const PAGE_STYLES = {
   lede: { color: 'var(--ui-text-secondary)', fontSize: '0.875rem', lineHeight: 1.5, margin: 0, maxWidth: '70ch', minWidth: 0 },
   modes: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem', minWidth: 0 },
   count: { color: 'var(--ui-text-tertiary)', fontVariantNumeric: 'tabular-nums', marginLeft: '0.4rem' },
+  unsaved: { color: 'var(--ui-text-secondary)', fontSize: '0.8125rem', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   work: {
     border: '1px solid var(--ui-stroke-secondary)',
     borderRadius: '8px',
@@ -3151,7 +3156,7 @@ export const PAGE_STYLES = {
 }
 
 /** The page as a pure view, so tests can read its structure. */
-export function ReviewPageView({ mode, onMode, t, total }) {
+export function ReviewPageView({ mode, onMode, t, total, unsaved = '' }) {
   return jsxs('div', {
     style: PAGE_STYLES.root,
     children: [
@@ -3160,7 +3165,7 @@ export function ReviewPageView({ mode, onMode, t, total }) {
         children: [
           jsx('h1', { style: PAGE_STYLES.title, children: t('pageTitle') }),
           jsx('p', { style: PAGE_STYLES.lede, children: t('pageLede') }),
-          jsx(ModeSwitch, { mode, onChange: onMode, t, total })
+          jsx(ModeSwitch, { mode, onChange: onMode, t, total, unsaved })
         ]
       }),
       jsx('div', { style: PAGE_STYLES.work, children: jsx(ReviewWorkArea, {}) })
@@ -3184,18 +3189,28 @@ export function notePageMount() {
   }
 }
 
+/** The kept Library draft as the notice names it: profile, then skill folder when there is one,
+ *  then the file. */
+export const draftLabel = session =>
+  session ? [session.profile, session.skill, session.name].filter(Boolean).join('/') : ''
+
 /** The route page. */
 export function ReviewPage() {
   const t = usePluginI18n(ID)
   const mode = useValue($mode)
+  const editing = useValue($libEditor)
   const files = useFiles()
 
   useEffect(() => notePageMount(), [])
 
-  return jsx(ReviewPageView, { mode, onMode: setMode, t, total: pendingTotal(files.data?.files) })
+  const unsaved = isDirty(editing) ? draftLabel(editing) : ''
+
+  return jsx(ReviewPageView, { mode, onMode: setMode, t, total: pendingTotal(files.data?.files), unsaved })
 }
 
 const PAGE_EN = {
+  modeLibraryUnsaved: file => `Library, unsaved changes in ${file}`,
+  unsavedIn: file => `Unsaved changes in ${file}`,
   pageLede:
     'Changes your agents want to make to their skills and memory. Nothing is saved until you accept it. Library lets you read and edit the saved files directly.',
   pageTitle: 'Skill review'
@@ -3682,11 +3697,11 @@ export function openReview({ pending = false } = {}) {
 export const settingsHref = () =>
   typeof SDK.pluginSettingsHref === 'function' ? SDK.pluginSettingsHref(ID) : `/settings?tab=plugins&plugin=${ID}`
 
-/** The list header's gear: open this plugin's settings page. Hosts without settings pages show the
- *  settings inside the list. */
+/** The list header's gear: open this plugin's settings page, after the discard prompt when Library
+ *  holds unsaved text. Hosts without settings pages show the settings inside the list. */
 export function openSettings() {
   if (hasSettingsPage) {
-    host.navigate(settingsHref())
+    requestLeave(() => host.navigate(settingsHref()))
   } else {
     $inlineSettings.set(!$inlineSettings.get())
   }

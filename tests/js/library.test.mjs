@@ -187,7 +187,7 @@ test('the switch sits in the page header, not in either list header', async () =
   const lib = src.slice(src.indexOf('function LibraryListPane()'), src.indexOf('const textLines'))
   assert.doesNotMatch(lib, /ModeSwitch|ModeControl/)
   const page = src.slice(src.indexOf('export function ReviewPageView('), src.indexOf('\n}\n', src.indexOf('export function ReviewPageView(')))
-  assert.match(page, /jsx\(ModeSwitch, \{ mode, onChange: onMode, t, total \}\)/)
+  assert.match(page, /jsx\(ModeSwitch, \{ mode, onChange: onMode, t, total, unsaved \}\)/)
   assert.ok(typeof FilesListPane === 'function' && typeof LibraryListPane === 'function' && typeof LibraryDetailPane === 'function')
 })
 

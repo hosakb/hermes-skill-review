@@ -44,7 +44,7 @@ const textOf = node => {
   return (Array.isArray(c) ? c.flat(Infinity) : [c]).map(textOf).join('')
 }
 
-function start() {
+function start({ settingsPages = false } = {}) {
   H.reset?.()
   H.navigated = []
   H.toasts = []
@@ -59,6 +59,7 @@ function start() {
     setTimeout: () => () => {},
     storage: { get: (k, d) => d, set() {} }
   }
+  if (settingsPages) ctx.registerSettingsPage = () => () => {}
   plugin.register(ctx)
   return ctx
 }
@@ -233,4 +234,139 @@ test('ReviewPage hands the view the shared mode and the Pending total', () => {
   assert.match(body, /useEffect\(\(\) => notePageMount\(\), \[\]\)/)
   assert.match(body, /onMode: setMode/)
   assert.match(body, /pendingTotal\(/)
+})
+
+// --- unsaved Library text -----------------------------------------------------------------------
+// Desktop's public SDK has no route-leave hook (host.navigate only sets the hash), so the plugin
+// gates the navigations it starts itself, and a draft left behind by a sidebar click stays in the
+// module atoms and is flagged on the page when the user comes back.
+
+const SOUL_ID = 'dev/soulKey'
+const draft = (extra = {}) => ({ id: SOUL_ID, profile: 'dev', key: 'soulKey', name: 'SOUL.md', skill: null, original: 'a', text: 'b', ...extra })
+const withDraft = () => {
+  mod.$libDiscard.set(null)
+  $mode.set('library')
+  $libSelection.set(SOUL_ID)
+  $libEditor.set(draft())
+}
+const clearDraft = () => {
+  mod.$libDiscard.set(null)
+  $libEditor.set(null)
+  $libSelection.set(null)
+  $mode.set('pending')
+}
+
+test('the gear asks before it leaves for Settings with unsaved Library text, then goes on Discard', () => {
+  const ctx = start({ settingsPages: true })
+  withDraft()
+  mod.openSettings()
+  assert.deepEqual(H.navigated, [], 'nothing leaves the page yet')
+  assert.ok(mod.$libDiscard.get(), 'the discard dialog is open')
+  mod.confirmDiscard()
+  assert.deepEqual(H.navigated, ['/settings?tab=plugins&plugin=skill-review'])
+  assert.equal($libEditor.get(), null, 'Discard drops the text')
+  clearDraft()
+  stop(ctx)
+})
+
+test('Cancel on the gear prompt stays on the page with the text kept', () => {
+  const ctx = start({ settingsPages: true })
+  withDraft()
+  mod.openSettings()
+  mod.cancelDiscard()
+  assert.deepEqual(H.navigated, [])
+  assert.equal($libEditor.get().text, 'b')
+  assert.equal($mode.get(), 'library')
+  clearDraft()
+  stop(ctx)
+})
+
+test('the gear goes straight to Settings when nothing is unsaved', () => {
+  const ctx = start({ settingsPages: true })
+  clearDraft()
+  mod.openSettings()
+  assert.deepEqual(H.navigated, ['/settings?tab=plugins&plugin=skill-review'])
+  assert.equal(mod.$libDiscard.get(), null)
+  stop(ctx)
+})
+
+test('the Pending button on the page asks before it drops unsaved Library text', () => {
+  const ctx = start()
+  withDraft()
+  const page = ReviewPageView({ mode: 'library', onMode: mod.setMode, t: en, total: 0 })
+  const pending = walk(page).filter(n => n.type === ModeSwitch).map(n => ModeSwitch(n.props))[0]
+  walk(pending).find(n => n.key === 'pending').props.onClick()
+  assert.equal($mode.get(), 'library')
+  assert.ok(mod.$libDiscard.get())
+  clearDraft()
+  stop(ctx)
+})
+
+test('the status button and palette on the page keep the draft: same page, no prompt, mode unchanged', () => {
+  const ctx = start()
+  withDraft()
+  ctx.registered.find(c => c.area === 'palette').data.run()
+  const chip = ReviewChip({ count: 0, counts: { skills: 0, memory: 0 }, lit: false, mode: 'popup', onOpen: () => openReview(), onMode() {}, t })
+  walk(chip).find(n => n.type === 'button').props.onClick()
+  assert.deepEqual(H.navigated, ['/skill-review', '/skill-review'])
+  assert.equal(mod.$libDiscard.get(), null)
+  assert.equal($mode.get(), 'library')
+  assert.equal($libEditor.get().text, 'b')
+  clearDraft()
+  stop(ctx)
+})
+
+test('the toast Open goes to the page and asks there before switching to Pending', () => {
+  const ctx = start()
+  withDraft()
+  openReview({ pending: true })
+  assert.deepEqual(H.navigated, ['/skill-review'])
+  assert.equal($mode.get(), 'library')
+  assert.ok(mod.$libDiscard.get())
+  mod.confirmDiscard()
+  assert.equal($mode.get(), 'pending')
+  clearDraft()
+  stop(ctx)
+})
+
+test('coming back after leaving another way: Library, the same file, the unsaved text', () => {
+  const ctx = start()
+  withDraft()
+  // A sidebar click leaves without the plugin knowing; then the page mounts again.
+  const unmount = notePageMount()
+  assert.equal($mode.get(), 'library')
+  assert.equal($libSelection.get(), SOUL_ID)
+  const fresh = { status: 'ok', file: { key: 'soulKey', name: 'SOUL.md', kind: 'identity' }, text: 'a', version: 'v2' }
+  assert.equal(mod.librarySession($libEditor.get(), SOUL_ID, fresh).text, 'b', 'a refetch never replaces the kept text')
+  const tree = mod.LibraryTree({ dirtyId: SOUL_ID, onSelect() {}, onToggle() {}, rows: [{ type: 'file', id: SOUL_ID, depth: 2, label: 'SOUL.md' }], selection: SOUL_ID, t })
+  assert.ok(walk(tree).some(n => n.props?.['data-dirty']), 'the tree row keeps its dirty marker')
+  unmount()
+  clearDraft()
+  stop(ctx)
+})
+
+test('draftLabel names the file with its profile, and a skill file with its skill', () => {
+  assert.equal(mod.draftLabel(draft()), 'dev/SOUL.md')
+  assert.equal(mod.draftLabel(draft({ name: 'references/a.md', skill: 'council' })), 'dev/council/references/a.md')
+  assert.equal(mod.draftLabel(null), '')
+})
+
+test('the Library switch carries an Unsaved changes notice while a draft is kept', () => {
+  const view = ModeSwitch({ mode: 'pending', onChange() {}, t: en, total: 0, unsaved: 'dev/SOUL.md' })
+  const library = walk(view).find(n => n.key === 'library')
+  assert.ok(walk(library).some(n => n.props?.['data-dirty']), 'a dot on the Library button')
+  assert.equal(library.props['aria-label'], 'Library, unsaved changes in dev/SOUL.md')
+  const notice = walk(view).find(n => n.props?.role === 'status')
+  assert.equal(textOf(notice), 'Unsaved changes in dev/SOUL.md')
+  assert.equal(notice.props.title, 'Unsaved changes in dev/SOUL.md')
+  const clean = ModeSwitch({ mode: 'library', onChange() {}, t: en, total: 0, unsaved: '' })
+  assert.ok(!walk(clean).some(n => n.props?.role === 'status' || n.props?.['data-dirty']))
+})
+
+test('ReviewPage hands the switch the kept draft, only while it differs from the file', () => {
+  const body = src.slice(src.indexOf('export function ReviewPage()'), src.indexOf('\n}\n', src.indexOf('export function ReviewPage()')))
+  assert.match(body, /useValue\(\$libEditor\)/)
+  assert.match(body, /isDirty\(editing\) \? draftLabel\(editing\) : ''/)
+  const view = src.slice(src.indexOf('export function ReviewPageView('), src.indexOf('\n}\n', src.indexOf('export function ReviewPageView(')))
+  assert.match(view, /jsx\(ModeSwitch, \{ mode, onChange: onMode, t, total, unsaved \}\)/)
 })
