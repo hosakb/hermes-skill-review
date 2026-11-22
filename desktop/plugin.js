@@ -2575,7 +2575,8 @@ export const LIB_STYLES = {
   dot: { background: 'var(--ui-blue, var(--ui-accent))', borderRadius: '50%', display: 'inline-block', flex: 'none', height: '0.45rem', width: '0.45rem' },
   search: { boxSizing: 'border-box', maxWidth: '100%', minWidth: 0, width: '100%' },
   // Gutter and text share face, size, leading and top padding, so line numbers stay level with
-  // the lines. No soft wrap: one text line is one gutter line. The box scrolls, not the textarea.
+  // the lines. The box scrolls, not the textarea. Wrap off: one text line is one gutter row. Wrap
+  // on: a hidden mirror counts the rows each line takes, and the gutter leaves blank rows to match.
   editorBox: {
     alignItems: 'flex-start',
     background: 'var(--ui-editor-surface-background)',
@@ -2624,6 +2625,10 @@ export const LIB_STYLES = {
     whiteSpace: 'pre',
     width: '100%'
   },
+  textareaWrap: { overflowWrap: 'anywhere', overflowX: 'hidden', whiteSpace: 'pre-wrap' },
+  // Zero size and clipped, so the measuring copy is never seen and never adds scroll.
+  mirrorClip: { height: 0, overflow: 'hidden', pointerEvents: 'none', position: 'absolute', visibility: 'hidden', width: 0 },
+  wrapToggle: { alignItems: 'center', cursor: 'pointer', display: 'inline-flex', gap: '0.3rem', marginLeft: 'auto' },
   body: { display: 'flex', flex: '1 1 auto', flexDirection: 'column', gap: '0.5rem', minHeight: 0, minWidth: 0, padding: PAD },
   footer: { alignItems: 'center', color: 'var(--ui-text-tertiary)', display: 'flex', flex: 'none', flexWrap: 'wrap', fontSize: '0.7rem', gap: '0.3rem 0.75rem', minWidth: 0 },
   unsaved: { alignItems: 'center', color: 'var(--ui-text-secondary)', display: 'inline-flex', gap: '0.3rem' },
@@ -2806,6 +2811,101 @@ export function LibraryListPane() {
 
 const textLines = text => String(text ?? '').split('\n').length
 
+/** localStorage key for the Wrap lines choice; '0' is off, anything else (or nothing) is on. */
+export const WRAP_KEY = `${ID}:libWrap`
+
+const browserStorage = () => {
+  try {
+    return globalThis.localStorage
+  } catch {
+    return undefined
+  }
+}
+
+export function readEditorWrap(storage = browserStorage()) {
+  try {
+    return storage?.getItem(WRAP_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+
+export function writeEditorWrap(on, storage = browserStorage()) {
+  try {
+    storage?.setItem(WRAP_KEY, on ? '1' : '0')
+  } catch {
+    // Storage can be blocked; the choice then lasts until the editor closes.
+  }
+}
+
+/** The editor's text lines. CRLF ends a line the same as LF, so the count matches textLines. */
+export const libraryLines = text => String(text ?? '').split(/\r?\n/)
+
+/** Gutter text with one number per text line on that line's first row, and a blank row for each
+ *  row it wraps onto. `rowCounts` holds the measured rows per line; when it is missing or belongs
+ *  to a text with another line count, every line takes one row. `rows` is the total. */
+export function wrapGutter(text, rowCounts) {
+  const count = libraryLines(text).length
+  const fits = Array.isArray(rowCounts) && rowCounts.length === count
+  const out = []
+
+  for (let i = 0; i < count; i += 1) {
+    out.push(String(i + 1))
+
+    const extra = fits ? Math.max(1, Math.round(rowCounts[i]) || 1) - 1 : 0
+
+    for (let j = 0; j < extra; j += 1) {
+      out.push('')
+    }
+  }
+
+  return { gutter: out.join('\n'), rows: out.length }
+}
+
+// What decides where a textarea line wraps, copied onto the mirror before each measure.
+const MIRROR_PROPS = [
+  'boxSizing', 'width', 'paddingLeft', 'paddingRight', 'borderLeftStyle', 'borderLeftWidth', 'borderRightStyle',
+  'borderRightWidth', 'direction', 'fontFamily', 'fontFeatureSettings', 'fontKerning', 'fontSize', 'fontStretch',
+  'fontStyle', 'fontVariant', 'fontVariantLigatures', 'fontWeight', 'letterSpacing', 'lineHeight', 'overflowWrap',
+  'tabSize', 'textRendering', 'textTransform', 'whiteSpace', 'wordBreak', 'wordSpacing'
+]
+
+/** Lay each line out in `mirror` with the textarea's font and width, and return how many rows
+ *  each one takes. Null when there is nothing to measure (no nodes, or the editor is not laid out). */
+export function measureWrapRows(area, mirror, lines) {
+  const doc = area?.ownerDocument
+  const style = doc?.defaultView?.getComputedStyle?.(area)
+
+  if (!mirror || !style) {
+    return null
+  }
+
+  for (const prop of MIRROR_PROPS) {
+    mirror.style[prop] = style[prop]
+  }
+
+  const line = content => {
+    const el = doc.createElement('div')
+
+    // An empty div has no height, but an empty line still takes one row.
+    el.textContent = content || '​'
+
+    return el
+  }
+  const nodes = lines.map(line)
+  const probe = line('')
+
+  mirror.replaceChildren(...nodes, probe)
+
+  const row = probe.getBoundingClientRect().height
+
+  if (!(row > 0)) {
+    return null
+  }
+
+  return nodes.map(el => Math.max(1, Math.round(el.getBoundingClientRect().height / row)))
+}
+
 /** The file editor as a pure view: header, pending link, alerts, the editor and its footer. */
 export function LibraryEditorView({ meta, session, loading = false, error = null, onChange, onSave, onRevert, onReload, onReview, t }) {
   const file = meta?.file ?? (session ? { kind: session.kind, name: session.name, pending: 0, skill: session.skill } : null)
@@ -2815,6 +2915,46 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
   const dirty = isDirty(session)
   const saving = Boolean(session?.saving)
   const pending = file?.pending ?? 0
+
+  // Soft wrap. `measured` is the rows per line for one text at one width and font load; the
+  // effect re-measures when any of those change, and typing measures before its own render so
+  // the gutter and the height never lag a keystroke.
+  const [wrap, setWrap] = useState(readEditorWrap())
+  const [box, setBox] = useState(null)
+  const [width, setWidth] = useState(0)
+  const [fontLoads, setFontLoads] = useState(0)
+  const [measured, setMeasured] = useState(null)
+  const value = session?.text ?? ''
+
+  const measure = text =>
+    setMeasured({
+      counts: measureWrapRows(box?.querySelector('textarea'), box?.querySelector('[data-wrap-mirror]'), libraryLines(text)),
+      fontLoads,
+      text,
+      width
+    })
+
+  useEffect(() => {
+    if (!wrap || !box) {
+      return undefined
+    }
+
+    let live = true
+    const stop = observeWidth(box.querySelector('textarea'), setWidth)
+
+    box.ownerDocument?.fonts?.ready?.then(() => live && setFontLoads(n => n + 1))
+
+    return () => {
+      live = false
+      stop?.()
+    }
+  }, [wrap, box])
+
+  useEffect(() => {
+    if (wrap && box && !(measured?.text === value && measured.width === width && measured.fontLoads === fontLoads)) {
+      measure(value)
+    }
+  }, [wrap, box, value, width, fontLoads, measured])
 
   const header = jsxs('div', {
     style: STYLES.headerWrap,
@@ -2851,6 +2991,7 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
     body = loading ? jsx(DiffSkeleton, { t }) : null
   } else {
     const lines = textLines(session.text)
+    const { gutter, rows } = wrapGutter(session.text, wrap ? measured?.counts : null)
 
     body = [
       session.conflict
@@ -2865,21 +3006,29 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
         : null,
       session.error ? jsx('div', { role: 'alert', style: EDIT_STYLES.error, children: session.error }, 'error') : null,
       jsxs('div', {
+        ref: setBox,
         style: LIB_STYLES.editorBox,
         children: [
-          jsx('pre', { 'aria-hidden': true, 'data-gutter': true, style: LIB_STYLES.gutter, children: Array.from({ length: lines }, (_, i) => i + 1).join('\n') }),
+          jsx('pre', { 'aria-hidden': true, 'data-gutter': true, style: LIB_STYLES.gutter, children: gutter }),
           jsx(Textarea, {
             'aria-invalid': Boolean(session.error),
             'aria-label': t('libEditorLabel', name),
-            onChange: event => onChange?.(event.target.value),
+            onChange: event => {
+              if (wrap && box) {
+                measure(event.target.value)
+              }
+
+              onChange?.(event.target.value)
+            },
             readOnly: saving,
             rows: lines,
             spellCheck: false,
-            // Every line shows; room is left for a horizontal scrollbar under a long line.
-            style: { ...LIB_STYLES.textarea, height: `calc(${(lines * 1.55 * 0.75 + 0.8).toFixed(2)}rem + 14px)` },
+            // Every row shows; room is left for a horizontal scrollbar under a long line.
+            style: { ...LIB_STYLES.textarea, ...(wrap ? LIB_STYLES.textareaWrap : null), height: `calc(${(rows * 1.55 * 0.75 + 0.8).toFixed(2)}rem + 14px)` },
             value: session.text,
-            wrap: 'off'
-          })
+            wrap: wrap ? 'soft' : 'off'
+          }),
+          wrap ? jsx('div', { 'aria-hidden': true, style: LIB_STYLES.mirrorClip, children: jsx('div', { 'data-wrap-mirror': true }) }) : null
         ]
       }, 'editor'),
       jsxs('div', {
@@ -2887,7 +3036,21 @@ export function LibraryEditorView({ meta, session, loading = false, error = null
         children: [
           dirty ? jsxs('span', { 'aria-live': 'polite', style: LIB_STYLES.unsaved, children: [jsx('span', { style: LIB_STYLES.dot }), t('libUnsaved')] }) : null,
           jsx('span', { children: t('libStraightToFile') }),
-          jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: t('libLines', lines) })
+          jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: t('libLines', lines) }),
+          jsxs('label', {
+            style: LIB_STYLES.wrapToggle,
+            children: [
+              jsx(Checkbox, {
+                checked: wrap,
+                onCheckedChange: on => {
+                  writeEditorWrap(on === true)
+                  setMeasured(null)
+                  setWrap(on === true)
+                }
+              }),
+              jsx('span', { children: t('libWrap') })
+            ]
+          })
         ]
       }, 'footer')
     ]
@@ -3004,7 +3167,8 @@ const LIB_EN = {
   libStagedTip: name => `${name} is not in the library: a new file, or a skill outside this profile's folder. Open its changes in Pending.`,
   libStraightToFile: 'Saves straight to the file',
   libUnsaved: 'Unsaved changes',
-  libUnsupportedTitle: 'Library is not available on this system'
+  libUnsupportedTitle: 'Library is not available on this system',
+  libWrap: 'Wrap lines'
 }
 
 // ---------------------------------------------------------------------------------------------
