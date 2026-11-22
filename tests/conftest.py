@@ -56,6 +56,15 @@ def home_of(root, profile):
 
 
 @pytest.fixture
+def scope(root, monkeypatch):
+    """scope(profile): serve the next requests the way the host serves that profile's plugin routes,
+    with get_hermes_home() at its home. The plugin itself never switches profiles."""
+    def _scope(profile):
+        monkeypatch.setenv("HERMES_HOME", str(home_of(root, profile)))
+    return _scope
+
+
+@pytest.fixture
 def stage(root):
     """stage(profile, payload, origin=...) writes a pending record into that profile's queue.
 

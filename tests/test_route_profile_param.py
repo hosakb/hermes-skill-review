@@ -38,9 +38,8 @@ def hermes_like(api):
     return TestClient(app), seen
 
 
-def _dev_files(client):
-    files = client.get(f"{BASE}/files", params={"kind": "all"}).json()["files"]
-    return [f for f in files if f["profile"] == "dev"]
+def _files(client):
+    return client.get(f"{BASE}/files", params={"kind": "all"}).json()["files"]
 
 
 def test_no_route_has_a_path_parameter_named_profile(api):
@@ -56,26 +55,26 @@ def test_no_route_has_a_path_parameter_named_profile(api):
 
 def test_hermes_dependency_never_sees_the_file_owner_as_its_profile(hermes_like, stage, root):
     client, seen = hermes_like
-    write_memory(root, "dev", ["alpha fact"])
-    staged = stage("dev", {"action": "add", "target": "memory", "content": "beta fact"})
-    stage("dev", {"action": "add", "target": "memory", "content": "gamma fact"})
-    [f] = _dev_files(client)
+    write_memory(root, "default", ["alpha fact"])
+    staged = stage("default", {"action": "add", "target": "memory", "content": "beta fact"})
+    stage("default", {"action": "add", "target": "memory", "content": "gamma fact"})
+    [f] = _files(client)
     base = f"{BASE}/files/{f['profile']}/{f['subsystem']}/{f['key']}"
-    pid = staged.get("pending_id") or staged.get("id")
 
     diff = client.get(f"{base}/diff")
     assert diff.status_code == 200
-    blocks = [s["block"] for s in diff.json()["segments"] if s["type"] == "block"]
+    data = diff.json()
+    blocks = [s["block"] for s in data["segments"] if s["type"] == "block"]
     assert len(blocks) == 2
+    first = blocks[0]
 
     calls = [
-        ("get", f"{base}/edits"),
-        ("get", f"{BASE}/pending/memory/dev/{pid}/diff"),
-        ("post", f"{base}/blocks/{blocks[0]['id']}/accept"),
-        ("post", f"{base}/accept-all"),
+        ("post", f"{base}/blocks/{first['id']}/accept", {"expect": data["writes"][first["record_id"]]["expect"]}),
+        ("post", f"{base}/accept-all", {"expects": {w: v["expect"] for w, v in data["writes"].items()}}),
+        ("get", f"{BASE}/library", None),
     ]
-    for method, url in calls:
-        response = getattr(client, method)(url)
+    for method, url, body in calls:
+        response = client.post(url, json=body) if method == "post" else client.get(url)
         assert response.status_code == 200, (url, response.text)
 
     assert len(seen) == 1 + 1 + len(calls)  # /files, diff, then the calls above
@@ -89,12 +88,21 @@ def test_an_explicit_query_profile_still_reaches_the_dependency(hermes_like):
     assert seen == ["ops"]
 
 
-def test_the_location_route_is_gone(hermes_like, stage, root):
-    """The external editor link was the only reader of /location; the route no longer exists."""
+def test_removed_routes_are_gone(hermes_like, stage, root):
+    """/location (the external editor link), /edits, /edit and /remove-entry need private Hermes code,
+    and the per-record /pending/... routes are replaced by the file routes: none of them exists."""
     client, _ = hermes_like
-    write_memory(root, "dev", ["alpha fact"])
-    stage("dev", {"action": "add", "target": "memory", "content": "beta fact"})
-    [f] = _dev_files(client)
+    write_memory(root, "default", ["alpha fact"])
+    staged = stage("default", {"action": "add", "target": "memory", "content": "beta fact"})
+    [f] = _files(client)
     base = f"{BASE}/files/{f['profile']}/{f['subsystem']}/{f['key']}"
+    block = f"{staged.get('pending_id') or staged.get('id')}-0123456789"
     assert client.get(f"{base}/location").status_code == 404
-    assert client.get(f"{base}/edits").status_code == 200
+    assert client.get(f"{base}/edits").status_code == 404
+    assert client.post(f"{base}/blocks/{block}/edit", json={"text": "x"}).status_code == 404
+    assert client.post(f"{base}/blocks/{block}/remove-entry").status_code == 404
+    pid = staged.get("pending_id") or staged.get("id")
+    for verb in ("diff", "accept", "reject"):
+        method = client.get if verb == "diff" else client.post
+        assert method(f"{BASE}/pending/memory/default/{pid}/{verb}").status_code in (404, 405)
+    assert client.get(f"{base}/diff").status_code == 200
