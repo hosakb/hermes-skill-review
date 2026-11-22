@@ -93,28 +93,30 @@ The diff marks a block stale when its file changed so that the change no longer 
 - No telemetry and no usage reporting.
 - No credentials. The plugin reads no secrets, tokens or `.env` files.
 - No tools, hooks, shell commands or background processes. The Python `register()` does nothing.
-- It reads pending records under `<HERMES_HOME>/pending/` and, for the default profile and every profile under `<HERMES_HOME>/profiles/`, each profile's `MEMORY.md`, `USER.md` and `SKILL.md` files. If you set external skill folders in Hermes, it reads `SKILL.md` files there too.
-- Library also reads each profile's `SOUL.md`, `PROJECT.md` and `AGENTS.md` and the supporting files of every skill in the profile's own skills folder. It does not read or write external skill folders.
-- On Save in Library, the plugin writes that one file itself: `SOUL.md`, `PROJECT.md`, `AGENTS.md`, `MEMORY.md`, `USER.md`, a `SKILL.md` or a skill's supporting file in the profile's own skills folder. It writes nothing else, and only after you press Save, apart from Hermes's own bookkeeping for a skill save: Hermes's skill audit ledger (`skills/.curator_ledger.jsonl` and its copies under `.curator_backups/blobs/`) records the change when `skills.ledger` is on, as it does for every skill write. It creates `MEMORY.md` or `USER.md` when you save one that did not exist. To serialise saves across Hermes processes it holds a lock file at `<profile>/pending/.skill-review-library.lock`.
-- It writes pending records: rejecting a block removes it from its record, and an edit or Remove entirely rewrites it.
-- On Accept, Hermes's own approval code writes the change to the profile's skill or memory files, the same as `/skills approve` or `/memory approve`.
-- Editing a skill change, and saving a skill file in Library, runs Hermes's content scan on a copy of the file in a temporary folder, which is deleted right after.
-- The backend keeps an in-memory cache of up to 512 diff results. Nothing is cached on disk.
+- It uses only Hermes's public plugin API. Pending calls `tools.write_review_api` (`list_writes`, `preview_write`, `decide_write`) for the profile Desktop is connected to. The plugin does not open, rewrite or rename anything under `<HERMES_HOME>/pending/`, and it does not replace or wrap any Hermes function.
+- On Accept or Reject, the plugin calls `decide_write` with the `expect` value of the preview you looked at. Hermes then applies or drops the whole write with its own checks and locks, the same as `/skills approve` or `/memory approve`.
+- Previews carry memory text and skill diffs to Desktop. The backend does not log, cache or store them.
+- Library reads the profile's `SOUL.md`, `PROJECT.md`, `AGENTS.md`, `MEMORY.md` and `USER.md`, and the files of each skill in the profile's own skills folder: `SKILL.md` and the text files under `references/`, `templates/`, `scripts/` and `assets/`. It finds those skills through Hermes's public skill catalog helpers (`find_all_skills`, `locate_skill`, `skill_search_dirs`). It does not read external skill folders.
+- On Save in Library, the plugin writes that one identity file itself: `SOUL.md`, `PROJECT.md` or `AGENTS.md`, and only after you press Save. It does not write memory or skill files. To serialise saves it holds a lock file at `<HERMES_HOME>/plugin-data/skill-review/library.lock`, in the plugin's own data folder.
 - The Desktop half stores its settings in Desktop plugin storage: notification mode, auto-open, shown profiles, sort order, which changes it already announced and when you last opened each file.
 
 ## Known limits
 
+- Pending needs a Hermes with the public write review API, `tools.write_review_api` (Hermes PR #158550, not yet in a release). On an older Hermes the review tab shows one message saying so, and Library still lists and opens files and saves identity files, without pending counts.
+- The tab shows only the profile Desktop is connected to. To review another profile, switch to it in Desktop. The plugin API offers no public way to reach other profiles from one request.
+- Hermes accepts or rejects a staged write only as a whole. A change that is one part of a write with several changes has no Accept or Reject of its own; use Accept all or Reject all for its file. A write that changes several files is listed as one entry with all its changes.
+- Accept all and Reject all decide only the writes you saw. A write staged after the file was loaded stays pending until you look at it. A write that changed since its preview is refused by Hermes and stays pending.
+- This version cannot edit a proposed change or remove an entry entirely: the public API has no way to change a staged write.
+- Library opens `MEMORY.md`, `USER.md` and skill files read-only. A save of those files must pass Hermes's own checks under Hermes's locks (the memory character limit and threat scan; the skill size limit, frontmatter, 60-character description and Skills Guard scan), and Hermes has no public helper for those yet. Identity files still save, up to 200,000 characters.
+- A write whose approval stopped partway (`needs_review`) is counted in the list but not shown, because the public API does not return its id. Check the files, then close it in chat with `/memory reject <id>` or `/skills reject <id>`.
+- Library finds skills through Hermes's skill catalog, so a skill that the catalog hides on this platform is not listed.
 - The review tab cannot be closed, because Desktop turns a plugin off when its only pane closes. Collapse it, or hide it from the zone menu or with "Toggle Pending writes tab" in the command palette. Desktop will not hide the last visible tab of a zone, so if Files is hidden, press Hide in the pane header (or Ctrl+J / Cmd+J) to collapse the whole right sidebar. Hide needs a Desktop that gives plugins `ctx.runAction`; on older ones the button is not shown.
 - The tab lives in the Files zone, where cmd-W does not reach it. If you drag it into the chat zone, or your layout has no Files pane or other right-side pane so Desktop puts it there, cmd-W there still closes it and switches the plugin off. This is a Desktop limitation.
 - After an update, reload Desktop and restart the backend before the new version runs.
 - Word highlights stop at 2,500 tokens per line and 4,000,000 comparison cells per line pair (16,000,000 per block). Longer lines are tinted without word marks. Diffs themselves are not truncated.
-- An edit can be at most 100,000 characters, and Hermes's own size limit for the file still applies.
-- Remove entirely handles single-line memory entries only, and refuses if the entry appears more than once in the file.
 - Library opens UTF-8 text files of at most 1 MB. It lists supporting files only under `references/`, `templates/`, `scripts/` and `assets/`, and leaves out files that are not UTF-8 text.
 - The Library editor does not wrap lines. A long line scrolls sideways.
 - Once you edit a file with Windows line endings in Library, it is saved with Unix line endings, because the browser's text box turns every line ending into a line feed.
-- The profile picker in the settings lists only profiles with pending changes, so a profile with none cannot be hidden from Library.
-- The Skills Guard scan on a Library save sees only the file you save, not the rest of the skill folder, the same as when you edit a proposed change.
 - Closing or reloading Desktop with unsaved text in Library does not ask first. The Desktop plugin SDK has no hook for that; only switching files, switching to Pending and Back ask.
 - Library leaves out a file that has a second hard link, and refuses one that gains a link after the list was read. It leaves out a file reached through a symlink, even one that points inside the profile folder. A skill whose `SKILL.md` is left out this way is left out whole, with its other files.
 - Library writes files directly. A Hermes process that holds a file's text in memory, such as a running chat with `SOUL.md` already in its prompt, sees the new text only when it reads the file again.
