@@ -22,7 +22,7 @@ globalThis.__queryClient ??= { fetchQuery: () => Promise.resolve({ items: [] }) 
 register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  $hidden, $kind, $selection, $sort, REVIEW_NARROW_PX, REVIEW_STYLES, ReviewLayout, ReviewWorkArea, isNarrowWidth,
+  $kind, $selection, $sort, REVIEW_NARROW_PX, REVIEW_STYLES, ReviewLayout, ReviewWorkArea, isNarrowWidth,
   observeWidth, openReview
 } = mod
 const plugin = mod.default
@@ -184,7 +184,6 @@ test('narrow with a file selected: only the detail shows, with Back at the top; 
 test('Back clears the selection, returns to the list and leaves every filter as it was', () => {
   $kind.set('memory')
   $sort.set('name')
-  $hidden.set(['dev'])
   $selection.set('memory:default:MEMORY.md')
   const before = ReviewLayout({ narrow: true, onBack: () => $selection.set(null), selection: $selection.get(), t })
   const listBefore = columns(before).find(c => c.key === 'list')
@@ -194,7 +193,6 @@ test('Back clears the selection, returns to the list and leaves every filter as 
   assert.equal($selection.get(), null)
   assert.equal($kind.get(), 'memory')
   assert.equal($sort.get(), 'name')
-  assert.deepEqual($hidden.get(), ['dev'])
   const after = ReviewLayout({ narrow: true, onBack() {}, selection: $selection.get(), t })
   const cols = visibleColumns(after)
   assert.equal(cols.length, 1)
@@ -204,7 +202,7 @@ test('Back clears the selection, returns to the list and leaves every filter as 
   assert.equal(listAfter.key, listBefore.key)
   assert.equal(listAfter.type, listBefore.type)
   assert.equal(columns(before)[0], listBefore)
-  $kind.set('all'); $sort.set('newest'); $hidden.set([])
+  $kind.set('all'); $sort.set('newest')
 })
 
 test('ReviewWorkArea Back button wiring clears the shared selection atom', () => {

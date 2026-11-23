@@ -1,4 +1,4 @@
-// Tests for the list sort, the profile subset picker, overflow-safe styles, the failure message
+// Tests for the list sort, the connected-profile label, overflow-safe styles, the failure message
 // punctuation, and the version-keyed diff query.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -24,10 +24,9 @@ globalThis.__queryClient ??= { fetchQuery: () => Promise.resolve({ items: [] }) 
 register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  $hidden, $sort, BlockView, DiffSkeleton, FileDetailView, FileHeader, FileListRow, FilesEmpty, FilterButton, LIST_STYLES,
-  ProfilePicker, SORTS, STYLES, FILE_STYLES, SortMenu, diffKey, diffMatches, diffQueryKey, diffVersion, endSentence,
-  filterFiles, loadListSettings, messages, onlyProfile, profileSummary, resultToast, setHiddenProfiles, setSort,
-  shownFiles, sortFiles, toggleHidden
+  $sort, BlockView, ConnectedProfile, DiffSkeleton, FileDetailView, FileHeader, FileListRow, FilesEmpty, FilterButton, LIST_STYLES,
+  SORTS, STYLES, FILE_STYLES, SortMenu, diffKey, diffMatches, diffQueryKey, diffVersion, endSentence,
+  filterFiles, loadListSettings, messages, resultToast, setSort, shownFiles, sortFiles
 } = mod
 const plugin = mod.default
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
@@ -120,11 +119,12 @@ test('the sort is stable: ties keep the order they came in', () => {
   assert.deepEqual(sortFiles(same, 'name').map(f => f.profile), ['dev', 'ops', 'qa'])
 })
 
-test('sorting happens after the profile and kind filters', () => {
-  const files = [file('dev', 'z.md', 5, 1), file('ops', 'a.md', 9, 1), file('dev', 'm/SKILL.md', 1, 4, 'skills'), file('dev', 'b.md', 3, 2)]
-  assert.deepEqual(shownFiles(files, ['ops'], 'memory', 'name').map(f => f.file), ['b.md', 'z.md'])
-  assert.deepEqual(shownFiles(files, [], 'all', 'changes').map(f => f.file), ['m/SKILL.md', 'b.md', 'z.md', 'a.md'])
-  assert.deepEqual(shownFiles(files, ['dev'], 'all', 'oldest').map(f => f.file), ['a.md'])
+test('sorting happens after the kind filter', () => {
+  const files = [file('dev', 'z.md', 5, 1), file('dev', 'a.md', 9, 1), file('dev', 'm/SKILL.md', 1, 4, 'skills'), file('dev', 'b.md', 3, 2)]
+  assert.deepEqual(shownFiles(files, 'memory', 'name').map(f => f.file), ['a.md', 'b.md', 'z.md'])
+  assert.deepEqual(shownFiles(files, 'all', 'changes').map(f => f.file), ['m/SKILL.md', 'b.md', 'z.md', 'a.md'])
+  assert.deepEqual(shownFiles(files, 'skills', 'oldest').map(f => f.file), ['m/SKILL.md'])
+  assert.deepEqual(filterFiles(files).length, 4)
 })
 
 test('SortMenu shows the active choice in its trigger and reports a pick', () => {
@@ -145,14 +145,13 @@ test('the sort choice persists in ctx.storage and loads back', () => {
   const ctx = fakeCtx({ hiddenProfiles: ['ops'], sortOrder: 'changes' })
   plugin.register(ctx)
   assert.equal($sort.get(), 'changes')
-  assert.deepEqual($hidden.get(), ['ops'])
+  assert.equal(mod.$hidden, undefined, 'a stored hidden-profile list from 0.2.x is ignored')
   setSort('oldest')
   assert.equal(ctx.storage.store.sortOrder, 'oldest')
   setSort('nope')
   assert.equal($sort.get(), 'oldest', 'an unknown value is ignored')
   loadListSettings(fakeCtx({ sortOrder: 'sideways', hiddenProfiles: 'ops' }))
   assert.equal($sort.get(), 'newest')
-  assert.deepEqual($hidden.get(), [])
 })
 
 test('SortControl is its own component, rendered on the settings page', () => {
@@ -160,94 +159,36 @@ test('SortControl is its own component, rendered on the settings page', () => {
   assert.match(slice('export function SettingsPageView(', '\nexport function '), /jsx\(SortControl, \{\}\)/)
 })
 
-// --- 2. profile subset ------------------------------------------------------------------------
+// --- 2. one profile: the connected one -----------------------------------------------------------
 
-const PROFILES = [file('dev', 'MEMORY.md', 9, 3), file('ops', 'USER.md', 8, 1), file('dev', 'USER.md', 7, 1), file('default', 'MEMORY.md', 6, 2), file('qa', 'x/SKILL.md', 5, 1, 'skills')]
-
-test('profileSummary lists each profile with pending files once, default first, with its file count', () => {
-  assert.deepEqual(profileSummary(PROFILES), [
-    { count: 1, profile: 'default' }, { count: 2, profile: 'dev' }, { count: 1, profile: 'ops' }, { count: 1, profile: 'qa' }
-  ])
-  assert.deepEqual(profileSummary([]), [])
-})
-
-test('hidden profiles are filtered out; a profile that appears later is shown', () => {
-  assert.deepEqual(filterFiles(PROFILES, ['dev', 'qa']).map(f => f.profile), ['ops', 'default'])
-  assert.deepEqual(filterFiles(PROFILES, []).length, 5)
-  const later = [...PROFILES, file('newbie', 'MEMORY.md', 1, 1)]
-  assert.ok(filterFiles(later, ['dev', 'qa']).some(f => f.profile === 'newbie'))
-  assert.deepEqual(filterFiles(PROFILES, ['ops'], 'skills').map(f => f.file), ['x/SKILL.md'])
-})
-
-test('toggle, All and Only-focused produce the hidden list', () => {
-  assert.deepEqual(toggleHidden([], 'ops', false), ['ops'])
-  assert.deepEqual(toggleHidden(['ops', 'qa'], 'ops', true), ['qa'])
-  assert.deepEqual(toggleHidden(['ops'], 'ops', false), ['ops'], 'no duplicates')
-  assert.deepEqual(onlyProfile(profileSummary(PROFILES), 'dev'), ['default', 'ops', 'qa'])
-})
-
-test('the hidden list, not the shown one, is what persists', () => {
-  const ctx = fakeCtx()
-  plugin.register(ctx)
-  setHiddenProfiles(['ops', 'ops', 7, 'qa'])
-  assert.deepEqual(ctx.storage.store.hiddenProfiles, ['ops', 'qa'])
-  assert.deepEqual($hidden.get(), ['ops', 'qa'])
-  setHiddenProfiles([])
-})
-
-test('the picker label says how many profiles are shown', () => {
-  const profiles = profileSummary(PROFILES)
-  const label = hidden => {
-    const tree = ProfilePicker({ focused: 'dev', hidden, onChange() {}, profiles, t })
-    return walk(tree).find(n => n.props?.asChild).props.children.props.title
+test('there is no profile picker: the list names the connected profile only', () => {
+  for (const name of ['ProfilePicker', 'ProfileControl', 'profileLabel', 'profileSummary', 'toggleHidden', 'onlyProfile', 'setHiddenProfiles', '$hidden']) {
+    assert.equal(mod[name], undefined, name)
   }
-  assert.equal(label([]), 'profilesAll:4')
-  assert.equal(label(['ops']), 'profilesShown:3,4')
-  assert.equal(label(['ops', 'gone-profile']), 'profilesShown:3,4', 'a hidden profile without files does not count')
-  assert.equal(en.profilesShown(3, 7), '3 of 7 profiles')
-  assert.equal(en.profilesAll(7), 'All 7 profiles')
+  const label = ConnectedProfile({ profile: 'hermes-dev', t })
+  const parts = label.props.children
+  assert.deepEqual([parts[0], parts[2].props.children, parts[4]], ['profileWord', 'hermes-dev', 'connectedMark'])
+  assert.equal(label.props.title, 'connectedProfileTip:hermes-dev')
+  assert.equal(label.props.style.textOverflow, 'ellipsis')
+  assert.equal(ConnectedProfile({ profile: null, t }), null)
+  assert.equal(en.connectedMark, '(connected)')
+  assert.match(slice('export function FilesListPane()', '\nexport function '), /jsx\(ConnectedProfile, \{ profile: v\.profile, t \}\)/)
+  assert.match(slice('export function LibraryListPane()', '\nconst textLines'), /jsx\(ConnectedProfile, /)
+  assert.doesNotMatch(src, /hiddenProfiles['"]?\s*,|writeStored\('hiddenProfiles'/)
 })
 
-test('the picker has a checkbox per profile with its count, plus All and Only-focused', () => {
-  const changes = []
-  const profiles = profileSummary(PROFILES)
-  const tree = ProfilePicker({ focused: 'dev', hidden: ['ops'], onChange: h => changes.push(h), profiles, t })
-  const rows = walk(tree).filter(n => n.type === 'label')
-  assert.deepEqual(rows.map(r => r.key), ['default', 'dev', 'ops', 'qa'])
-  const checks = rows.map(r => kids(r)[0])
-  assert.deepEqual(checks.map(c => c.props.checked), [true, true, false, true])
-  assert.deepEqual(rows.map(r => text(r)), ['default 1', 'dev focusedMark 2', 'ops 1', 'qa 1'])
-  checks[2].props.onCheckedChange(true)
-  checks[0].props.onCheckedChange(false)
-  const shortcuts = walk(tree).filter(n => typeof n.props?.onClick === 'function')
-  shortcuts.forEach(b => b.props.onClick())
-  assert.deepEqual(changes, [[], ['ops', 'default'], [], ['default', 'ops', 'qa']])
-})
-
-test('Only-focused is disabled when the focused chat profile has nothing pending', () => {
-  const tree = expand(ProfilePicker({ focused: 'elsewhere', hidden: [], onChange() {}, profiles: profileSummary(PROFILES), t }))
-  const only = walk(tree).find(n => n.props?.title === 'onlyFocusedNone:elsewhere')
-  assert.equal(only.props.disabled, true)
-})
-
-test('the settings page uses the picker; the status chip keeps counting every profile', () => {
-  const list = slice('function FilesListPane()', '\nfunction ')
-  assert.match(slice('export function SettingsPageView(', '\nexport function '), /jsx\(ProfileControl, /)
-  assert.doesNotMatch(list, /scopeFocused|\$scope/, 'the old two-way scope control is gone from the live list')
+test('the status chip counts the connected profile\'s writes', () => {
   const chip = slice('function StatusChip()', '\nconst NOTIFY_EN')
   assert.doesNotMatch(chip, /\$hidden|filterFiles|shownFiles/)
   assert.match(chip, /count: items\.length/)
 })
 
-test('an empty list with hidden profiles explains and offers to show them all', () => {
-  let shown = 0
-  const tree = expand(FilesEmpty({ files: 3, gateOn: true, inScope: 0, kind: 'all', onShowAll: () => { shown += 1 }, t }))
-  assert.match(text(tree), /showAll/)
-  assert.ok(walk(tree).some(n => n.props?.description === 'emptyHidden:3'))
-  walk(tree).find(n => typeof n.props?.onClick === 'function').props.onClick()
-  assert.equal(shown, 1)
-  assert.ok(walk(expand(FilesEmpty({ files: 3, gateOn: true, inScope: 2, kind: 'skills', onShowAll() {}, t }))).some(n => n.props?.description === 'emptyKind:kind_skills'))
-  assert.ok(walk(expand(FilesEmpty({ files: 0, gateOn: false, inScope: 0, kind: 'all', onShowAll() {}, t }))).some(n => n.props?.description === 'gateOff'))
+test('an empty list says why: nothing of this kind, nothing at all, or the gate is off', () => {
+  assert.ok(walk(expand(FilesEmpty({ files: 3, gateOn: true, kind: 'skills', t }))).some(n => n.props?.description === 'emptyKind:kind_skills'))
+  assert.ok(walk(expand(FilesEmpty({ files: 0, gateOn: true, kind: 'all', t }))).some(n => n.props?.description === 'emptyBody'))
+  assert.ok(walk(expand(FilesEmpty({ files: 0, gateOn: false, kind: 'all', t }))).some(n => n.props?.description === 'gateOff'))
+  assert.equal(en.emptyKind('Skills'), 'Nothing under Skills for this profile.')
+  assert.equal(en.emptyHidden, undefined)
 })
 
 test('the settings page carries the notify control', () => {
@@ -309,31 +250,22 @@ test('file header, block header and list row stay inside the pane', () => {
   const long = { ...SKILL_FILE, file: 'a-very-long-skill-name-without-breaks/references/another-long-file-name.md', profile: 'a-long-profile-name' }
   assertContained(expand(FileHeader({ acceptable: 1, busy: false, file: long, onAcceptAll() {}, onRejectAll() {}, t })), 'FileHeader')
   for (const seg of [...MEMORY_DIFF.segments, ...SKILL_DIFF.segments].filter(s => s.type === 'block')) {
-    assertContained(expand(BlockView({ block: seg.block, busy: false, isNew: true, onAccept() {}, onReject() {}, t })), `BlockView ${seg.block.id}`)
+    assertContained(expand(BlockView({ block: seg.block, isNew: true, t })), `BlockView ${seg.block.id}`)
   }
   assertContained(expand(FileListRow({ file: long, hasNew: true, onSelect() {}, selected: false, t })), 'FileListRow')
   const detail = expand(FileDetailView({ busy: false, confirmOpen: false, data: SKILL_DIFF, file: SKILL_FILE, onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t }))
   assertContained(detail, 'FileDetailView')
 })
 
-test('the block Reject button sits in the action group, never alone at the row end', () => {
-  const head = kids(BlockView({ block: SKILL_DIFF.segments[1].block, busy: false, isNew: false, onAccept() {}, onReject() {}, t }))[0]
-  const group = kids(head).find(n => n.props?.style === STYLES.actions)
-  assert.ok(group, 'action group present')
-  assert.equal(kids(group).length, 2)
-  assert.equal(kids(group)[1].props.children, 'reject')
+test('a block head has no action group: the decision is in the file header', () => {
+  const head = kids(BlockView({ block: SKILL_DIFF.segments[1].block, isNew: false, t }))[0]
+  assert.equal(kids(head).find(n => n.props?.style === STYLES.actions), undefined)
+  const header = expand(FileHeader({ acceptable: 1, busy: false, file: SKILL_FILE, onAcceptAll() {}, onRejectAll() {}, t }))
+  const group = walk(header).find(n => n.props?.style === STYLES.actions)
+  assert.deepEqual(kids(group).map(b => b.props.children), ['rejectAll', 'acceptAll'])
 })
 
-test('profile picker and sort menu triggers stay inside the pane', () => {
-  const profiles = profileSummary([...PROFILES, file('a-profile-with-a-really-long-name-indeed', 'MEMORY.md', 1, 1)])
-  const picker = expand(ProfilePicker({ focused: 'dev', hidden: ['ops'], onChange() {}, profiles, t }))
-  assertContained(picker, 'ProfilePicker')
-  const trigger = walk(picker).find(n => n.props?.asChild).props.children
-  assert.equal(trigger.props.style, STYLES.button)
-  assert.equal(kids(trigger)[0].props.style, STYLES.ellipsis)
-  assert.equal(LIST_STYLES.popover.maxWidth, 'calc(100vw - 2rem)')
-  assert.equal(LIST_STYLES.checkName.textOverflow, 'ellipsis')
-  assert.equal(LIST_STYLES.checkCount.flex, 'none')
+test('the sort menu trigger stays inside the pane', () => {
   const sortTrigger = walk(SortMenu({ onChange() {}, t, value: 'newest' }))[1]
   assert.deepEqual(sortTrigger.props.style, { flexShrink: 0, maxWidth: '100%', minWidth: 0, width: 'auto' })
 })

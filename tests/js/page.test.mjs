@@ -159,7 +159,7 @@ test('the page: title, one lede sentence, the mode buttons, then the work area',
   const h1 = nodes.find(n => n.type === 'h1')
   assert.equal(textOf(h1), 'Skill review')
   const lede = nodes.find(n => n.type === 'p')
-  assert.equal(textOf(lede), 'Changes your agents want to make to their skills and memory. Nothing is saved until you accept it. Library lets you read and edit the saved files directly.')
+  assert.equal(textOf(lede), 'Changes your agents want to make to their skills and memory. Nothing is saved until you accept it. Library lets you read the saved files and edit the identity files directly.')
   const order = nodes.filter(n => n.type === 'h1' || n.type === 'p' || n.type === ModeSwitch || n.type === ReviewWorkArea).map(n => n.type)
   assert.deepEqual(order, ['h1', 'p', ModeSwitch, ReviewWorkArea])
 })

@@ -24,7 +24,7 @@ register(pathToFileURL(here + 'stub-loader.mjs'))
 const sdk = await import('@hermes/plugin-sdk')
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  $hidden, $inlineSettings, $notifyMode, $sort, NotifyModeControl, NotifyModeSegments, ProfileControl, ReviewPage, SettingsGearButton,
+  $inlineSettings, $notifyMode, $sort, NotifyModeControl, NotifyModeSegments, ReviewPage, SettingsGearButton,
   SettingsPage, SettingsPageView, SettingsSummary, SortControl, messages, openReview, openSettings, settingsPageContribution
 } = mod
 const plugin = mod.default
@@ -152,43 +152,37 @@ const header = () => {
 
 test('the list header has the summary and the gear, no settings controls, and keeps the kind filter', () => {
   const bar = header()
-  for (const name of ['ProfileControl', 'SortControl', 'NotifyModeControl']) {
+  for (const name of ['SortControl', 'NotifyModeControl']) {
     assert.doesNotMatch(bar, new RegExp(`jsx\\(${name}\\b`), `${name} lives on the settings page`)
   }
   assert.match(bar, /jsx\(SettingsGearButton, \{ onOpen: openSettings, t \}\)/)
-  assert.match(bar, /jsx\(SettingsSummary, \{ hidden: v\.hidden, profiles: v\.profiles, sort: v\.sort, t \}\)/)
+  assert.match(bar, /jsx\(ConnectedProfile, \{ profile: v\.profile, t \}\)/)
+  assert.match(bar, /jsx\(SettingsSummary, \{ sort: v\.sort, t \}\)/)
   assert.match(bar, /KINDS\.map/)
   assert.match(bar, /inline \? jsx\(SettingsPage, \{\}\) : null/, 'the inline fallback')
 })
 
-test('the list summary follows the shared store when the settings page changes it', () => {
-  const profiles = [{ profile: 'default', count: 2 }, { profile: 'dev', count: 1 }, { profile: 'ops', count: 4 }]
-  assert.equal(text(SettingsSummary({ hidden: [], profiles, sort: 'newest', t })), 'settingsSummary:profilesAll:3,sort_newest')
+test('the list summary follows the shared sort when the settings page changes it', () => {
+  assert.equal(text(SettingsSummary({ sort: 'newest', t })), 'sort_newest')
   SortControl().props.onChange('changes')
-  ProfileControl({ focused: 'default', profiles }).props.onChange(['ops'])
   assert.equal($sort.get(), 'changes')
-  assert.deepEqual($hidden.get(), ['ops'])
-  assert.equal(text(SettingsSummary({ hidden: $hidden.get(), profiles, sort: $sort.get(), t })), 'settingsSummary:profilesShown:2,3,sort_changes')
-  assert.match(slice('function useVisibleFiles()', '\nfunction '), /\n    hidden,\n[\s\S]*\n    sort\n  }/)
+  assert.equal(text(SettingsSummary({ sort: $sort.get(), t })), 'sort_changes')
   SortControl().props.onChange('newest')
-  ProfileControl({ focused: 'default', profiles }).props.onChange([])
 })
 
 // --- the settings page ------------------------------------------------------------------------
 
-test('the settings page is built from ListRow and holds every control', () => {
-  const profiles = [{ profile: 'default', count: 2 }]
-  const view = SettingsPageView({ focused: 'default', profiles, t })
+test('the settings page is built from ListRow and holds the sort and notify controls, no profile picker', () => {
+  const view = SettingsPageView({ t })
   const rows = ofType(view, sdk.ListRow)
-  assert.deepEqual(rows.map(r => r.props.title), ['scopeGroup', 'sortLabel', 'notifyLabel'])
-  assert.equal(kids(view).length, 3, 'profiles, sort and notify mode, nothing else')
-  for (const type of [ProfileControl, SortControl, NotifyModeControl]) {
+  assert.deepEqual(rows.map(r => r.props.title), ['sortLabel', 'notifyLabel'])
+  assert.equal(kids(view).length, 2, 'sort and notify mode, nothing else')
+  for (const type of [SortControl, NotifyModeControl]) {
     assert.equal(ofType(view, type).length, 1, `${type.name} is on the page`)
   }
-  assert.equal(ofType(view, ProfileControl)[0].props.profiles, profiles)
   assert.equal(ofType(view, NotifyModeControl)[0].props.bare, true)
-  assert.match(text(SettingsPageView({ focused: 'default', profiles: [], t })), /settingsNoProfiles/)
-  assert.match(slice('export function SettingsPage()', '\n}'), /useVisibleFiles\(\)/)
+  assert.equal(mod.ProfileControl, undefined)
+  assert.equal(messages.en.settingsProfilesHelp, undefined)
 })
 
 test('the notify control on the page is the bare segmented control', () => {

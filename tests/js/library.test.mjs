@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { register } from 'node:module'
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
@@ -21,7 +22,7 @@ globalThis.__queryClient ??= { fetchQuery: () => Promise.resolve({ items: [] }) 
 register(pathToFileURL(here + 'stub-loader.mjs'))
 const mod = await import(pathToFileURL(pluginPath).href)
 const {
-  $hidden, $kind, $libDiscard, $libEditor, $libOpen, $libSelection, $mode, $selection, FilesListPane, LibraryDetailPane,
+  $kind, $libDiscard, $libEditor, $libOpen, $libSelection, $mode, $selection, FilesListPane, LibraryDetailPane,
   LibraryEditorView, LibraryListPane, LibraryTree, ModeSwitch, ReviewLayout, cancelDiscard, changeLibraryText,
   confirmDiscard, librarySession, filterLibrary, findLibraryFile, isDirty, libId, libraryFilePath, libraryPath, messages,
   libraryErrorState, openPendingFor, performLibrarySave, reloadLibraryFile, requestLeave, restError, revertLibrary, selectLibraryFile,
@@ -104,7 +105,7 @@ const httpError = (status, detail) =>
 
 const reset = () => {
   $mode.set('pending'); $libSelection.set(null); $libEditor.set(null); $libDiscard.set(null); $libOpen.set({})
-  $selection.set(null); $hidden.set([]); $kind.set('all'); H.reset()
+  $selection.set(null); $kind.set('all'); H.reset()
 }
 
 const soulId = libId('dev', 'soul00000000000s')
@@ -260,28 +261,24 @@ test('a staged row (no file on disk yet) opens its review entry in Pending', () 
   assert.equal($selection.get(), 'skills/dev/reviewNewKey0000')
 })
 
-// --- search and profile filter -----------------------------------------------------------------
-
-test('hidden profiles drop out of the tree', () => {
-  assert.deepEqual(filterLibrary(TREE.profiles, ['dev'], '').map(p => p.profile), ['default', 'ops'])
-})
+// --- search ------------------------------------------------------------------------------------
 
 test('search keeps matching files, whole skills by name, and drops what does not match', () => {
-  const soul = filterLibrary(TREE.profiles, [], 'soul')
+  const soul = filterLibrary(TREE.profiles, 'soul')
   assert.deepEqual(soul.map(p => p.profile), ['dev'])
   assert.deepEqual(soul[0].identity.map(f => f.name), ['SOUL.md'])
   assert.deepEqual(soul[0].memory, [])
-  const council = filterLibrary(TREE.profiles, [], 'COUNCIL')
+  const council = filterLibrary(TREE.profiles, 'COUNCIL')
   assert.deepEqual(council[0].skills.map(s => [s.name, s.files.length]), [['council', 2]])
-  const ref = filterLibrary(TREE.profiles, [], 'references/')
+  const ref = filterLibrary(TREE.profiles, 'references/')
   assert.deepEqual(ref[0].skills.map(s => [s.name, s.files.map(f => f.name)]), [['council', ['references/a.md']]])
-  assert.deepEqual(filterLibrary(TREE.profiles, [], 'user.md').map(p => p.profile), ['default', 'dev', 'ops'])
-  assert.deepEqual(filterLibrary(TREE.profiles, [], 'nothing-like-this'), [])
-  assert.deepEqual(filterLibrary(TREE.profiles, [], 'release').map(p => p.staged.length), [1])
+  assert.deepEqual(filterLibrary(TREE.profiles, 'user.md').map(p => p.profile), ['default', 'dev', 'ops'])
+  assert.deepEqual(filterLibrary(TREE.profiles, 'nothing-like-this'), [])
+  assert.deepEqual(filterLibrary(TREE.profiles, 'release').map(p => p.staged.length), [1])
 })
 
 test('a search opens every node so matches show without clicking', () => {
-  const rows = treeRows(filterLibrary(TREE.profiles, [], 'references'), { 'p:dev': false }, 'references')
+  const rows = treeRows(filterLibrary(TREE.profiles, 'references'), { 'p:dev': false }, 'references')
   assert.deepEqual(rows.filter(r => r.type === 'file').map(r => r.label), ['references/a.md'])
 })
 
@@ -587,4 +584,57 @@ test('a late 409 after discarding and reopening the same file does not bring the
   settle.resolve({ status: 'saved', version: 'def:2' })
   await run
   assert.deepEqual($libEditor.get(), reopened, 'a late success does not mark the new text saved either')
+})
+
+// --- read-only memory and skill files (no public helper for their save checks yet) -----------------
+
+const MEMORY_READ_ONLY = {
+  status: 'ok',
+  file: { key: 'memory0000000000', kind: 'memory', name: 'MEMORY.md', skill: null, exists: true, size: 10, mtime: 1,
+    read_only: true, read_only_reason: 'Library shows memory files read-only for now.' },
+  text: 'alpha fact',
+  version: 'v1',
+  limit: null
+}
+
+test('a read-only file opens without Save or Revert, with a read-only text box and its reason', () => {
+  reset()
+  const id = libId('dev', 'memory0000000000')
+  const session = librarySession(null, id, MEMORY_READ_ONLY)
+  assert.equal(session.readOnly, true)
+  assert.equal(session.readOnlyReason, 'Library shows memory files read-only for now.')
+  const view = LibraryEditorView({ meta: { file: MEMORY_READ_ONLY.file, profile: 'dev' }, session, t })
+  assert.equal(byLabel(view, 'libSave'), undefined)
+  assert.equal(byLabel(view, 'libRevert'), undefined)
+  assert.match(text(view), /libReadOnly/)
+  assert.match(text(view), /Library shows memory files read-only for now\./)
+  assert.match(text(view), /libReadOnlyFooter/)
+  const [area] = walk(view).filter(n => n.type === Textarea)
+  assert.equal(area.props.readOnly, true)
+  changeLibraryText(session, 'typed anyway')
+  assert.equal($libEditor.get(), null, 'typing never starts an edit of a read-only file')
+})
+
+test('an identity file stays editable', () => {
+  reset()
+  const session = fresh()
+  assert.equal(session.readOnly, false)
+  const view = LibraryEditorView({ meta: { file: SOUL.file, profile: 'dev' }, session, t })
+  assert.ok(byLabel(view, 'libSave'))
+  assert.doesNotMatch(text(view), /libReadOnly/)
+})
+
+test('the read-only and missing-API strings are plain', () => {
+  for (const key of ['libReadOnly', 'libReadOnlyFooter', 'libNoReviewApi', 'needsApi', 'needsApiTitle']) {
+    assert.equal(typeof messages.en[key], 'string', key)
+    assert.doesNotMatch(messages.en[key], /—/, key)
+  }
+})
+
+test('the Pending list shows the missing-API message before any error or empty state', () => {
+  const src = readFileSync(pluginPath, 'utf8')
+  const pane = src.slice(src.indexOf('export function FilesListPane()'), src.indexOf('/** Empty list: nothing'))
+  assert.ok(pane.indexOf('v.unavailable') > 0 && pane.indexOf('v.unavailable') < pane.indexOf('v.isError) {'))
+  assert.match(pane, /jsx\(EmptyState, \{ description: v\.unavailable, title: t\('needsApiTitle'\) \}\)/)
+  assert.match(pane, /needsReviewText\(v\.needsReview, t\)/)
 })

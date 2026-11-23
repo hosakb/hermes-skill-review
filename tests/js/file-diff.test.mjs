@@ -1,4 +1,4 @@
-// Tests for the per-file composite diff (list of files, one diff per file, per-block actions).
+// Tests for the per-file diff (list of files, one diff per file, whole-write decisions).
 // Same stub setup as plugin.test.mjs, kept in its own file so both can change independently.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -6,7 +6,7 @@ import { register } from 'node:module'
 import { test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { CREATE_DIFF, FILES, GONE, MEMORY_DIFF, MEMORY_FILE, NEW_SKILL_FILE, ODD_FILE, SKILL_DIFF, SKILL_FILE, T0, USER_FILE } from './fixtures.mjs'
+import { API_DIFF, CREATE_DIFF, EXPECT_M1, EXPECT_M2, FILES, GONE, MEMORY_DIFF, MEMORY_FILE, NEW_SKILL_FILE, ODD_FILE, SKILL_DIFF, SKILL_FILE, T0, USER_FILE } from './fixtures.mjs'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const pluginPath = fileURLToPath(new URL('../../desktop/plugin.js', import.meta.url))
@@ -26,7 +26,7 @@ const mod = await import(pathToFileURL(pluginPath).href)
 const {
   $selection, STYLES, FILE_STYLES, BlockView, FileDetailView, FileDiffView, FileHeader, FileList, FileListRow,
   actionPath, actionToast, diffKey, fileDiffPath, fileKey, filesPath, handleDiffData, isNewBlock, lastOpenedAt,
-  messages, openVisit, performAction, segmentRows, visibleItems
+  decisionBody, hasWholeWrite, messages, openVisit, performAction, readyWrites, segmentRows
 } = mod
 const t = (k, ...a) => (a.length ? `${k}:${a.join(',')}` : k)
 
@@ -66,7 +66,7 @@ function fakeQueryClient() {
 
 function fakeRest(reply) {
   const calls = []
-  const rest = async (path, opts) => { calls.push({ path, method: opts?.method }); return typeof reply === 'function' ? reply(path) : reply }
+  const rest = async (path, opts) => { calls.push({ path, method: opts?.method, body: opts?.body }); return typeof reply === 'function' ? reply(path) : reply }
   return { calls, rest }
 }
 
@@ -76,11 +76,12 @@ test('file paths follow contract v1 and encode every segment', () => {
   assert.equal(filesPath(), '/files?kind=all')
   assert.equal(fileDiffPath(MEMORY_FILE), `/files/dev/memory/${MEMORY_FILE.key}/diff`)
   assert.equal(fileDiffPath(ODD_FILE), '/files/my%20profile/memory/a%2Fb%20c/diff')
-  assert.equal(actionPath(ODD_FILE, { verb: 'accept', blockId: 'r1/0' }), '/files/my%20profile/memory/a%2Fb%20c/blocks/r1%2F0/accept')
-  assert.equal(actionPath(MEMORY_FILE, { verb: 'reject', blockId: 'r1-0' }), `/files/dev/memory/${MEMORY_FILE.key}/blocks/r1-0/reject`)
+  assert.equal(actionPath(ODD_FILE, { verb: 'accept-all' }), '/files/my%20profile/memory/a%2Fb%20c/accept-all')
   assert.equal(actionPath(MEMORY_FILE, { verb: 'accept-all' }), `/files/dev/memory/${MEMORY_FILE.key}/accept-all`)
   assert.equal(actionPath(MEMORY_FILE, { verb: 'reject-all' }), `/files/dev/memory/${MEMORY_FILE.key}/reject-all`)
   assert.throws(() => actionPath(MEMORY_FILE, { verb: 'delete' }))
+  assert.throws(() => actionPath(MEMORY_FILE, { verb: 'accept', blockId: 'r1-0' }), 'there is no per-change route')
+  assert.throws(() => actionPath(MEMORY_FILE, { verb: 'reject', blockId: 'r1-0' }))
 })
 
 test('fileKey separates the same file name in two profiles', () => {
@@ -99,12 +100,6 @@ test('the list has one row per profile and file, keyed by fileKey', () => {
   assert.equal(rows.length, 5)
   assert.deepEqual(rows.map(r => r.key), files.map(fileKey))
   assert.equal(new Set(rows.map(r => r.key)).size, 5, 'USER.md in dev and in ops are two rows')
-})
-
-test('profile scope and kind filters apply to files', () => {
-  assert.deepEqual(visibleItems(FILES.files, 'focused', 'dev').map(f => f.file), ['MEMORY.md', 'USER.md', 'council/SKILL.md'])
-  assert.deepEqual(visibleItems(FILES.files, 'all', 'dev', 'skills').map(f => f.file), ['council/SKILL.md', 'release-notes/SKILL.md'])
-  assert.deepEqual(visibleItems(FILES.files, 'focused', 'dev', 'memory').map(f => f.file), ['MEMORY.md', 'USER.md'])
 })
 
 test('a list row shows the file, profile, counts and a New badge, and selects on click', () => {
@@ -162,7 +157,7 @@ test('openVisit stores the open time and keeps the previous one for the whole vi
 })
 
 test('blocks are labelled New or Older from the stored last-open time', () => {
-  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: T0 + 150, segments: MEMORY_DIFF.segments, t }))
+  const tree = expand(FileDiffView({ prior: T0 + 150, segments: MEMORY_DIFF.segments, t }))
   const found = blocks(tree)
   assert.deepEqual(found.map(b => b.props['data-block']), ['r1-0', 'r1-1', 'r2-0'])
   assert.deepEqual(found.map(b => b.props['data-new']), [false, false, true])
@@ -170,13 +165,13 @@ test('blocks are labelled New or Older from the stored last-open time', () => {
   assert.match(text(found[0]), /staged:/)
   assert.match(text(found[2]), /\bnew\b/)
   assert.doesNotMatch(text(found[2]), /\bolder\b/)
-  const never = blocks(expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: MEMORY_DIFF.segments, t })))
+  const never = blocks(expand(FileDiffView({ prior: null, segments: MEMORY_DIFF.segments, t })))
   assert.ok(never.every(b => b.props['data-new'] === true), 'a file never opened shows every block as New')
   assert.notDeepEqual(found[0].props.style, found[2].props.style, 'New and Older look different')
 })
 
 test('block headers show the origin and summary', () => {
-  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: MEMORY_DIFF.segments, t }))
+  const tree = expand(FileDiffView({ prior: null, segments: MEMORY_DIFF.segments, t }))
   const [first, , last] = blocks(tree)
   assert.match(text(first), /origin_background_review/)
   assert.match(text(first), /replace: deploy host/)
@@ -198,7 +193,7 @@ test('segmentRows: context is grey with the line number, removed and added carry
 })
 
 test('the composite diff draws context, red removed rows and green added rows in file order', () => {
-  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: MEMORY_DIFF.segments, t }))
+  const tree = expand(FileDiffView({ prior: null, segments: MEMORY_DIFF.segments, t }))
   const rows = rowsOf(tree)
   assert.deepEqual(rows.map(r => r.props['aria-label']), [
     'row_context', 'row_context', 'row_remove', 'row_add', 'row_context', 'row_remove', 'row_remove', 'row_context', 'row_add', 'row_add'
@@ -221,7 +216,7 @@ test('the composite diff draws context, red removed rows and green added rows in
 })
 
 test('a new-file create is one block of added lines with no context', () => {
-  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: CREATE_DIFF.segments, t }))
+  const tree = expand(FileDiffView({ prior: null, segments: CREATE_DIFF.segments, t }))
   assert.equal(blocks(tree).length, 1)
   const rows = rowsOf(tree)
   assert.equal(rows.length, 4)
@@ -229,47 +224,97 @@ test('a new-file create is one block of added lines with no context', () => {
   assert.deepEqual(rows.map(r => kids(r)[1].props.children), [1, 2, 3, 4])
 })
 
-test('several blocks in one file each get their own Accept and Reject', () => {
-  const seen = []
-  const tree = expand(FileDiffView({ busy: false, onBlock: a => seen.push(a), prior: null, segments: MEMORY_DIFF.segments, t }))
-  for (const b of blocks(tree)) {
-    button(b, 'accept').props.onClick()
-    button(b, 'reject').props.onClick()
+test('no change has a button of its own: Hermes decides whole writes', () => {
+  for (const segments of [MEMORY_DIFF.segments, API_DIFF.segments, SKILL_DIFF.segments, CREATE_DIFF.segments]) {
+    const tree = expand(FileDiffView({ prior: null, segments, t }))
+    assert.ok(blocks(tree).length > 0)
+    assert.deepEqual(buttons(tree).filter(b => blocks(b).length === 0 && /accept|reject/i.test(text(b))), [])
+    for (const b of blocks(tree)) {
+      assert.equal(button(b, 'accept'), undefined)
+      assert.equal(button(b, 'reject'), undefined)
+    }
   }
-  assert.deepEqual(seen, [
-    { blockId: 'r1-0', verb: 'accept' }, { blockId: 'r1-0', verb: 'reject' },
-    { blockId: 'r1-1', verb: 'accept' }, { blockId: 'r1-1', verb: 'reject' },
-    { blockId: 'r2-0', verb: 'accept' }, { blockId: 'r2-0', verb: 'reject' }
-  ])
-  const busy = expand(FileDiffView({ busy: true, onBlock() {}, prior: null, segments: MEMORY_DIFF.segments, t }))
-  assert.ok(buttons(busy).every(b => b.props.disabled === true), 'buttons disable while a request runs')
 })
-
-test('a stale block is greyed, shows its reason and offers Reject only', () => {
+test('a stale block is greyed and shows its reason', () => {
   const stale = SKILL_DIFF.segments.find(s => s.block?.state === 'stale').block
-  const view = expand(BlockView({ block: stale, busy: false, isNew: false, onAccept() {}, onReject() {}, t }))
-  assert.equal(button(view, 'accept'), undefined, 'no Accept on a stale block')
-  assert.ok(button(view, 'reject'))
+  const view = expand(BlockView({ block: stale, isNew: false, t }))
+  assert.equal(buttons(view).length, 0)
   assert.match(text(view), /old_string no longer appears in the file/)
   assert.match(text(view), /\bstale\b/)
   assert.equal(view.props.style.opacity, FILE_STYLES.blockStale.opacity)
   assert.ok(view.props.style.opacity < 1, 'greyed')
-  const blocked = { ...SKILL_DIFF.segments[1].block, can_accept: false }
-  assert.equal(button(expand(BlockView({ block: blocked, busy: false, isNew: true, onAccept() {}, onReject() {}, t })), 'accept'), undefined,
-    'can_accept false hides Accept even for a pending block')
+})
+test('a conflict block shows Hermes\'s reason', () => {
+  const tree = expand(FileDiffView({ prior: null, segments: API_DIFF.segments, t }))
+  const conflict = blocks(tree).find(b => b.props['data-block'] === 'm3-cccccccccc')
+  assert.match(text(conflict), /conflictReason:Skill 'council' already exists/)
+  assert.equal(buttons(conflict).length, 0)
+  assert.equal(messages.en.conflictReason('x.'), 'Cannot apply: x.')
+  assert.equal(messages.en.conflictAbove, undefined, 'no overlap guess any more: Hermes decides')
+})
+test('a file with a write of several changes says once that this version decides whole writes only', () => {
+  const base = { busy: false, confirmOpen: false, file: MEMORY_FILE, onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t }
+  assert.equal(hasWholeWrite(API_DIFF), true)
+  const view = expand(FileDetailView({ ...base, data: API_DIFF }))
+  const notes = walk(view).filter(n => n.props?.role === 'note')
+  assert.equal(notes.length, 1)
+  assert.equal(notes[0].props.children, 'statusWholeWrite')
+  assert.equal(notes[0].props.style, FILE_STYLES.wholeNote)
+  for (const b of blocks(view)) assert.doesNotMatch(text(b), /statusWholeWrite|one part of a write/)
+  const singles = { ...API_DIFF, writes: { m1: API_DIFF.writes.m1, m3: API_DIFF.writes.m3 } }
+  assert.equal(hasWholeWrite(singles), false)
+  assert.equal(walk(expand(FileDetailView({ ...base, data: singles }))).filter(n => n.props?.role === 'note').length, 0)
+  assert.match(messages.en.statusWholeWrite, /^This version decides whole writes only\./)
+})
+test('blocks render the preview text: a new entry, a unified diff, a removed entry', () => {
+  const rows = id => segmentRows({ type: 'block', block: API_DIFF.segments.find(s => s.block.id === id).block })
+  assert.deepEqual(rows('m1-0123456789').map(r => [r.kind, r.text]), [['add', 'gamma fact']])
+  assert.deepEqual(rows('m2-aaaaaaaaaa').map(r => [r.kind, r.text]),
+    [['hunk', '@@ -1 +1 @@'], ['remove', 'alpha fact'], ['add', 'ALPHA fact']], 'the file header row is dropped')
+  assert.deepEqual(rows('m2-bbbbbbbbbb').map(r => [r.kind, r.text]), [['remove', 'beta fact']])
+  assert.deepEqual(rows('m3-cccccccccc'), [], 'a blocked op shows its reason, not a diff')
 })
 
-test('a conflict block says it conflicts with the block above', () => {
-  const tree = expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: SKILL_DIFF.segments, t }))
-  const conflict = blocks(tree).find(b => b.props['data-block'] === 'p2-0')
-  assert.match(text(conflict), /conflictAbove/)
-  assert.ok(button(conflict, 'accept'), 'a conflict block can still be accepted when the backend allows it')
-  assert.equal(messages.en.conflictAbove, 'Conflicts with the block above')
-  const plain = blocks(tree).find(b => b.props['data-block'] === 'p1-0')
-  assert.doesNotMatch(text(plain), /conflictAbove/)
+test('Accept all and Reject all send back the expect of each preview shown, unchanged', () => {
+  const actions = []
+  const view = expand(FileDetailView({
+    busy: false, confirmOpen: true, data: API_DIFF, file: MEMORY_FILE, onAction: a => actions.push(a),
+    onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t
+  }))
+  button(view, 'acceptAll').props.onClick()
+  walk(view).find(n => n.props?.destructive === true).props.onConfirm()
+  const all = { m1: EXPECT_M1, m2: EXPECT_M2, m3: null }
+  assert.deepEqual(actions, [{ verb: 'accept-all', body: { expects: all } }, { verb: 'reject-all', body: { expects: all } }])
+  assert.equal(actions[0].body.expects.m1, EXPECT_M1, 'the same object, not a copy or a rebuild')
+  assert.equal(actions[0].body.expects.m2, EXPECT_M2)
+  assert.equal(readyWrites(API_DIFF), 2)
+})
+test('a decision POSTs its expects to the file URL', async () => {
+  host.reset()
+  const qc = fakeQueryClient()
+  const { calls, rest } = fakeRest({ results: [{ id: 'm1', status: 'applied' }], file_gone: false })
+  await performAction({ action: { verb: 'accept-all', body: { expects: { m1: EXPECT_M1 } } }, file: MEMORY_FILE, queryClient: qc, rest, t })
+  assert.deepEqual(calls.at(-1).body, { expects: { m1: EXPECT_M1 } })
+  assert.equal(calls.at(-1).path, `/files/dev/memory/${MEMORY_FILE.key}/accept-all`)
+})
+test('a file view on a Hermes without the write review API shows its one message', () => {
+  const view = expand(FileDetailView({
+    busy: false, confirmOpen: false, data: { status: 'unavailable', message: 'needs the API' }, file: MEMORY_FILE,
+    onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t
+  }))
+  assert.ok(walk(view).some(n => n.props?.description === 'needs the API'))
+  assert.equal(blocks(view).length, 0)
 })
 
 // --- file header, confirmation ----------------------------------------------------------------
+
+test('a one-change file says Accept and Reject; Reject comes first, as in the mockup', () => {
+  const one = { ...MEMORY_FILE, counts: { ...MEMORY_FILE.counts, total: 1 } }
+  const header = expand(FileHeader({ acceptable: 1, busy: false, file: one, onAcceptAll() {}, onRejectAll() {}, t }))
+  assert.deepEqual(buttons(header).map(b => b.props.children), ['reject', 'accept'])
+  const many = expand(FileHeader({ acceptable: 1, busy: false, file: SKILL_FILE, onAcceptAll() {}, onRejectAll() {}, t }))
+  assert.deepEqual(buttons(many).map(b => b.props.children), ['rejectAll', 'acceptAll'])
+})
 
 test('the file header has Accept all and Reject all; Reject all only asks for confirmation', () => {
   const asked = []
@@ -280,10 +325,10 @@ test('the file header has Accept all and Reject all; Reject all only asks for co
   }))
   assert.match(text(view), /council\/SKILL\.md/)
   button(view, 'acceptAll').props.onClick()
-  assert.deepEqual(actions, [{ verb: 'accept-all' }])
+  assert.deepEqual(actions, [{ verb: 'accept-all', body: { expects: {} } }])
   button(view, 'rejectAll').props.onClick()
   assert.deepEqual(asked, [true])
-  assert.deepEqual(actions, [{ verb: 'accept-all' }], 'Reject all does not call the backend by itself')
+  assert.deepEqual(actions, [{ verb: 'accept-all', body: { expects: {} } }], 'Reject all does not call the backend by itself')
   const dialog = walk(view).find(n => n.props?.destructive === true)
   assert.equal(dialog.props.open, false)
   const open = expand(FileDetailView({
@@ -294,15 +339,17 @@ test('the file header has Accept all and Reject all; Reject all only asks for co
   assert.equal(confirm.props.open, true)
   assert.match(confirm.props.description, /rejectAllBody:3,council\/SKILL\.md/)
   confirm.props.onConfirm()
-  assert.deepEqual(actions.at(-1), { verb: 'reject-all' })
+  assert.deepEqual(actions.at(-1), { verb: 'reject-all', body: { expects: {} } })
 })
 
-test('Accept all is disabled when no block can be accepted', () => {
-  const onlyStale = { ...SKILL_DIFF, segments: SKILL_DIFF.segments.filter(s => s.type === 'context' || s.block.state === 'stale') }
+test('Accept all is disabled when no shown write is ready', () => {
+  const onlyStale = { ...API_DIFF, writes: { m3: API_DIFF.writes.m3, m4: { expect: {}, status: 'stale', reason: 'moved', op_count: 1 } } }
   const header = FileHeader({ acceptable: 0, busy: false, file: SKILL_FILE, onAcceptAll() {}, onRejectAll() {}, t })
   assert.equal(button(header, 'acceptAll').props.disabled, true)
-  const view = expand(FileDetailView({ busy: false, confirmOpen: false, data: onlyStale, file: SKILL_FILE, onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t }))
+  const view = expand(FileDetailView({ busy: false, confirmOpen: false, data: onlyStale, file: MEMORY_FILE, onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t }))
   assert.equal(button(view, 'acceptAll').props.disabled, true)
+  const ready = expand(FileDetailView({ busy: false, confirmOpen: false, data: API_DIFF, file: MEMORY_FILE, onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t }))
+  assert.equal(button(ready, 'acceptAll').props.disabled, false)
   assert.equal(button(view, 'rejectAll').props.disabled, false)
 })
 
@@ -319,55 +366,35 @@ test('the detail view shows loading, error and gone states', () => {
 
 // --- actions, refetch, file gone --------------------------------------------------------------
 
-test('per-block accept and reject POST to the block URL, toast, and refetch the file', async () => {
-  host.reset()
-  const qc = fakeQueryClient()
-  const { calls, rest } = fakeRest({ status: 'applied', error: null, file_gone: false })
-  $selection.set(fileKey(MEMORY_FILE))
-  await performAction({ action: { blockId: 'r1-0', verb: 'accept' }, file: MEMORY_FILE, queryClient: qc, rest, t })
-  assert.deepEqual(calls, [{ path: `/files/dev/memory/${MEMORY_FILE.key}/blocks/r1-0/accept`, method: 'POST' }])
-  assert.deepEqual(host.toasts.map(x => x.kind), ['success'])
-  assert.deepEqual(qc.invalidated, [diffKey(MEMORY_FILE), ['skill-review', 'files'], ['skill-review', 'pending']])
-  assert.equal($selection.get(), fileKey(MEMORY_FILE), 'the file stays open while it has changes')
-
-  const second = fakeRest({ status: 'rejected', error: null, file_gone: false })
-  await performAction({ action: { blockId: 'r2-0', verb: 'reject' }, file: MEMORY_FILE, queryClient: qc, rest: second.rest, t })
-  assert.deepEqual(second.calls, [{ path: `/files/dev/memory/${MEMORY_FILE.key}/blocks/r2-0/reject`, method: 'POST' }])
-  assert.equal(host.toasts.at(-1).kind, 'info')
-})
-
 test('when the backend says file_gone, the view returns to the list', async () => {
   host.reset()
   const qc = fakeQueryClient()
-  const { rest } = fakeRest({ status: 'applied', error: null, file_gone: true })
+  const { rest } = fakeRest({ results: [{ id: 'c1', status: 'applied' }], file_gone: true })
   $selection.set(fileKey(NEW_SKILL_FILE))
-  await performAction({ action: { blockId: 'c1-0', verb: 'accept' }, file: NEW_SKILL_FILE, queryClient: qc, rest, t })
+  await performAction({ action: { verb: 'accept-all', body: { expects: {} } }, file: NEW_SKILL_FILE, queryClient: qc, rest, t })
   assert.equal($selection.get(), null)
   assert.ok(qc.invalidated.some(k => k[1] === 'files'), 'the list refetches')
 })
 
-test('a failed block keeps the file open and reports the error with any multi-line detail', async () => {
+test('a conflict keeps the file open and reports Hermes\'s reason', async () => {
   host.reset()
   const qc = fakeQueryClient()
-  const scan = 'Security scan blocked this skill:\n  - exfiltration'
-  const { rest } = fakeRest({ status: 'failed', error: scan, file_gone: false })
+  const { rest } = fakeRest({ results: [{ id: 'p1', kind: 'skills', status: 'conflict', reason: 'Security scan blocked this skill' }], file_gone: false })
   $selection.set(fileKey(SKILL_FILE))
-  await performAction({ action: { blockId: 'p1-0', verb: 'accept' }, file: SKILL_FILE, queryClient: qc, rest, t })
+  await performAction({ action: { verb: 'accept-all', body: { expects: {} } }, file: SKILL_FILE, queryClient: qc, rest, t })
   const toast = host.toasts.at(-1)
   assert.equal(toast.kind, 'error')
-  assert.match(toast.message, /Security scan blocked this skill:$/)
-  assert.equal(toast.detail, scan)
+  assert.match(toast.detail, /p1: statusConflict:Security scan blocked this skill\./)
   assert.equal($selection.get(), fileKey(SKILL_FILE))
   assert.deepEqual(qc.invalidated[0], diffKey(SKILL_FILE), 'still refetched, the file may have changed')
 })
-
 test('accept-all and reject-all POST to the file URL and summarise the results', async () => {
   host.reset()
   const qc = fakeQueryClient()
   const { calls, rest } = fakeRest(path => ({
     results: path.endsWith('accept-all')
-      ? [{ block_id: 'p1-0', status: 'applied', error: null }, { block_id: 'p2-0', status: 'failed', error: 'overlaps p1-0' }]
-      : [{ block_id: 'p1-0', status: 'rejected', error: null }, { block_id: 'p3-0', status: 'rejected', error: null }]
+      ? [{ id: 'p1', status: 'applied' }, { id: 'p2', status: 'conflict', reason: 'overlaps p1' }]
+      : [{ id: 'p1', status: 'rejected' }, { id: 'p3', status: 'rejected' }]
   }))
   await performAction({ action: { verb: 'accept-all' }, file: SKILL_FILE, queryClient: qc, rest, t })
   await performAction({ action: { verb: 'reject-all' }, file: SKILL_FILE, queryClient: qc, rest, t })
@@ -377,7 +404,7 @@ test('accept-all and reject-all POST to the file URL and summarise the results',
   ])
   assert.equal(host.toasts[0].kind, 'error', 'a partial failure is an error toast')
   assert.match(host.toasts[0].message, /bulkAccepted:1,2/)
-  assert.match(host.toasts[0].detail, /overlaps p1-0/)
+  assert.match(host.toasts[0].detail, /p2: statusConflict:overlaps p1\./)
   assert.equal(host.toasts[1].kind, 'info')
   assert.match(host.toasts[1].message, /bulkRejected:2,2/)
   assert.equal(qc.invalidated.filter(k => k[1] === 'file').length, 2, 'refetched after each')
@@ -394,15 +421,19 @@ test('a diff that comes back gone returns to the list and refreshes it', () => {
   assert.deepEqual(qc.invalidated, [['skill-review', 'files']])
 })
 
-test('actionToast covers every block status', () => {
+test('actionToast covers every bulk outcome', () => {
   const file = USER_FILE
-  assert.equal(actionToast({ verb: 'accept' }, { status: 'applied' }, file, t).kind, 'success')
-  assert.equal(actionToast({ verb: 'reject' }, { status: 'rejected' }, file, t).kind, 'info')
-  assert.equal(actionToast({ verb: 'accept' }, { status: 'already_handled' }, file, t).kind, 'info')
-  assert.equal(actionToast({ verb: 'accept' }, { status: 'failed', error: 'x' }, file, t).kind, 'error')
+  assert.equal(actionToast({ verb: 'accept-all' }, { results: [{ id: 'a', status: 'applied' }] }, file, t).kind, 'success')
+  assert.equal(actionToast({ verb: 'reject-all' }, { results: [{ id: 'a', status: 'rejected' }] }, file, t).kind, 'info')
+  assert.equal(actionToast({ verb: 'accept-all' }, { results: [{ id: 'a', status: 'already_resolved', prior: 'applied' }] }, file, t).kind, 'info')
+  assert.equal(actionToast({ verb: 'accept-all' }, { results: [{ id: 'a', status: 'stale', reason: 'moved' }] }, file, t).kind, 'info')
+  assert.equal(actionToast({ verb: 'accept-all' }, { results: [{ id: 'a', status: 'unseen' }] }, file, t).kind, 'info')
+  assert.equal(actionToast({ verb: 'accept-all' }, { results: [{ id: 'a', status: 'conflict', reason: 'x' }] }, file, t).kind, 'error')
+  assert.equal(actionToast({ verb: 'accept-all' }, { results: [{ id: 'a', kind: 'memory', status: 'needs_review', reason: 'x' }] }, file, t).kind, 'error')
   assert.equal(actionToast({ verb: 'accept-all' }, { results: [] }, file, t).kind, 'info')
+  const off = actionToast({ verb: 'accept-all' }, { status: 'unavailable', message: 'needs the API', results: [] }, file, t)
+  assert.deepEqual(off, { kind: 'error', message: 'needs the API' })
 })
-
 // --- styles -----------------------------------------------------------------------------------
 
 test('file view styles let text wrap, shrink to the pane and use theme variables only', () => {
@@ -426,7 +457,7 @@ test('file view styles let text wrap, shrink to the pane and use theme variables
 test('a 400-character line inside a block wraps in the text column', () => {
   const long = 'x'.repeat(400)
   const seg = { type: 'block', block: { ...CREATE_DIFF.segments[0].block, added: [{ no: 1, text: long }] } }
-  const row = rowsOf(expand(FileDiffView({ busy: false, onBlock() {}, prior: null, segments: [seg], t })))[0]
+  const row = rowsOf(expand(FileDiffView({ prior: null, segments: [seg], t })))[0]
   const cell = kids(row)[3]
   assert.equal(cell.props.children, long)
   assert.equal(cell.props.style, STYLES.rowText)
