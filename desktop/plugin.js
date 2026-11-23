@@ -893,12 +893,13 @@ export function actionPath(file, action) {
 
 /**
  * The body of Accept all or Reject all: for each write shown, the `expect` preview_write returned,
- * exactly as the diff carried it. A write staged after the diff loaded has none, so it stays pending.
+ * exactly as the diff carried it. A write without one (staged after the diff loaded) is left out, so it
+ * stays pending.
  */
 export function decisionBody(action, data) {
-  const writes = data?.writes ?? {}
+  const writes = Object.entries(data?.writes ?? {}).filter(([, w]) => w?.expect && typeof w.expect === 'object')
 
-  return { expects: Object.fromEntries(Object.entries(writes).map(([id, w]) => [id, w.expect])) }
+  return { expects: Object.fromEntries(writes.map(([id, w]) => [id, w.expect])) }
 }
 
 /** How many of the shown writes Hermes would apply now (preview status ready). */
@@ -1105,7 +1106,6 @@ export function FileListRow({ file, hasNew, selected, onSelect, t }) {
         children: [
           hasNew ? jsx(Badge, { size: 'xs', variant: 'default', children: t('new') }) : null,
           jsx(Badge, { size: 'xs', variant: file.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${file.subsystem}`) }),
-          jsx(Badge, { size: 'xs', variant: 'outline', children: file.profile }),
           jsx('span', { style: STYLES.muted, children: t('changes', c.total ?? 0) }),
           c.stale ? jsx('span', { style: STYLES.muted, children: t('staleCount', c.stale) }) : null,
           c.conflict ? jsx('span', { style: STYLES.muted, children: t('conflictCount', c.conflict) }) : null,
@@ -1219,7 +1219,6 @@ export function FileHeader({ file, acceptable, busy, onAcceptAll, onRejectAll, t
         style: { ...STYLES.listMeta, flexBasis: '100%' },
         children: [
           jsx(Badge, { variant: file.subsystem === 'memory' ? 'default' : 'muted', children: t(`kind_${file.subsystem}`) }),
-          jsx(Badge, { variant: 'outline', children: file.profile }),
           jsx('span', { style: STYLES.muted, children: t('changes', c.total ?? 0) }),
           c.stale ? jsx('span', { style: STYLES.muted, children: t('staleCount', c.stale) }) : null,
           c.conflict ? jsx('span', { style: STYLES.muted, children: t('conflictCount', c.conflict) }) : null
@@ -1272,14 +1271,14 @@ export function FileDetailView({ file, data, loading, error, prior, busy, confir
       whole ? jsx('div', { role: 'note', style: FILE_STYLES.wholeNote, children: statusText({ status: 'whole_write' }, t) }) : null,
       jsx('div', { style: STYLES.detailScroll, children: body }),
       jsx(ConfirmDialog, {
-        confirmLabel: t('rejectAll'),
+        confirmLabel: t(blockList.length === 1 ? 'reject' : 'rejectAll'),
         description: t('rejectAllBody', blockList.length, shownFile.file),
         destructive: true,
         dismissOnConfirm: true,
         onClose: onCloseConfirm,
         onConfirm: () => decide({ verb: 'reject-all' }),
         open: confirmOpen,
-        title: t('rejectAllTitle')
+        title: t(blockList.length === 1 ? 'rejectOneTitle' : 'rejectAllTitle')
       })
     ]
   })
@@ -1634,7 +1633,10 @@ function FileDetailPane() {
   if (!file) {
     return jsx('div', {
       style: STYLES.paneRoot,
-      children: jsx(EmptyState, { description: v.files.length ? t('selectFileBody') : t('emptyBody'), title: t('selectFileTitle') })
+      children: jsx(EmptyState, {
+        description: v.unavailable ? t('selectFileUnavailable') : v.files.length ? t('selectFileBody') : t('emptyBody'),
+        title: t('selectFileTitle')
+      })
     })
   }
 
@@ -2937,9 +2939,12 @@ const FILE_EN = {
   origin_background_review: 'background review',
   profileErrors: names => `Could not read pending changes for: ${names}`,
   rejectAll: 'Reject all',
-  rejectAllBody: (n, name) => `All ${n} proposed change${n === 1 ? '' : 's'} to ${name} are discarded. Hermes can propose them again.`,
+  rejectAllBody: (n, name) =>
+    n === 1 ? `The proposed change to ${name} is discarded. Hermes can propose it again.` : `All ${n} proposed changes to ${name} are discarded. Hermes can propose them again.`,
   rejectAllTitle: 'Reject every change in this file?',
+  rejectOneTitle: 'Reject this change?',
   selectFileBody: 'Pick a file in the list to see its changes.',
+  selectFileUnavailable: 'Changes show up here once Hermes has the write review API.',
   selectFileTitle: 'No file selected',
   staged: date => `staged ${date}`,
   stale: 'stale',

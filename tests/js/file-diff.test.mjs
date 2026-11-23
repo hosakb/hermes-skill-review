@@ -107,7 +107,7 @@ test('a list row shows the file, profile, counts and a New badge, and selects on
   const row = FileListRow({ file: SKILL_FILE, hasNew: true, onSelect: k => { picked = k }, selected: true, t })
   const all = text(row)
   assert.match(all, /council\/SKILL\.md/)
-  assert.match(all, /\bdev\b/)
+  assert.doesNotMatch(all, /\bdev\b/, 'one profile only: the list header names it, the rows do not')
   assert.match(all, /changes:3/)
   assert.match(all, /staleCount:1/)
   assert.match(all, /conflictCount:1/)
@@ -283,8 +283,9 @@ test('Accept all and Reject all send back the expect of each preview shown, unch
   }))
   button(view, 'acceptAll').props.onClick()
   walk(view).find(n => n.props?.destructive === true).props.onConfirm()
-  const all = { m1: EXPECT_M1, m2: EXPECT_M2, m3: null }
+  const all = { m1: EXPECT_M1, m2: EXPECT_M2 }
   assert.deepEqual(actions, [{ verb: 'accept-all', body: { expects: all } }, { verb: 'reject-all', body: { expects: all } }])
+  assert.ok(!('m3' in actions[0].body.expects), 'a write without an expect is left out, so the backend leaves it pending')
   assert.equal(actions[0].body.expects.m1, EXPECT_M1, 'the same object, not a copy or a rebuild')
   assert.equal(actions[0].body.expects.m2, EXPECT_M2)
   assert.equal(readyWrites(API_DIFF), 2)
@@ -338,6 +339,13 @@ test('the file header has Accept all and Reject all; Reject all only asks for co
   const confirm = walk(open).find(n => n.props?.destructive === true)
   assert.equal(confirm.props.open, true)
   assert.match(confirm.props.description, /rejectAllBody:3,council\/SKILL\.md/)
+  assert.equal(confirm.props.title, 'rejectAllTitle')
+  assert.equal(messages.en.rejectAllBody(1, 'MEMORY.md'), 'The proposed change to MEMORY.md is discarded. Hermes can propose it again.')
+  assert.equal(messages.en.rejectAllBody(2, 'MEMORY.md'), 'All 2 proposed changes to MEMORY.md are discarded. Hermes can propose them again.')
+  const one = { ...CREATE_DIFF, writes: { c1: { expect: EXPECT_M1, status: 'ready', reason: null, op_count: 1 } } }
+  const single = expand(FileDetailView({ busy: false, confirmOpen: true, data: one, file: NEW_SKILL_FILE, onAction() {}, onAskRejectAll() {}, onCloseConfirm() {}, prior: null, t }))
+  const ask = walk(single).find(n => n.props?.destructive === true)
+  assert.deepEqual([ask.props.title, ask.props.confirmLabel], ['rejectOneTitle', 'reject'])
   confirm.props.onConfirm()
   assert.deepEqual(actions.at(-1), { verb: 'reject-all', body: { expects: {} } })
 })

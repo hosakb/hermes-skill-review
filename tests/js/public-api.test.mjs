@@ -164,3 +164,11 @@ test('unsaved identity text still asks before it is dropped, and the page names 
   assert.equal($libEditor.get(), null)
   $mode.set('pending'); $libSelection.set(null); $libDiscard.set(null)
 })
+
+test('without the review API the empty detail pane does not promise changes', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(pluginPath, 'utf8')
+  const pane = src.slice(src.indexOf('function FileDetailPane()'), src.indexOf('// Library mode'))
+  assert.match(pane, /v\.unavailable \? t\('selectFileUnavailable'\)/)
+  assert.equal(en.selectFileUnavailable, 'Changes show up here once Hermes has the write review API.')
+})
